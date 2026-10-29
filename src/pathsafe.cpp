@@ -67,9 +67,35 @@ std::vector<std::string> split_components(const std::string& s) {
     return out;
 }
 
+// ASCII-only upper case (std::toupper would depend on the C locale for bytes >= 0x80).
 std::string upper_ascii(std::string s) {
-    for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    for (auto& c : s)
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
     return s;
+}
+
+// Simple case folding for comparing internal names: ASCII lower case, plus the two non-ASCII code points whose
+// simple folding is an ASCII letter and which Windows/macOS file systems may therefore treat as that letter:
+// U+017F LATIN SMALL LETTER LONG S -> 's' and U+212A KELVIN SIGN -> 'k'. Other bytes are copied unchanged.
+std::string fold_simple(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {
+            out += (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : static_cast<char>(c);
+        } else if (c == 0xC5 && i + 1 < s.size() && static_cast<unsigned char>(s[i + 1]) == 0xBF) {
+            out += 's';
+            ++i;
+        } else if (c == 0xE2 && i + 2 < s.size() && static_cast<unsigned char>(s[i + 1]) == 0x84 &&
+                   static_cast<unsigned char>(s[i + 2]) == 0xAA) {
+            out += 'k';
+            i += 2;
+        } else {
+            out += static_cast<char>(c);
+        }
+    }
+    return out;
 }
 
 bool is_reserved_device(const std::string& comp) {
@@ -81,6 +107,13 @@ bool is_reserved_device(const std::string& comp) {
     if (stem.size() == 4 && (stem.compare(0, 3, "COM") == 0 || stem.compare(0, 3, "LPT") == 0) && stem[3] >= '1' &&
         stem[3] <= '9')
         return true;
+    // Windows also reserves COM/LPT followed by superscript 1, 2, 3 (U+00B9, U+00B2, U+00B3; UTF-8 C2 B9/B2/B3).
+    // Blocked on every platform so that a Windows destination stays safe.
+    if (stem.size() == 5 && (stem.compare(0, 3, "COM") == 0 || stem.compare(0, 3, "LPT") == 0) &&
+        static_cast<unsigned char>(stem[3]) == 0xC2) {
+        unsigned char t = static_cast<unsigned char>(stem[4]);
+        if (t == 0xB9 || t == 0xB2 || t == 0xB3) return true;
+    }
     return false;
 }
 
@@ -111,6 +144,13 @@ bool is_inside(const fs::path& root, const fs::path& p) {
 
 }  // namespace
 
+bool has_tmp_component(const std::string& rel_utf8) {
+    static const std::string pre = ".mysync-tmp-";
+    for (const auto& c : split_components(rel_utf8))
+        if (fold_simple(c).compare(0, pre.size(), pre) == 0) return true;
+    return false;
+}
+
 std::string normalize_rel(const std::string& rel_utf8) {
     bool lead = !rel_utf8.empty() && (rel_utf8[0] == '/' || rel_utf8[0] == '\\');
     std::string out = lead ? "/" : "";
@@ -128,7 +168,7 @@ bool is_internal_dir(const std::string& rel_utf8) {
     auto comps = split_components(rel_utf8);
     for (const auto& c : comps) {
         if (c == ".") continue;
-        return upper_ascii(c) == "__SYNC";
+        return fold_simple(c) == "__sync";
     }
     return false;
 }

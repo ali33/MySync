@@ -354,6 +354,27 @@ void get_size_text(KV& kv, const char* k, std::string& out) {
     }
 }
 
+void get_size(KV& kv, const char* k, uint64_t& out, bool* explicit_zero = nullptr) {
+    std::string txt;
+    get_size_text(kv, k, txt);
+    if (txt.empty()) return;
+    out = parse_size(txt);
+    if (explicit_zero && out == 0) *explicit_zero = true;
+}
+
+// Octal mode text key. line is used for the error position.
+template <class F>
+void get_mode(KV& kv, const char* k, uint32_t& out, F parse) {
+    if (const Entry* e = kv.take(k)) {
+        if (e->v.type != Val::Str) fail(e->line, std::string("key '") + k + "' must be an octal string such as \"0640\"");
+        try {
+            out = parse(e->v.s);
+        } catch (const Error& ex) {
+            fail(e->line, std::string("key '") + k + "': " + ex.what());
+        }
+    }
+}
+
 void get_time_text(KV& kv, const char* k, std::string& out) {
     if (const Entry* e = kv.take(k)) {
         if (e->v.type != Val::Str) fail(e->line, std::string("key '") + k + "' must be a string");
@@ -426,6 +447,7 @@ void apply_server(const Section& sec, ServerConfig& c) {
     get_str(kv, "root", c.root);
     get_str(kv, "key_file", c.key_file);
     get_num(kv, "max_connections", c.max_connections, 1, 100000);
+    get_num(kv, "max_bandwidth_kbps", c.max_bandwidth_kbps, 0, INT32_MAX);
     get_num(kv, "max_auth_failures_per_min", c.max_auth_failures_per_min, 1, 1000000);
     get_bool(kv, "trash", c.trash);
     {
@@ -450,10 +472,15 @@ void apply_server(const Section& sec, ServerConfig& c) {
     get_str(kv, "log_file", c.log_file);
     check_log_level(kv, c.log_level);
     {
-        std::string txt;
-        get_size_text(kv, "max_file_size", txt);
-        if (!txt.empty()) c.max_file_size = parse_size(txt);
+        bool zero = false;
+        get_size(kv, "max_file_size", c.max_file_size, &zero);
+        if (zero) log_warn("config: max_file_size = 0 disables the per-file size limit; a client can then fill the disk");
+        zero = false;
+        get_size(kv, "max_trash_bytes", c.max_trash_bytes, &zero);
+        if (zero) log_warn("config: max_trash_bytes = 0 leaves the trash unbounded");
     }
+    get_mode(kv, "file_mode", c.file_mode, parse_file_mode);
+    get_mode(kv, "dir_mode", c.dir_mode, parse_dir_mode);
     get_num(kv, "io_timeout_s", c.io_timeout_s, 1, 86400);
     kv.finish();
 }
@@ -471,6 +498,9 @@ void apply_client_acl(const Section& sec, ClientAcl& a) {
     get_str(kv, "access", access);
     if (e && access != "rw" && access != "ro") fail(e->line, "access must be \"rw\" or \"ro\"");
     a.read_only = access == "ro";
+    get_num(kv, "max_sessions", a.max_sessions, 1, 10000);
+    get_num(kv, "max_bandwidth_kbps", a.max_bandwidth_kbps, 0, INT32_MAX);
+    get_size(kv, "max_write_bytes_per_hour", a.max_write_bytes_per_hour);
     const Entry* pe = nullptr;
     for (const auto& x : sec.entries)
         if (x.key == "prefix") pe = &x;
@@ -567,6 +597,8 @@ void apply_target(const Section& sec, TargetConfig& t) {
     get_str(kv, "path", t.path);
     get_str(kv, "remote_prefix", t.remote_prefix);
     get_bool(kv, "enabled", t.enabled);
+    get_mode(kv, "file_mode", t.file_mode, parse_file_mode);
+    get_mode(kv, "dir_mode", t.dir_mode, parse_dir_mode);
     bool has_sk = false;
     get_pubkey(kv, "server_key", t.server_key, has_sk);
     kv.finish();
@@ -576,6 +608,8 @@ void apply_target(const Section& sec, TargetConfig& t) {
                 fail(line_of(k), std::string("target has both 'path' and '") + k +
                                      "' (a target is either local or network)");
     } else {
+        for (const char* k : {"file_mode", "dir_mode"})
+            if (line_of(k)) fail(line_of(k), std::string("'") + k + "' only applies to local targets (with 'path')");
         if (line_of("path")) fail(line_of("path"), "target 'path' must not be empty");
         if (t.host.empty()) fail(sec.line, "target needs either 'path' (local) or 'host' (network)");
         if (!has_sk) fail(sec.line, "network target '" + t.host + "' without 'server_key'");
@@ -699,6 +733,27 @@ PublicKey parse_public_key_hex(const std::string& hex) {
     PublicKey k;
     std::copy(b.begin(), b.end(), k.begin());
     return k;
+}
+
+static uint32_t parse_mode_bits(const std::string& t, const char* what) {
+    std::string d = t;
+    if (d.size() > 1 && d[0] == '0') d.erase(0, 1);  // "0640" -> "640"
+    if (d.empty() || d.size() > 3 || d.find_first_not_of("01234567") != std::string::npos)
+        throw Error(std::string(what) + " must be an octal number such as \"0640\"");
+    return uint32_t(std::stoul(d, nullptr, 8));
+}
+
+uint32_t parse_file_mode(const std::string& octal) {
+    uint32_t m = parse_mode_bits(octal, "file mode");
+    if (m & 0111) throw Error("file mode must not have execute bits");
+    if ((m & 0600) != 0600) throw Error("file mode must keep read and write for the owner (at least 0600)");
+    return m;
+}
+
+uint32_t parse_dir_mode(const std::string& octal) {
+    uint32_t m = parse_mode_bits(octal, "directory mode");
+    if ((m & 0700) != 0700) throw Error("directory mode must keep rwx for the owner (at least 0700)");
+    return m;
 }
 
 Bytes load_secret_key_file(const std::string& utf8_path) {

@@ -169,3 +169,46 @@ TEST(pathsafe_symlink_escape) {
     fs::create_directories(root / "sub");
     CHECK(safe_join(r, "sub/new.txt") == root / "sub" / "new.txt");
 }
+
+TEST(pathsafe_blocks_unicode_superscript_device_names) {
+    TmpDir t;
+    std::string root = t.p.u8string();
+    const char* sup[] = {"\xC2\xB9", "\xC2\xB2", "\xC2\xB3"};  // U+00B9 U+00B2 U+00B3
+    for (const char* d : sup)
+        for (const char* base : {"COM", "LPT", "com", "Lpt", "cOm"}) {
+            std::string n = std::string(base) + d;
+            CHECK_THROWS(safe_join(root, n));
+            CHECK_THROWS(safe_join(root, n + ".txt"));
+            CHECK_THROWS(safe_join(root, n + ".tar.gz"));
+            CHECK_THROWS(safe_join(root, "dir/" + n));
+            CHECK_THROWS(safe_join(root, n + " .log"));  // spaces before the extension are ignored by Windows too
+        }
+    // look-alikes that are not devices stay usable
+    CHECK_EQ(safe_join(root, "COM\xC2\xB9" "0").filename().u8string(), std::string("COM\xC2\xB9" "0"));
+    CHECK_EQ(safe_join(root, "XCOM\xC2\xB9").filename().u8string(), std::string("XCOM\xC2\xB9"));
+    CHECK_EQ(safe_join(root, "COM\xC2\xBA").filename().u8string(), std::string("COM\xC2\xBA"));  // masculine ordinal
+    CHECK_EQ(safe_join(root, "COM4x").filename().string(), std::string("COM4x"));
+}
+
+TEST(pathsafe_internal_names_fold_long_s_and_kelvin) {
+    const std::string long_s = "\xC5\xBF";       // U+017F -> 's'
+    const std::string kelvin = "\xE2\x84\xAA";  // U+212A -> 'k'
+    CHECK(is_internal_dir("__" + long_s + "ync"));
+    CHECK(is_internal_dir("__" + long_s + "YNC/a"));
+    CHECK(is_internal_dir("__sync"));
+    CHECK(is_internal_dir("__SYNC"));
+    CHECK(is_internal_dir("./__" + long_s + "ync/__trash"));
+    CHECK(!is_internal_dir("__" + kelvin + "ync"));  // Kelvin folds to 'k', not 's'
+    CHECK(!is_internal_dir("__syncx"));
+    CHECK(!is_internal_dir("x/__sync"));
+    CHECK(has_tmp_component(".mysync-tmp-1234"));
+    CHECK(has_tmp_component("a/.MYSYNC-TMP-ab"));
+    CHECK(has_tmp_component("a/.my" + long_s + "ync-tmp-ab"));
+    CHECK(has_tmp_component("a\\.my" + long_s + "ync-tmp-ab\\f"));
+    CHECK(!has_tmp_component(".mysync-tmp"));
+    CHECK(!has_tmp_component("a/.mysync_tmp-1"));
+    CHECK(!has_tmp_component("x.mysync-tmp-1"));
+    CHECK(!has_tmp_component(".my" + kelvin + "ync-tmp-1"));  // 'k' is not an 's'
+    // a name that only becomes ".mysync-tmp-" after folding the Kelvin sign: "-tmp-" has no 'k', so use a 'k' elsewhere
+    CHECK(has_tmp_component(".mysync-tmp-" + kelvin));
+}

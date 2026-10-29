@@ -67,9 +67,11 @@ void log_write(LogLevel l, const std::string& msg) {
 #else
     localtime_r(&t, &tmv);
 #endif
-    char ts[40];
-    std::snprintf(ts, sizeof ts, "%04d-%02d-%02d %02d:%02d:%02d.%03d", tmv.tm_year + 1900, tmv.tm_mon + 1,
-                  tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ms);
+    // Seven ints can need up to 11 characters each; the buffer covers the worst case so nothing is ever cut off.
+    char ts[128];
+    int tn = std::snprintf(ts, sizeof ts, "%04d-%02d-%02d %02d:%02d:%02d.%03d", tmv.tm_year + 1900, tmv.tm_mon + 1,
+                           tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ms);
+    if (tn < 0 || size_t(tn) >= sizeof ts) ts[0] = '\0';
     std::string line = std::string(ts) + " [" + level_name(l) + "] " + msg + "\n";
     std::lock_guard<std::mutex> lk(g_log_mu);
     std::fwrite(line.data(), 1, line.size(), stderr);

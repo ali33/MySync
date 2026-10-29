@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 META.vn
+# Author: Nguyễn Đức Sơn
+#
+# cmake -DTP_DIR=<third_party dir> -P verify_third_party.cmake
+# Compares the SHA-256 of every file listed in CHECKSUMS.sha256; fails (FATAL_ERROR) on a mismatch or missing file.
+file(STRINGS "${TP_DIR}/CHECKSUMS.sha256" lines)
+set(bad 0)
+set(count 0)
+foreach(line IN LISTS lines)
+  if(line STREQUAL "")
+    continue()
+  endif()
+  if(NOT line MATCHES "^([0-9a-fA-F]+)  (.+)$")
+    message(SEND_ERROR "bad line in CHECKSUMS.sha256: ${line}")
+    math(EXPR bad "${bad}+1")
+    continue()
+  endif()
+  string(TOLOWER "${CMAKE_MATCH_1}" want)
+  set(rel "${CMAKE_MATCH_2}")
+  if(NOT EXISTS "${TP_DIR}/${rel}")
+    message(SEND_ERROR "MISSING  ${rel}")
+    math(EXPR bad "${bad}+1")
+    continue()
+  endif()
+  file(SHA256 "${TP_DIR}/${rel}" got)
+  if(NOT got STREQUAL want)
+    message(SEND_ERROR "MISMATCH ${rel}")
+    math(EXPR bad "${bad}+1")
+  endif()
+  math(EXPR count "${count}+1")
+endforeach()
+if(bad)
+  message(FATAL_ERROR "third_party: ${bad} problem(s) against CHECKSUMS.sha256")
+endif()
+message(STATUS "third_party: ${count} files match CHECKSUMS.sha256")

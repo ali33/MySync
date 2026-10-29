@@ -34,11 +34,28 @@ key_file = "server.key"
 # Số kết nối đồng thời tối đa.
 max_connections = 20
 
+# Trần băng thông TOÀN máy chủ, kilobit/giây (1 kbps = 125 byte/s), tính gộp byte nhận và gửi của mọi máy khách.
+# 0 = không giới hạn. Muốn giới hạn riêng từng máy: `max_bandwidth_kbps` trong khối [[client]] (mọi kết nối song song
+# của máy đó dùng CHUNG một trần; vẫn chịu trần toàn máy chủ). Nếu máy khách cũng tự đặt `max_bandwidth_kbps` thì
+# mức nào thấp hơn sẽ thắng. Không áp cho đích copy cục bộ/UNC.
+max_bandwidth_kbps = 0
+
 # Chống dò khoá: quá số lần xác thực sai mỗi phút từ một IP thì IP đó bị chặn tạm.
 max_auth_failures_per_min = 10
 
-# true = tệp bị xoá hoặc bị ghi đè được chuyển vào <root>/__sync/__trash/ thay vì mất hẳn.
+# true = tệp bị xoá hoặc bị ghi đè (kể cả bị upload đè) được chuyển (đổi tên, không sao chép) vào
+# <root>/__sync/__trash/<thời gian UTC>/<đường dẫn> thay vì mất hẳn. Tệp trùng nội dung thì không tạo bản trash.
 trash = true
+
+# Dung lượng tối đa của thùng rác ("10GB", "500MB", số byte). Vượt mức thì dọn các mục CŨ NHẤT (theo thời gian)
+# trước khi chuyển thêm vào. Một mục đơn lẻ lớn hơn hạn mức thì KHÔNG bị xoá/ghi đè: máy khách nhận lỗi rõ ràng.
+# 0 = không giới hạn (không nên: máy khách có quyền rw xoá/ghi đè liên tục sẽ làm đầy đĩa).
+max_trash_bytes = "10GB"
+
+# Quyền Linux của tệp / thư mục máy chủ tạo ra (chuỗi bát phân; Windows bỏ qua). Tệp không được có bit thực thi
+# và phải giữ rw cho chủ; thư mục phải giữ rwx cho chủ. Mặc định chỉ chủ + nhóm đọc được, người ngoài không.
+file_mode = "0640"
+dir_mode = "0750"
 
 # IP được phép / bị cấm: IP đơn, CIDR ("10.0.0.0/8", "fd00::/8") hoặc "*". Deny thắng allow.
 allow = ["*"]
@@ -50,8 +67,9 @@ log_file = ""
 # debug | info | warn | error
 log_level = "info"
 
-# Kích thước tối đa mỗi tệp nhận ("10GB", "500MB", số byte). 0 = không giới hạn.
-max_file_size = 0
+# Kích thước tối đa mỗi tệp nhận ("10GB", "500MB", số byte). Mặc định 10GB.
+# CẢNH BÁO: đặt tường minh 0 = không giới hạn, một máy khách có thể làm đầy đĩa bằng một tệp khổng lồ.
+max_file_size = "10GB"
 
 # Hết thời gian chờ I/O của một kết nối (giây).
 io_timeout_s = 60
@@ -66,6 +84,16 @@ public_key = "0000000000000000000000000000000000000000000000000000000000000000"
 access = "rw"
 # Chỉ cho máy này thấy thư mục con này của root ("" = cả root). Không có "/" đầu/cuối.
 prefix = "hanoi"
+# Hạn mức riêng của máy này (không ảnh hưởng máy khác):
+#  - max_sessions: số phiên đồng thời tối đa (mặc định 4, bằng `connections` mặc định của máy khách). Phiên thừa bị
+#    từ chối bằng lỗi BUSY; tăng lên nếu máy khách đặt `connections` lớn hơn.
+#  - max_write_bytes_per_hour: số byte tối đa máy này được ghi trong BẤT KỲ khoảng 1 giờ trượt nào ("50GB",
+#    "500MB", số byte; mặc định 50GB; 0 = không giới hạn). Vượt mức thì tệp mới bị từ chối bằng lỗi BUSY (ghi log);
+#    tệp trùng nội dung không tốn hạn mức.
+max_sessions = 4
+# Trần băng thông riêng của máy này (kbps, gộp nhận + gửi, chung cho mọi kết nối của máy). 0 = không giới hạn riêng.
+max_bandwidth_kbps = 0
+max_write_bytes_per_hour = "50GB"
 
 # [[client]]
 # name = "may-giam-sat"

@@ -251,3 +251,63 @@ TEST(local_unavailable_destination_throws) {
     auto t = make_local_target(tc);
     CHECK_THROWS(t->open());
 }
+
+namespace {
+std::vector<std::pair<std::string, std::string>> local_trash(const std::string& dst) {
+    std::vector<std::pair<std::string, std::string>> out;
+    fs::path tr = fs::u8path(dst) / "__sync" / "__trash";
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(tr, ec), end; !ec && it != end; it.increment(ec))
+        if (it->is_regular_file()) out.emplace_back(it->path().lexically_relative(tr).generic_string(), read_file(it->path()));
+    return out;
+}
+}  // namespace
+
+TEST(local_overwrite_moves_old_version_to_trash) {
+    Tmp tmp;
+    std::string src = tmp.sub("src"), dst = tmp.sub("dst");
+    fs::path f = fs::u8path(src) / "sub" / "doc.txt";
+    write_file(f, "first version");
+    auto t = open_target(dst);
+    CHECK(t->put_file("sub/doc.txt", f.u8string(), meta_of("sub/doc.txt", f)).status == PutResult::Sent);
+    CHECK(local_trash(dst).empty());
+    CHECK(t->put_file("sub/doc.txt", f.u8string(), meta_of("sub/doc.txt", f)).status == PutResult::Skipped);
+    CHECK(local_trash(dst).empty());  // identical content: no trash entry
+
+    write_file(f, "second, different version");
+    CHECK(t->put_file("sub/doc.txt", f.u8string(), meta_of("sub/doc.txt", f)).status == PutResult::Sent);
+    CHECK_EQ(read_file(fs::u8path(dst) / "sub" / "doc.txt"), std::string("second, different version"));
+    auto tf = local_trash(dst);
+    CHECK_EQ(tf.size(), size_t(1));
+    CHECK_EQ(tf[0].second, std::string("first version"));
+    CHECK(tf[0].first.find("/sub/doc.txt") != std::string::npos);
+    CHECK_EQ(count_tmp(fs::u8path(dst)), 0u);
+}
+
+#ifndef _WIN32
+TEST(local_created_files_and_dirs_use_configured_modes) {
+    auto perms = [](const fs::path& p) { return unsigned(fs::status(p).permissions() & fs::perms::mask); };
+    Tmp tmp;
+    std::string src = tmp.sub("src"), dst = tmp.sub("dst");
+    fs::path f = fs::u8path(src) / "a.txt";
+    write_file(f, "payload");
+    {
+        auto t = open_target(dst);  // defaults
+        CHECK(t->put_file("x/y/a.txt", f.u8string(), meta_of("x/y/a.txt", f)).status == PutResult::Sent);
+        CHECK_EQ(perms(fs::u8path(dst) / "x" / "y" / "a.txt"), 0640u);
+        CHECK_EQ(perms(fs::u8path(dst) / "x" / "y"), 0750u);
+        t->make_dir("m/n");
+        CHECK_EQ(perms(fs::u8path(dst) / "m" / "n"), 0750u);
+    }
+    std::string dst2 = tmp.sub("dst2");
+    TargetConfig tc;
+    tc.path = dst2;
+    tc.file_mode = 0600;
+    tc.dir_mode = 0700;
+    auto t = make_local_target(tc, nullptr, "");
+    t->open();
+    CHECK(t->put_file("p/a.txt", f.u8string(), meta_of("p/a.txt", f)).status == PutResult::Sent);
+    CHECK_EQ(perms(fs::u8path(dst2) / "p" / "a.txt"), 0600u);
+    CHECK_EQ(perms(fs::u8path(dst2) / "p"), 0700u);
+}
+#endif

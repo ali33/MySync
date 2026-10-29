@@ -7,6 +7,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -85,7 +86,9 @@ struct Env {
     std::thread th;
     double stop_seconds = 0;
 
-    explicit Env(ServerConfig cfg = ServerConfig(), bool pre_orphans = false) {
+    // tweak_rw: lets a test change the limits of the "rw" client (the helper gives it room for 64 sessions).
+    explicit Env(ServerConfig cfg = ServerConfig(), bool pre_orphans = false,
+                 std::function<void(ClientAcl&)> tweak_rw = nullptr) {
         tmp = unique_tmp();
         root = tmp / "root";
         src = tmp / "src";
@@ -108,6 +111,8 @@ struct Env {
             cfg.clients.push_back(a);
         };
         add("rw", rw, false, "");
+        cfg.clients.back().max_sessions = 64;
+        if (tweak_rw) tweak_rw(cfg.clients.back());
         add("ro", ro, true, "");
         add("sub", sub, false, "sub/dir");
         srv = std::make_unique<Server>(cfg, server_kp);
@@ -516,11 +521,17 @@ TEST(net_many_parallel_clients) {
     for (int c = 0; c < 6; c++) {
         PutItem it = e.item("par/c" + std::to_string(c) + ".bin", pseudo_random(300000, 100 + uint64_t(c)));
         ths.emplace_back([&e, it, &okc] {
-            try {
-                auto t = e.target(e.rw);
-                t->open();
-                if (t->put_file(it.rel, it.abs_src, it.meta).status == PutResult::Sent) okc++;
-            } catch (...) {
+            // At most 4 connections per source may be in the handshake at once (kMaxUnauthPerIp), so on a slow or
+            // busy machine some of the 6 simultaneous connects are refused at first: retry like a real client does.
+            for (int attempt = 0; attempt < 50; attempt++) {
+                try {
+                    auto t = e.target(e.rw);
+                    t->open();
+                    if (t->put_file(it.rel, it.abs_src, it.meta).status == PutResult::Sent) okc++;
+                    return;
+                } catch (...) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                }
             }
         });
     }
@@ -732,4 +743,300 @@ TEST(server_drops_silent_session_after_handshake_within_hello_deadline) {
     CHECK(dt > 4.0 && dt < 8.5);                       // ~5 s hello deadline
     auto t = e.target(e.rw);
     CHECK_THROWS(t->open());                           // and the source was charged for it
+}
+
+
+// ---------------------------------------------------------------- limits, trash on overwrite, modes
+
+namespace {
+
+std::string slurp(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+// Every regular file below <root>/__sync/__trash, as (relative path, content).
+std::vector<std::pair<std::string, std::string>> trash_files(const fs::path& root) {
+    std::vector<std::pair<std::string, std::string>> out;
+    fs::path tr = root / "__sync" / "__trash";
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(tr, ec), end; !ec && it != end; it.increment(ec))
+        if (it->is_regular_file()) out.emplace_back(it->path().lexically_relative(tr).generic_string(), slurp(it->path()));
+    return out;
+}
+
+uint64_t trash_total(const fs::path& root) {
+    uint64_t n = 0;
+    for (auto& f : trash_files(root)) n += f.second.size();
+    return n;
+}
+
+void pause_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+
+}  // namespace
+
+TEST(net_overwrite_moves_old_version_to_trash) {
+    Env e;
+    auto t = e.target(e.rw);
+    t->open();
+    PutItem a = e.item_text("d/doc.txt", "version one");
+    CHECK(t->put_file(a.rel, a.abs_src, a.meta).status == PutResult::Sent);
+    CHECK(trash_files(e.root).empty());  // first write: nothing to preserve
+    PutResult same = t->put_file(a.rel, a.abs_src, a.meta);
+    CHECK(same.status == PutResult::Skipped);
+    CHECK(trash_files(e.root).empty());  // identical content: no trash
+
+    PutItem b = e.item_text("d/doc.txt", "version two, longer");
+    CHECK(t->put_file(b.rel, b.abs_src, b.meta).status == PutResult::Sent);
+    CHECK_EQ(slurp(e.root / "d" / "doc.txt"), std::string("version two, longer"));
+    auto tf = trash_files(e.root);
+    CHECK_EQ(tf.size(), size_t(1));
+    CHECK_EQ(tf[0].second, std::string("version one"));
+    CHECK(tf[0].first.find("/d/doc.txt") != std::string::npos);  // <stamp>/d/doc.txt
+    CHECK(!any_tmp_left(e.root));
+}
+
+TEST(net_overwrite_with_trash_off_keeps_no_copy) {
+    ServerConfig cfg;
+    cfg.trash = false;
+    Env e(cfg);
+    auto t = e.target(e.rw);
+    t->open();
+    PutItem a = e.item_text("x.txt", "one");
+    CHECK(t->put_file(a.rel, a.abs_src, a.meta).status == PutResult::Sent);
+    PutItem b = e.item_text("x.txt", "two!");
+    CHECK(t->put_file(b.rel, b.abs_src, b.meta).status == PutResult::Sent);
+    CHECK_EQ(slurp(e.root / "x.txt"), std::string("two!"));
+    CHECK(!fs::exists(e.root / "__sync" / "__trash"));
+}
+
+TEST(net_overwrite_big_file_via_delta_keeps_old_version_in_trash) {
+    Env e;
+    auto t = e.target(e.rw);
+    t->open();
+    Bytes big = pseudo_random(2u << 20, 11);
+    Bytes old = big;
+    PutItem a = e.item("big.bin", big);
+    CHECK(t->put_file(a.rel, a.abs_src, a.meta).status == PutResult::Sent);
+    big[1000] ^= 0x33;
+    PutItem b = e.item("big.bin", big);
+    PutResult r = t->put_file(b.rel, b.abs_src, b.meta);
+    CHECK(r.status == PutResult::Sent);
+    CHECK(r.used_delta);
+    CHECK(hash_of(e.root / "big.bin") == b.meta.hash);
+    auto tf = trash_files(e.root);
+    CHECK_EQ(tf.size(), size_t(1));
+    CHECK(tf[0].second == std::string(old.begin(), old.end()));  // the OLD content
+}
+
+TEST(net_trash_limit_purges_oldest_entries) {
+    ServerConfig cfg;
+    cfg.max_trash_bytes = 1000;
+    Env e(cfg);
+    auto t = e.target(e.rw);
+    t->open();
+    for (int i = 1; i <= 4; i++) {
+        PutItem a = e.item("f" + std::to_string(i) + ".bin", Bytes(400, uint8_t('a' + i)));
+        CHECK(t->put_file(a.rel, a.abs_src, a.meta).status == PutResult::Sent);
+    }
+    for (int i = 1; i <= 4; i++) {
+        t->remove_path("f" + std::to_string(i) + ".bin", false);
+        CHECK(trash_total(e.root) <= 1000);
+        pause_ms(15);  // distinct millisecond time stamps => distinct trash directories
+    }
+    auto tf = trash_files(e.root);
+    CHECK_EQ(tf.size(), size_t(2));  // 400 + 400 fit, the two oldest were purged
+    bool has3 = false, has4 = false;
+    for (auto& f : tf) {
+        if (f.first.find("f3.bin") != std::string::npos) has3 = true;
+        if (f.first.find("f4.bin") != std::string::npos) has4 = true;
+    }
+    CHECK(has3 && has4);
+}
+
+TEST(net_item_larger_than_trash_limit_is_refused_not_lost) {
+    ServerConfig cfg;
+    cfg.max_trash_bytes = 1000;
+    Env e(cfg);
+    auto t = e.target(e.rw);
+    t->open();
+    PutItem a = e.item("huge.bin", Bytes(2000, 'h'));
+    CHECK(t->put_file(a.rel, a.abs_src, a.meta).status == PutResult::Sent);
+    bool threw = false;
+    try {
+        t->remove_path("huge.bin", false);
+    } catch (const std::exception& ex) {
+        threw = std::string(ex.what()).find("trash limit") != std::string::npos;
+    }
+    CHECK(threw);
+    CHECK(fs::exists(e.root / "huge.bin"));  // not deleted
+
+    // overwriting it would also have to trash the 2000-byte original: refused, old version stays intact
+    PutItem b = e.item("huge.bin", Bytes(2100, 'n'));
+    PutResult r = t->put_file(b.rel, b.abs_src, b.meta);
+    CHECK(r.status == PutResult::Failed);
+    CHECK(r.error.find("trash limit") != std::string::npos);
+    CHECK_EQ(slurp(e.root / "huge.bin"), std::string(2000, 'h'));
+    CHECK(!any_tmp_left(e.root));
+    CHECK(trash_files(e.root).empty());
+}
+
+TEST(net_max_sessions_per_client) {
+    Env e(ServerConfig(), false, [](ClientAcl& a) { a.max_sessions = 2; });
+    auto a = e.target(e.rw);
+    a->open();
+    auto b = e.target(e.rw);
+    b->open();
+    auto c = e.target(e.rw);
+    CHECK_THROWS(c->open());  // third session of the same client: refused
+    auto other = e.target(e.ro);
+    other->open();  // another client is not affected
+    PutItem it = e.item_text("still.txt", "works");
+    CHECK(a->put_file(it.rel, it.abs_src, it.meta).status == PutResult::Sent);  // existing sessions keep working
+    a->close();
+    bool again = false;
+    for (int i = 0; i < 100 && !again; i++) {  // the freed slot is released by the server thread
+        auto d = e.target(e.rw);
+        try {
+            d->open();
+            again = true;
+            d->close();
+        } catch (const std::exception&) {
+            pause_ms(20);
+        }
+    }
+    CHECK(again);
+    b->close();
+    other->close();
+}
+
+TEST(net_write_quota_per_client) {
+    Env e(ServerConfig(), false, [](ClientAcl& a) { a.max_write_bytes_per_hour = 1u << 20; });
+    auto t = e.target(e.rw);
+    t->open();
+    PutItem a = e.item("q1.bin", pseudo_random(600000, 21));
+    CHECK(t->put_file(a.rel, a.abs_src, a.meta).status == PutResult::Sent);
+    PutItem b = e.item("q2.bin", pseudo_random(600000, 22));
+    PutResult r = t->put_file(b.rel, b.abs_src, b.meta);  // 600000 + 600000 > 1 MiB
+    CHECK(r.status == PutResult::Failed);
+    CHECK(r.error.find("quota") != std::string::npos);
+    CHECK(!fs::exists(e.root / "q2.bin"));
+    PutItem c = e.item("q3.bin", pseudo_random(100000, 23));
+    CHECK(t->put_file(c.rel, c.abs_src, c.meta).status == PutResult::Sent);  // the session survived; room is left
+    PutResult skip = t->put_file(a.rel, a.abs_src, a.meta);
+    CHECK(skip.status == PutResult::Skipped);  // unchanged files cost no quota
+    t->close();
+    // the rw quota does not touch another client
+    auto s = e.target(e.sub);
+    s->open();
+    PutItem d = e.item("sub1.bin", pseudo_random(900000, 24));
+    CHECK(s->put_file(d.rel, d.abs_src, d.meta).status == PutResult::Sent);
+}
+
+TEST(write_quota_sliding_window) {
+    WriteQuota q(1000);
+    const int64_t m = 60000;
+    int64_t t0 = 10 * m;
+    CHECK(q.charge(600, t0));
+    CHECK(!q.charge(600, t0));  // nothing is charged on refusal
+    CHECK_EQ(q.used(t0), uint64_t(600));
+    CHECK(!q.would_exceed(400, t0));
+    CHECK(q.would_exceed(401, t0));
+    CHECK(q.charge(400, t0 + 5 * m));
+    CHECK(!q.charge(1, t0 + 30 * m));
+    CHECK_EQ(q.used(t0 + 59 * m), uint64_t(1000));  // still inside the hour
+    CHECK_EQ(q.used(t0 + 60 * m), uint64_t(400));   // the first 600 left the window
+    CHECK_EQ(q.used(t0 + 65 * m), uint64_t(0));
+    CHECK(q.charge(1000, t0 + 65 * m));
+    WriteQuota unlimited(0);
+    CHECK(unlimited.charge(UINT64_MAX, 0));
+    CHECK(!unlimited.would_exceed(UINT64_MAX, 0));
+}
+
+#ifndef _WIN32
+TEST(net_created_files_and_dirs_use_configured_modes) {
+    auto perms = [](const fs::path& p) { return unsigned(fs::status(p).permissions() & fs::perms::mask); };
+    {
+        Env e;  // defaults: files 0640, directories 0750
+        auto t = e.target(e.rw);
+        t->open();
+        PutItem a = e.item_text("m/n/f.txt", "mode check");
+        CHECK(t->put_file(a.rel, a.abs_src, a.meta).status == PutResult::Sent);
+        CHECK_EQ(perms(e.root / "m" / "n" / "f.txt"), 0640u);
+        CHECK_EQ(perms(e.root / "m" / "n"), 0750u);
+        CHECK_EQ(perms(e.root / "m"), 0750u);
+        t->make_dir("k/l");
+        CHECK_EQ(perms(e.root / "k" / "l"), 0750u);
+    }
+    {
+        ServerConfig cfg;
+        cfg.file_mode = 0600;
+        cfg.dir_mode = 0700;
+        Env e(cfg);
+        auto t = e.target(e.rw);
+        t->open();
+        PutItem a = e.item_text("p/q.txt", "private");
+        CHECK(t->put_file(a.rel, a.abs_src, a.meta).status == PutResult::Sent);
+        CHECK_EQ(perms(e.root / "p" / "q.txt"), 0600u);
+        CHECK_EQ(perms(e.root / "p"), 0700u);
+        t->remove_path("p/q.txt", false);
+        bool dirs_ok = true;
+        for (fs::recursive_directory_iterator it(e.root / "__sync" / "__trash"), end; it != end; ++it)
+            if (it->is_directory() && perms(it->path()) != 0700u) dirs_ok = false;
+        CHECK(dirs_ok);
+    }
+}
+#endif
+
+// ---------------------------------------------------------------- server-side bandwidth caps
+
+namespace {
+double timed_put(ITarget& t, const PutItem& it) {
+    auto t0 = Clock::now();
+    CHECK(t.put_file(it.rel, it.abs_src, it.meta).status == PutResult::Sent);
+    return secs_since(t0);
+}
+}  // namespace
+
+TEST(net_server_total_bandwidth_cap) {
+    ServerConfig cfg;
+    cfg.max_bandwidth_kbps = 800;  // 100 KB/s, burst 10 KB
+    Env e(cfg);
+    auto t = e.target(e.rw);
+    t->open();
+    PutItem a = e.item("bw.bin", pseudo_random(300000, 31));  // incompressible: ~300 KB on the wire
+    double dt = timed_put(*t, a);
+    CHECK(dt >= 2.0);
+    CHECK(dt < 20.0);
+    CHECK(hash_of(e.root / "bw.bin") == a.meta.hash);
+}
+
+TEST(net_server_per_client_bandwidth_cap_leaves_others_alone) {
+    Env e(ServerConfig(), false, [](ClientAcl& a) { a.max_bandwidth_kbps = 800; });
+    auto t = e.target(e.rw);
+    t->open();
+    PutItem a = e.item("slow.bin", pseudo_random(300000, 32));
+    CHECK(timed_put(*t, a) >= 2.0);
+    auto s = e.target(e.sub);
+    s->open();
+    PutItem b = e.item("fast.bin", pseudo_random(300000, 33));
+    CHECK(timed_put(*s, b) < 1.5);  // client "sub" has no cap of its own and the server has none
+}
+
+TEST(net_server_client_cap_is_shared_by_its_connections) {
+    Env e(ServerConfig(), false, [](ClientAcl& a) { a.max_bandwidth_kbps = 1600; });  // 200 KB/s for the client
+    PutItem a = e.item("p1.bin", pseudo_random(400000, 34));
+    PutItem b = e.item("p2.bin", pseudo_random(400000, 35));
+    auto t1 = e.target(e.rw);
+    auto t2 = e.target(e.rw);
+    t1->open();
+    t2->open();
+    auto t0 = Clock::now();
+    std::thread th1([&] { CHECK(t1->put_file(a.rel, a.abs_src, a.meta).status == PutResult::Sent); });
+    std::thread th2([&] { CHECK(t2->put_file(b.rel, b.abs_src, b.meta).status == PutResult::Sent); });
+    th1.join();
+    th2.join();
+    double dt = secs_since(t0);
+    CHECK(dt >= 3.0);  // 800 KB through one 200 KB/s bucket (two separate buckets would take ~2 s)
+    CHECK(dt < 30.0);
 }

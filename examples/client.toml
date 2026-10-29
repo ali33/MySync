@@ -100,5 +100,9 @@ enabled = true
 # không cần máy chủ MySync. Vẫn bỏ qua tệp trùng nội dung, ghi tạm + đổi tên nguyên tử, chặn thoát khỏi thư mục đích.
 [[watch.target]]
 path = "/mnt/nas/tailieu"
+# Linux: quyền của tệp / thư mục tạo ra ở đích (chuỗi bát phân, Windows bỏ qua). Mặc định như dưới đây.
+# file_mode = "0640"
+# dir_mode = "0750"
+# Tệp đích bị ghi đè hoặc bị xoá được chuyển vào <đích>/__sync/__trash/<thời gian UTC>/ (đổi tên, không sao chép).
 # Windows: path = '\\nas\backup\tailieu'   (nháy đơn để khỏi phải nhân đôi dấu gạch ngược)
 enabled = true

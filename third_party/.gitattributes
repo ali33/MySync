@@ -1,0 +1,2 @@
+# Vendored files are checksum-pinned (CHECKSUMS.sha256): never let git rewrite their line endings.
+* -text

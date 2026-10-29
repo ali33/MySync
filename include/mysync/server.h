@@ -13,7 +13,12 @@
 //    oldest unfinished NEED_* offer, so the client sends file contents in OFFER order.
 //  - LIST_REQ{prefix}: entry paths are relative to <virtual root>/<prefix>.
 //  - DELETE of a missing path succeeds (idempotent). With trash=true the path is moved to
-//    <root>/__sync/__trash/<UTC timestamp>/<path relative to root>.
+//    <root>/__sync/__trash/<UTC timestamp>/<path relative to root>. The same happens to the old content of a file
+//    that an upload overwrites (moved by rename, before the new content is renamed into place). The trash is capped
+//    by ServerConfig::max_trash_bytes: older timestamp directories are purged first; a single item larger than the
+//    cap is refused (FILE_ERR TooLarge) instead of being deleted or overwritten.
+//  - Per client (ClientAcl): max_sessions caps its concurrent sessions (extra ones are answered with FILE_ERR Busy and
+//    closed), max_write_bytes_per_hour caps received bytes in any sliding hour (FILE_ERR Busy, logged).
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -73,6 +78,23 @@ private:
     std::map<std::string, Entry> fails_;
     std::list<std::string> order_;  // oldest last-failure first
     int64_t last_sweep_ms_ = INT64_MIN / 2;
+};
+
+// Sliding-window (one hour, minute buckets) budget of bytes a client may write. Thread-safe. limit 0 = unlimited.
+// `now_ms` is any monotonic millisecond clock (the server passes steady_clock).
+class WriteQuota {
+public:
+    explicit WriteQuota(uint64_t limit_per_hour) : limit_(limit_per_hour) { minute_.fill(-1); bytes_.fill(0); }
+    bool would_exceed(uint64_t add, int64_t now_ms);  // true when charging `add` now would pass the limit
+    bool charge(uint64_t add, int64_t now_ms);        // false (and nothing charged) when it would pass the limit
+    uint64_t used(int64_t now_ms);                    // bytes charged within the last hour
+
+private:
+    uint64_t used_locked(int64_t now_min) const;
+    uint64_t limit_;
+    std::mutex m_;
+    std::array<int64_t, 60> minute_;
+    std::array<uint64_t, 60> bytes_;
 };
 
 class Server {

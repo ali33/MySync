@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -26,6 +27,8 @@ namespace mysync::fio {
 namespace fs = std::filesystem;
 
 constexpr const char* kTmpPrefix = ".mysync-tmp-";
+constexpr uint32_t kDefaultFileMode = 0640;  // POSIX permission bits of created files / directories (ignored on Windows)
+constexpr uint32_t kDefaultDirMode = 0750;
 
 struct StatInfo {
     bool exists = false;
@@ -86,6 +89,43 @@ inline bool set_mtime(const fs::path& p, int64_t mtime_ns) {
     ts[1].tv_sec = time_t(mtime_ns / 1000000000LL);
     ts[1].tv_nsec = long(mtime_ns % 1000000000LL);
     return ::utimensat(AT_FDCWD, p.c_str(), ts, 0) == 0;
+#endif
+}
+
+// chmod that ignores the umask; no-op (true) on Windows.
+inline bool set_mode(const fs::path& p, uint32_t mode) {
+#ifdef _WIN32
+    (void)p;
+    (void)mode;
+    return true;
+#else
+    return ::chmod(p.c_str(), mode_t(mode)) == 0;
+#endif
+}
+
+// create_directories with explicit permission bits for every directory it creates (the umask is overridden by a
+// following chmod). On Windows identical to fs::create_directories.
+inline void create_dirs(const fs::path& dir, uint32_t mode, std::error_code& ec) {
+#ifdef _WIN32
+    (void)mode;
+    fs::create_directories(dir, ec);
+#else
+    ec.clear();
+    std::vector<fs::path> missing;
+    for (fs::path p = dir; !p.empty(); p = p.parent_path()) {
+        std::error_code e2;
+        if (fs::exists(p, e2)) break;
+        missing.push_back(p);
+        if (p == p.parent_path()) break;
+    }
+    for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+        if (::mkdir(it->c_str(), mode_t(mode)) == 0) {
+            ::chmod(it->c_str(), mode_t(mode));
+        } else if (errno != EEXIST) {
+            ec = std::error_code(errno, std::generic_category());
+            return;
+        }
+    }
 #endif
 }
 
@@ -159,12 +199,13 @@ public:
             n -= size_t(w);
         }
     }
-    // Flushes data to stable storage, stamps the modification time (when mtime_ns >= 0, on the open handle so no
+    // Flushes data to stable storage, sets the POSIX permission bits to `mode`, stamps the modification time (when mtime_ns >= 0, on the open handle so no
     // second open is needed) and closes the handle; the file stays on disk. Returns false if only the stamp failed.
-    bool sync_and_close(int64_t mtime_ns = -1) {
+    bool sync_and_close(int64_t mtime_ns = -1, uint32_t mode = kDefaultFileMode) {
         if (h_ == kInvalid) return true;
         bool stamped = true;
 #ifdef _WIN32
+        (void)mode;
         bool ok = FlushFileBuffers(h_) != 0;
         if (mtime_ns >= 0) {
             uint64_t ft = uint64_t(mtime_ns / 100 + 116444736000000000LL);
@@ -175,7 +216,7 @@ public:
         }
         CloseHandle(h_);
 #else
-        ::fchmod(h_, 0644);
+        ::fchmod(h_, mode_t(mode));
         bool ok = ::fsync(h_) == 0;
         if (mtime_ns >= 0) {
             struct timespec ts[2];

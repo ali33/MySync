@@ -244,3 +244,77 @@ TEST(config_load_from_file_mentions_path) {
     CHECK(msg.find("unknown key 'zzz' at line 3") != std::string::npos);
     CHECK_THROWS(load_client_config((d.p / "nope.toml").u8string()));
 }
+
+
+TEST(config_server_limits_modes_and_defaults) {
+    ServerConfig d = parse_server_config_text(srv());
+    CHECK_EQ(d.max_file_size, uint64_t(10) << 30);
+    CHECK_EQ(d.max_trash_bytes, uint64_t(10) << 30);
+    CHECK_EQ(d.file_mode, 0640u);
+    CHECK_EQ(d.dir_mode, 0750u);
+    CHECK_EQ(d.clients[0].max_sessions, 4u);
+    CHECK_EQ(d.clients[0].max_write_bytes_per_hour, uint64_t(50) << 30);
+
+    ServerConfig c = parse_server_config_text(
+        "[server]\nroot='r'\nkey_file='k'\nmax_trash_bytes = \"2GB\"\nmax_file_size = 0\n"
+        "file_mode = \"0600\"\ndir_mode = '0700'\n"
+        "[[client]]\nname='a'\npublic_key='" + K1 + "'\nmax_sessions = 9\nmax_write_bytes_per_hour = \"1.5GB\"\n"
+        "[[client]]\nname='b'\npublic_key='" + K2 + "'\nmax_write_bytes_per_hour = 12345\n"
+        "[[client]]\nname='c'\npublic_key='" + K3 + "'\nmax_write_bytes_per_hour = 0\n");
+    CHECK_EQ(c.max_trash_bytes, uint64_t(2) << 30);
+    CHECK_EQ(c.max_file_size, uint64_t(0));  // explicit 0 = unlimited
+    CHECK_EQ(c.file_mode, 0600u);
+    CHECK_EQ(c.dir_mode, 0700u);
+    CHECK_EQ(c.clients[0].max_sessions, 9u);
+    CHECK_EQ(c.clients[0].max_write_bytes_per_hour, uint64_t(1610612736));
+    CHECK_EQ(c.clients[1].max_sessions, 4u);
+    CHECK_EQ(c.clients[1].max_write_bytes_per_hour, uint64_t(12345));
+    CHECK_EQ(c.clients[2].max_write_bytes_per_hour, uint64_t(0));
+}
+
+TEST(config_server_limits_and_modes_errors) {
+    CHECK(err_of(srv("file_mode = \"0755\"\n"), true).find("execute") != std::string::npos);
+    CHECK(err_of(srv("file_mode = \"0400\"\n"), true).find("owner") != std::string::npos);
+    CHECK(err_of(srv("file_mode = \"0689\"\n"), true).find("octal") != std::string::npos);
+    CHECK(err_of(srv("file_mode = \"abc\"\n"), true).find("line 3") != std::string::npos);
+    CHECK(err_of(srv("file_mode = 640\n"), true).find("octal string") != std::string::npos);
+    CHECK(err_of(srv("dir_mode = \"0600\"\n"), true).find("rwx") != std::string::npos);
+    CHECK(err_of(srv("max_trash_bytes = \"lots\"\n"), true).find("line 3") != std::string::npos);
+    CHECK(err_of(srv("max_trash_bytes = -1\n"), true).find("negative") != std::string::npos);
+    CHECK(err_of(srv() + "max_sessions = 0\n", true).find("out of range") != std::string::npos);
+    CHECK(err_of(srv() + "max_sessions = \"4\"\n", true).find("integer") != std::string::npos);
+    CHECK(err_of(srv() + "max_write_bytes_per_hour = \"x\"\n", true).find("line 6") != std::string::npos);
+    CHECK(err_of(srv() + "max_sessionz = 4\n", true).find("unknown key 'max_sessionz'") != std::string::npos);
+    CHECK_EQ(parse_file_mode("640"), 0640u);
+    CHECK_EQ(parse_dir_mode("0755"), 0755u);
+    CHECK_THROWS(parse_file_mode(""));
+    CHECK_THROWS(parse_file_mode("06400"));
+    CHECK_THROWS(parse_dir_mode("0o755"));
+}
+
+TEST(config_local_target_modes) {
+    ClientConfig c = parse_client_config_text(
+        "key_file='k'\n[[watch]]\npath='/w'\n[[watch.target]]\npath='/d'\nfile_mode='0644'\ndir_mode='0755'\n"
+        "[[watch.target]]\npath='/e'\n");
+    CHECK_EQ(c.watches[0].targets[0].file_mode, 0644u);
+    CHECK_EQ(c.watches[0].targets[0].dir_mode, 0755u);
+    CHECK_EQ(c.watches[0].targets[1].file_mode, 0640u);
+    CHECK_EQ(c.watches[0].targets[1].dir_mode, 0750u);
+    CHECK(err_of("key_file='k'\n[[watch]]\npath='/w'\n[[watch.target]]\nhost='h'\nserver_key='" + K1 +
+                 "'\nfile_mode='0640'\n", false).find("local targets") != std::string::npos);
+    CHECK(err_of("key_file='k'\n[[watch]]\npath='/w'\n[[watch.target]]\npath='/d'\nfile_mode='0750'\n", false)
+              .find("execute") != std::string::npos);
+}
+
+TEST(config_server_bandwidth_caps) {
+    ServerConfig d = parse_server_config_text(srv());
+    CHECK_EQ(d.max_bandwidth_kbps, 0u);
+    CHECK_EQ(d.clients[0].max_bandwidth_kbps, 0u);
+    ServerConfig c = parse_server_config_text(
+        "[server]\nroot='r'\nkey_file='k'\nmax_bandwidth_kbps = 8000\n[[client]]\nname='a'\npublic_key='" + K1 +
+        "'\nmax_bandwidth_kbps = 1_000\n");
+    CHECK_EQ(c.max_bandwidth_kbps, 8000u);
+    CHECK_EQ(c.clients[0].max_bandwidth_kbps, 1000u);
+    CHECK(err_of(srv("max_bandwidth_kbps = -1\n"), true).find("out of range") != std::string::npos);
+    CHECK(err_of(srv() + "max_bandwidth_kbps = \"5\"\n", true).find("integer") != std::string::npos);
+}

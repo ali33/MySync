@@ -23,7 +23,7 @@ Bản quyền (C) 2026 META.vn · Tác giả: Nguyễn Đức Sơn · GPL-2.0-or
 | Lịch đồng bộ `syncTasks` (task time, sleepTimeSpan) | Giữ | `schedule_at = ["01:00","12:10"]`, `schedule_interval_s` (scheduler.h). |
 | Thư mục hệ thống `__sync` (trash/error/meta) | Giữ ý tưởng | `__sync` không bao giờ được đồng bộ; trash trên đích. |
 | Dịch vụ Windows (Service/ServiceInstaller.cs, ServicePart.cs) | Giữ + mở rộng | `mysync service install/uninstall/start/stop` (SCM) và unit systemd trên Linux; chạy độc lập foreground. |
-| Giới hạn `Max_BandWidth` | Giữ | `max_bandwidth_kbps` (token bucket). |
+| Giới hạn `Max_BandWidth` | Giữ | `max_bandwidth_kbps` (token bucket) ở máy khách; nay máy chủ cũng có `[server] max_bandwidth_kbps` (trần toàn máy) và `[[client]] max_bandwidth_kbps` (trần riêng từng máy, chung cho mọi kết nối của máy đó, gộp byte nhận + gửi; luôn qua cả hai bucket nên mức thấp hơn thắng, kể cả khi máy khách tự đặt giới hạn). Không theo khung giờ, không áp cho đích copy cục bộ. |
 | Giới hạn `Max_Cpu` (ServerPerformance) | Đổi | Thay bằng `connections`/số luồng băm; không đo CPU toàn máy. |
 | Nhật ký NLog | Đổi | `log.h` đơn giản: tệp + stderr, mức log; không ghi bí mật. |
 | Đích copy trực tiếp (Simple/CopyClient.cs) | Giữ — theo quyết định người dùng | `[[watch.target]] path = "..."`: ổ khác, thư mục khác, UNC `\server\share` (Windows) hoặc điểm mount CIFS/NFS (Linux), không cần server MySync. Đủ: bỏ qua trùng hash, ghi tạm + rename nguyên tử, chặn thoát khỏi thư mục đích (safe_join). |

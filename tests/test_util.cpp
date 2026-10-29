@@ -104,3 +104,27 @@ TEST(util_log_file_threadsafe) {
     std::error_code ec;
     fs::remove_all(dir, ec);
 }
+
+TEST(util_log_timestamp_is_complete) {
+    namespace fs = std::filesystem;
+    uint8_t r[6];
+    random_bytes(r, sizeof r);
+    fs::path dir = fs::temp_directory_path() / ("mysync-test-" + to_hex(r, sizeof r));
+    fs::create_directories(dir);
+    fs::path lf = dir / "ts.txt";
+    log_set_level(LogLevel::Info);
+    log_set_file(lf.u8string());
+    log_info("probe");
+    log_set_file("");
+    std::ifstream in(lf, std::ios::binary);
+    std::string line;
+    std::getline(in, line);
+    in.close();
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    // exactly "YYYY-MM-DD HH:MM:SS.mmm [INFO] probe": a 23-character timestamp that was never cut short
+    CHECK(line.size() > 24);
+    CHECK(line[4] == '-' && line[7] == '-' && line[10] == ' ' && line[13] == ':' && line[16] == ':' && line[19] == '.');
+    CHECK(line[23] == ' ' && line[24] == '[');
+    CHECK(line.find("probe") != std::string::npos);
+}

@@ -10,7 +10,7 @@
 // true/false, arrays (single or multi line, comments allowed inside), '#' comments.
 // Not supported: floats, dates, inline tables, dotted keys, multi-line strings.
 // Server file: keys at top level (optionally under a [server] table) plus [[client]] entries
-// (name, public_key, access = "rw"|"ro", prefix).
+// (name, public_key, access = "rw"|"ro", prefix, max_sessions, max_write_bytes_per_hour).
 // Client file: keys at top level (optionally under [client]), then [[watch]], [watch.filter], [[watch.target]] (network: host/server_key, or local: path).
 // Every error is thrown as Error with the offending line ("unknown key 'x' at line N").
 #include <array>
@@ -46,6 +46,9 @@ struct TargetConfig {
     std::string path;         // local destination directory
     std::string remote_prefix;
     bool enabled = true;
+    // Local targets on Linux/macOS: permission bits of created files / directories (ignored on Windows).
+    uint32_t file_mode = 0640;
+    uint32_t dir_mode = 0750;
     bool is_local() const { return !path.empty(); }
 };
 
@@ -70,6 +73,9 @@ struct ClientAcl {
     PublicKey public_key{};
     bool read_only = false;   // access = "ro"
     std::string prefix;       // sub-directory of root this client may see ("" = whole root), no leading/trailing '/'
+    uint32_t max_sessions = 4;                              // concurrent sessions of this client (0 = unlimited)
+    uint64_t max_write_bytes_per_hour = 50ull << 30;        // bytes received in any sliding hour (0 = unlimited)
+    uint32_t max_bandwidth_kbps = 0;  // cap on bytes the server receives + sends for this client, shared by all its connections (0 = none of its own)
 };
 
 struct ServerConfig {
@@ -86,7 +92,12 @@ struct ServerConfig {
     std::string state_dir;
     std::string log_file;
     std::string log_level = "info";
-    uint64_t max_file_size = 0;  // 0 = unlimited; accepts "10GB" style strings
+    uint32_t max_bandwidth_kbps = 0;  // cap on all bytes received + sent by the server, all clients together (0 = unlimited)
+    uint64_t max_file_size = 10ull << 30;  // default 10 GiB; an explicit 0 = unlimited; accepts "10GB" style strings
+    uint64_t max_trash_bytes = 10ull << 30;  // size cap of <root>/__sync/__trash (oldest entries purged first); 0 = unlimited
+    // Linux/macOS: permission bits of files / directories created by the server (octal text in the file, e.g. "0640").
+    uint32_t file_mode = 0640;
+    uint32_t dir_mode = 0750;
     uint32_t io_timeout_s = 60;
 };
 
@@ -113,6 +124,11 @@ ServerConfig parse_server_config_text(const std::string& text);
 ClientConfig parse_client_config_text(const std::string& text);
 ServerConfig load_server_config(const std::string& utf8_path);
 ClientConfig load_client_config(const std::string& utf8_path);
+
+// Octal permission text ("0640", "640", "0750") -> bits. File modes must not carry any execute bit and must keep
+// owner read+write; directory modes must keep owner rwx. Only the 9 rwx bits are accepted. Throws Error.
+uint32_t parse_file_mode(const std::string& octal);
+uint32_t parse_dir_mode(const std::string& octal);
 
 // Reads a secret key file: exactly 64 hex characters (trailing newline allowed) -> 32 bytes.
 // Linux: refused when group/other can access the file. Windows: read only.

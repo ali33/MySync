@@ -31,7 +31,7 @@ Mỗi thông điệp: u8 type + các trường (u8/u16/u32/u64 big-endian, chu�
   SKIP (đã có nội dung y hệt - cùng hash; chỉ cập nhật mtime nếu khác) | NEED_FULL | NEED_DELTA{block_size, n, sigs[n]{weak u32, strong16}}
 - DATA{seq, flags(bit0 lz4), bytes} * ; ENDFILE{hash32} -> server ghi vào tệp tạm cùng thư mục (.mysync-tmp-<rand>), tính BLAKE3 khi nhận, so với hash khai báo + hash tính lại; khớp thì fsync + set mtime + rename nguyên tử; trả FILE_OK / FILE_ERR{code}.
 - DELTA_OPS (thay DATA khi NEED_DELTA): chuỗi COPY{block_idx} | LITERAL{bytes}; server dựng lại từ tệp cũ -> tệp tạm -> kiểm hash như trên.
-- DELETE{path} (chuyển vào __sync/__trash/<timestamp>/..., không xoá thật nếu config trash=true) | RENAME{from,to} | MKDIR{path}
+- DELETE{path} (chuyển vào __sync/__trash/<timestamp>/..., không xoá thật nếu config trash=true; upload ghi đè tệp có sẵn cũng chuyển bản cũ vào đó bằng rename trước khi đổi tên bản mới) | RENAME{from,to} | MKDIR{path}
 - PING/PONG, BYE.
 Pipeline: client giữ N kết nối song song (config `connections`, mặc định 4), mỗi kết nối xử lý tuần tự nhiều tệp; tệp nhỏ được OFFER theo lô (OFFER không chờ trả lời từng cái: gửi tới `window` OFFER rồi đọc phản hồi) để tránh RTT.
 Giới hạn: kích thước tệp tối đa theo config; server từ chối đường dẫn xấu (xem pathsafe.h) với PATH_DENIED.
@@ -65,3 +65,25 @@ mysync service install|uninstall|start|stop  -c <config> --role server|client [-
 mysync version
 ```
 Chạy độc lập: lệnh ở foreground, Ctrl+C / SIGTERM dừng sạch. Service: Windows SCM hoặc systemd (`Type=notify` hoặc simple).
+
+## Hạn mức, thùng rác và quyền tệp của máy chủ
+
+- **Theo từng client** (`[[client]]`): `max_sessions` (mặc định 4) — phiên thứ N+1 của cùng client bị từ chối bằng
+  `FILE_ERR(BUSY)` rồi đóng, client khác không bị ảnh hưởng; `max_write_bytes_per_hour` (mặc định 50GB, 0 = không hạn) —
+  cửa sổ trượt 1 giờ (60 xô theo phút) đếm byte thực sự ghi; OFFER mà chắc chắn vượt hạn mức bị từ chối ngay
+  (`FILE_ERR(BUSY)`, log cảnh báo), vượt giữa chừng thì tệp đang nhận bị huỷ. Tệp trùng nội dung (SKIP) không tốn hạn mức;
+  byte của lần truyền hỏng không được hoàn lại (tính thận trọng).
+- **Thùng rác** (`[server] max_trash_bytes`, mặc định 10GB, 0 = không hạn): tổng dung lượng `__sync/__trash` được đếm
+  lười (quét một lần khi cần, sau đó cộng trừ). Trước khi chuyển một mục vào thùng, nếu tổng sẽ vượt hạn mức thì xoá các
+  thư mục mốc thời gian CŨ NHẤT (tên là mốc UTC nên sắp theo tên là sắp theo tuổi) cho tới khi đủ chỗ. Mục đơn lẻ lớn hơn
+  hạn mức thì xoá/ghi đè bị từ chối (`FILE_ERR(TOO_LARGE)` "trash limit") — dữ liệu cũ giữ nguyên, không bao giờ vừa
+  xoá vừa mất. Mọi thao tác trên thùng rác đi qua một khoá, nên hai phiên không dọn lẫn nhau.
+- **Ghi đè bằng upload**: trước khi rename bản mới đè lên tệp có sẵn, bản cũ được rename vào thùng rác (cùng volume nên
+  không sao chép); nếu rename bản mới hỏng thì bản cũ được trả về chỗ cũ. `LocalTarget` làm tương tự (thùng rác của đích,
+  chưa có hạn mức dung lượng).
+- **`max_file_size`** mặc định 10GB; đặt tường minh 0 vẫn là không giới hạn (có cảnh báo trong log lúc nạp cấu hình).
+- **Quyền tệp (Linux/macOS)**: `file_mode` (mặc định 0640, không bit thực thi) và `dir_mode` (0750) áp cho mọi tệp /
+  thư mục máy chủ và `LocalTarget` tạo ra (`[[watch.target]]` cục bộ có khoá `file_mode`/`dir_mode` riêng); dùng
+  `fchmod`/`chmod` nên không phụ thuộc umask. Tệp tạm được tạo 0600. Windows bỏ qua.
+- **Tên nguy hiểm trong `pathsafe`**: chặn `COM¹ COM² COM³ LPT¹ LPT² LPT³` (mọi kiểu chữ, có/không đuôi) trên mọi nền
+  tảng; `__sync` và `.mysync-tmp-` được so sánh sau khi gấp chữ đơn giản, gồm U+017F (ſ → s) và U+212A (K Kelvin → k).

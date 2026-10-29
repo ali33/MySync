@@ -93,6 +93,8 @@ if(MINGW)
   target_link_options(mysync_tests PRIVATE -static)
 endif()
 add_test(NAME mysync_tests COMMAND mysync_tests)
+add_test(NAME third_party_checksums
+         COMMAND ${CMAKE_COMMAND} -DTP_DIR=${CMAKE_CURRENT_SOURCE_DIR}/third_party -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/verify_third_party.cmake)
 
 if(UNIX AND NOT APPLE)
   foreach(t mysync mysync_tests)

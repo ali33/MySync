@@ -30,6 +30,7 @@
 #include "mysync/net.h"
 #include "mysync/pathsafe.h"
 #include "mysync/protocol.h"
+#include "mysync/ratelimit.h"
 #include "mysync/secure_channel.h"
 
 namespace mysync {
@@ -93,19 +94,6 @@ fs::path u8(const std::string& s) { return fs::u8path(s); }
 // shutdown(): closing from this thread would race the owner's use of the descriptor; the owning thread sees the
 // failed recv and closes the socket itself.
 void wake(net::Socket& s) { s.shutdown_both(); }
-
-// True when any '/'-separated component is one of our temp files (clients must not address them).
-bool has_tmp_component(const std::string& rel) {
-    const std::string pre = fio::kTmpPrefix;
-    size_t pos = 0;
-    while (pos <= rel.size()) {
-        size_t e = rel.find('/', pos);
-        if (e == std::string::npos) e = rel.size();
-        if (lower(rel.substr(pos, std::min(pre.size(), e - pos))) == pre) return true;
-        pos = e + 1;
-    }
-    return false;
-}
 
 void clean_orphans(const std::string& root) {
     std::error_code ec;
@@ -287,6 +275,42 @@ size_t AuthThrottle::tracked() {
     return fails_.size();
 }
 
+// ---------------------------------------------------------------- WriteQuota
+
+uint64_t WriteQuota::used_locked(int64_t now_min) const {
+    uint64_t sum = 0;
+    for (size_t i = 0; i < 60; i++)
+        if (minute_[i] >= 0 && now_min >= minute_[i] && now_min - minute_[i] < 60) sum += bytes_[i];
+    return sum;
+}
+
+bool WriteQuota::would_exceed(uint64_t add, int64_t now_ms) {
+    if (limit_ == 0) return false;
+    std::lock_guard<std::mutex> lk(m_);
+    uint64_t u = used_locked(now_ms / 60000);
+    return u > limit_ || add > limit_ - u;
+}
+
+bool WriteQuota::charge(uint64_t add, int64_t now_ms) {
+    if (limit_ == 0) return true;
+    std::lock_guard<std::mutex> lk(m_);
+    int64_t cur = now_ms / 60000;
+    uint64_t u = used_locked(cur);
+    if (u > limit_ || add > limit_ - u) return false;
+    size_t i = size_t(cur % 60);
+    if (minute_[i] != cur) {
+        minute_[i] = cur;
+        bytes_[i] = 0;
+    }
+    bytes_[i] += add;
+    return true;
+}
+
+uint64_t WriteQuota::used(int64_t now_ms) {
+    std::lock_guard<std::mutex> lk(m_);
+    return used_locked(now_ms / 60000);
+}
+
 // ---------------------------------------------------------------- server core
 
 namespace detail {
@@ -306,6 +330,13 @@ struct SessRec {
     net::Socket* sock = nullptr;
 };
 
+struct ClientState {
+    std::atomic<int> sessions{0};
+    WriteQuota quota;
+    RateLimiter bandwidth;  // shared by every connection of this client (received + sent bytes)
+    ClientState(uint64_t bytes_per_hour, uint32_t kbps) : quota(bytes_per_hour), bandwidth(kbps) {}
+};
+
 struct ServerCore {
     ServerConfig cfg;
     KeyPair key;
@@ -320,6 +351,11 @@ struct ServerCore {
     std::mutex um;               // connections still in the handshake
     std::map<std::string, int> unauth_by_key;
     size_t unauth_total = 0;
+    RateLimiter total_bandwidth;  // all clients together
+    std::vector<std::unique_ptr<ClientState>> cstate;  // parallel to cfg.clients
+    std::mutex trash_mu;           // serialises moves into / purges of <root>/__sync/__trash
+    bool trash_scanned = false;    // trash_bytes is valid (computed lazily, only when max_trash_bytes != 0)
+    uint64_t trash_bytes = 0;
 
     size_t unauth_cap() const { return std::max<size_t>(8, cfg.max_connections / 2); }
     bool unauth_acquire(const std::string& key) {
@@ -349,17 +385,21 @@ struct ServerCore {
     }
 
     ServerCore(ServerConfig c, const KeyPair& k)
-        : cfg(std::move(c)), key(k), ipf(cfg.allow, cfg.deny), thr(cfg.max_auth_failures_per_min) {
+        : cfg(std::move(c)), key(k), ipf(cfg.allow, cfg.deny), thr(cfg.max_auth_failures_per_min),
+          total_bandwidth(cfg.max_bandwidth_kbps) {
         if (cfg.root.empty()) throw Error("server root is not set");
         net::init();
         std::error_code ec;
-        fs::create_directories(u8(cfg.root), ec);
+        fio::create_dirs(u8(cfg.root), cfg.dir_mode, ec);
         if (!fs::is_directory(u8(cfg.root), ec)) throw Error("server root is not a directory");
         root = fs::weakly_canonical(u8(cfg.root), ec).u8string();
         if (ec) throw Error("cannot resolve server root");
         state_dir = cfg.state_dir.empty() ? (u8(root) / "__sync" / "__meta") : u8(cfg.state_dir);
-        fs::create_directories(state_dir, ec);
+        fio::create_dirs(state_dir, cfg.dir_mode, ec);
         if (ec) throw Error("cannot create state directory");
+        for (size_t i = 0; i < cfg.clients.size(); i++)
+            cstate.push_back(std::make_unique<ClientState>(cfg.clients[i].max_write_bytes_per_hour,
+                                                         cfg.clients[i].max_bandwidth_kbps));
         lsock = net::Socket::listen(cfg.bind, cfg.port);
         clean_orphans(root);
     }
@@ -403,6 +443,7 @@ struct ServerCore {
 
 namespace {
 
+using detail::ClientState;
 using detail::ServerCore;
 using detail::SessRec;
 using detail::Tree;
@@ -412,6 +453,84 @@ struct OpError : Error {
     ErrCode code;
     OpError(ErrCode c, const std::string& m) : Error(m), code(c) {}
 };
+
+// Size in bytes of a file, or of every regular file below a directory (symlinks are not followed).
+uint64_t tree_bytes(const fs::path& p) {
+    std::error_code ec;
+    fs::file_status st = fs::symlink_status(p, ec);
+    if (ec) return 0;
+    if (st.type() == fs::file_type::regular) {
+        auto n = fs::file_size(p, ec);
+        return ec ? 0 : uint64_t(n);
+    }
+    if (st.type() != fs::file_type::directory) return 0;
+    uint64_t sum = 0;
+    fs::recursive_directory_iterator it(p, fs::directory_options::skip_permission_denied, ec), end;
+    for (; !ec && it != end; it.increment(ec)) {
+        std::error_code e2;
+        if (it->is_regular_file(e2) && !it->is_symlink(e2)) {
+            auto n = it->file_size(e2);
+            if (!e2) sum += uint64_t(n);
+        }
+    }
+    return sum;
+}
+
+// Frees trash until trash_bytes <= target by deleting whole timestamp directories, oldest name first (the names are
+// UTC timestamps, so they sort by age). Caller holds c.trash_mu.
+void trash_purge_to(ServerCore& c, uint64_t target) {
+    fs::path troot = u8(c.root) / "__sync" / "__trash";
+    std::error_code ec;
+    std::vector<fs::path> dirs;
+    for (fs::directory_iterator it(troot, ec), end; !ec && it != end; it.increment(ec)) dirs.push_back(it->path());
+    std::sort(dirs.begin(), dirs.end());
+    size_t purged = 0;
+    uint64_t freed = 0;
+    for (const auto& d : dirs) {
+        if (c.trash_bytes <= target) break;
+        uint64_t sz = tree_bytes(d);
+        std::error_code e2;
+        fs::remove_all(d, e2);
+        if (e2) throw OpError(ErrCode::IoError, "cannot free trash space");
+        c.trash_bytes -= std::min(sz, c.trash_bytes);
+        freed += sz;
+        purged++;
+    }
+    if (purged)
+        log_info("trash over max_trash_bytes: purged " + std::to_string(purged) + " oldest entr" +
+                 (purged == 1 ? "y" : "ies") + " (" + std::to_string(freed) + " bytes)");
+    if (c.trash_bytes > target) c.trash_bytes = tree_bytes(troot);  // accounting drifted: resynchronise
+    if (c.trash_bytes > target) throw OpError(ErrCode::IoError, "cannot free enough trash space");
+}
+
+// Moves `abs` (file or directory) into <root>/__sync/__trash/<UTC timestamp>/<real> by rename and returns the new
+// location. Enforces max_trash_bytes: older entries are purged first; an item larger than the cap is refused.
+fs::path trash_move(ServerCore& c, const fs::path& abs, const std::string& real) {
+    std::lock_guard<std::mutex> lk(c.trash_mu);
+    const uint64_t limit = c.cfg.max_trash_bytes;
+    uint64_t sz = 0;
+    if (limit) {
+        sz = tree_bytes(abs);
+        if (sz > limit)
+            throw OpError(ErrCode::TooLarge, "item is larger than the trash limit (max_trash_bytes); not removed");
+        if (!c.trash_scanned) {
+            c.trash_bytes = tree_bytes(u8(c.root) / "__sync" / "__trash");
+            c.trash_scanned = true;
+        }
+        if (c.trash_bytes + sz > limit) trash_purge_to(c, limit - sz);
+    }
+    fs::path base = u8(c.root) / "__sync" / "__trash" / utc_stamp() / u8(real);
+    std::error_code ec;
+    fio::create_dirs(base.parent_path(), c.cfg.dir_mode, ec);
+    if (ec) throw OpError(ErrCode::IoError, "cannot create trash directory");
+    fs::path cand = base;
+    for (int n = 1; fio::stat_path(cand).exists || fs::is_symlink(cand, ec); n++)
+        cand = fs::path(base.u8string() + "-" + std::to_string(n));
+    fs::rename(abs, cand, ec);
+    if (ec) throw OpError(ErrCode::IoError, "cannot move to trash");
+    if (limit) c.trash_bytes += sz;
+    return cand;
+}
 
 struct Resolved {
     fs::path abs;
@@ -439,8 +558,8 @@ struct Pending {
 
 class Session {
 public:
-    Session(ServerCore& c, SecureChannel& ch, const ClientAcl& acl, std::string ip)
-        : c_(c), ch_(ch), acl_(acl), ip_(std::move(ip)) {}
+    Session(ServerCore& c, SecureChannel& ch, const ClientAcl& acl, std::string ip, ClientState& cs)
+        : c_(c), ch_(ch), acl_(acl), ip_(std::move(ip)), cs_(cs) {}
 
     void run() {
         prefix_ = normalize_rel(acl_.prefix);
@@ -449,7 +568,7 @@ public:
             if (is_internal_dir(prefix_)) throw Error("client prefix points into the internal directory");
             fs::path p = safe_join(c_.root, prefix_);  // throws on a malicious prefix: session refused
             std::error_code ec;
-            fs::create_directories(p, ec);
+            fio::create_dirs(p, c_.cfg.dir_mode, ec);
         }
         tree_ = c_.tree_for(prefix_);
 
@@ -474,7 +593,7 @@ public:
         log_info("client '" + acl_.name + "' connected from " + ip_);
 
         for (;;) {
-            Message m = decode(ch_.recv_msg());
+            Message m = decode(recv());
             if (!dispatch(m)) break;
         }
         c_.save_tree(*tree_, false);
@@ -489,12 +608,27 @@ private:
     SecureChannel& ch_;
     const ClientAcl& acl_;
     std::string ip_;
+    ClientState& cs_;
     std::string prefix_;
     std::shared_ptr<Tree> tree_;
     uint32_t caps_ = 0;
     std::deque<std::unique_ptr<Pending>> pending_;
 
-    void send(const Message& m) { ch_.send_msg(encode(m)); }
+    // Bandwidth caps: the client's own bucket first, then the server-wide one (the lower cap wins).
+    void throttle(size_t n) {
+        cs_.bandwidth.acquire(n);
+        c_.total_bandwidth.acquire(n);
+    }
+    Bytes recv() {
+        Bytes b = ch_.recv_msg();
+        throttle(b.size());
+        return b;
+    }
+    void send(const Message& m) {
+        Bytes b = encode(m);
+        throttle(b.size());
+        ch_.send_msg(b);
+    }
     void ok() { send(FileOk{}); }
     void err(ErrCode code, const std::string& msg) { send(FileErr{code, msg}); }
 
@@ -600,6 +734,11 @@ private:
             }
         }
 
+        if (cs_.quota.would_exceed(o.size, steady_ms())) {
+            log_warn("client '" + acl_.name + "' exceeded max_write_bytes_per_hour; refusing " + r.real);
+            throw OpError(ErrCode::Busy, "write quota exceeded (max_write_bytes_per_hour); try again later");
+        }
+
         auto p = std::make_unique<Pending>();
         p->r = r;
         p->size = o.size;
@@ -637,7 +776,7 @@ private:
         // (a symlinked ancestor could have appeared in between).
         bool existed = fs::is_directory(dir, ec);
         if (!existed) {
-            fs::create_directories(dir, ec);
+            fio::create_dirs(dir, c_.cfg.dir_mode, ec);
             if (ec) throw OpError(ErrCode::IoError, "cannot create directory");
             recheck(p.r);
         }
@@ -648,6 +787,10 @@ private:
     void write_body(Pending& p, const void* d, size_t n) {
         if (n > p.size - p.received) throw OpError(ErrCode::TooLarge, "more data than announced");
         ensure_started(p);
+        if (!cs_.quota.charge(n, steady_ms())) {
+            log_warn("client '" + acl_.name + "' exceeded max_write_bytes_per_hour while writing " + p.r.real);
+            throw OpError(ErrCode::Busy, "write quota exceeded (max_write_bytes_per_hour); try again later");
+        }
         p.tmp.write(d, n);
         p.hasher->update(d, n);
         p.received += n;
@@ -732,10 +875,22 @@ private:
             if (!(a && b)) throw OpError(ErrCode::HashMismatch, "hash mismatch");
             p->applier.reset();
             const int64_t mtime = std::max<int64_t>(0, p->mtime_ns);
-            if (!p->tmp.sync_and_close(mtime)) log_debug("cannot set modification time");
+            if (!p->tmp.sync_and_close(mtime, c_.cfg.file_mode)) log_debug("cannot set modification time");
+            // The previous content of an overwritten file goes to the trash first (rename, no copy).
+            fs::path trashed;
+            if (c_.cfg.trash) {
+                fio::StatInfo old = fio::stat_path(p->r.abs);
+                if (old.exists && old.is_regular) trashed = trash_move(c_, p->r.abs, p->r.real);
+            }
             std::error_code ec;
             fs::rename(p->tmp.path(), p->r.abs, ec);  // atomic replace; a directory at the destination fails here
-            if (ec) throw OpError(ErrCode::IoError, "cannot replace destination");
+            if (ec) {
+                if (!trashed.empty()) {
+                    std::error_code e2;
+                    fs::rename(trashed, p->r.abs, e2);  // put the old version back
+                }
+                throw OpError(ErrCode::IoError, "cannot replace destination");
+            }
             p->tmp.release();
             fio::StatInfo ns;
             ns.size = p->size;
@@ -758,17 +913,7 @@ private:
         if (acl_.read_only) throw OpError(ErrCode::PathDenied, "read-only client");
     }
 
-    void move_to_trash(const Resolved& r) {
-        fs::path base = u8(c_.root) / "__sync" / "__trash" / utc_stamp() / u8(r.real);
-        std::error_code ec;
-        fs::create_directories(base.parent_path(), ec);
-        if (ec) throw OpError(ErrCode::IoError, "cannot create trash directory");
-        fs::path cand = base;
-        for (int n = 1; fio::stat_path(cand).exists || fs::is_symlink(cand, ec); n++)
-            cand = fs::path(base.u8string() + "-" + std::to_string(n));
-        fs::rename(r.abs, cand, ec);
-        if (ec) throw OpError(ErrCode::IoError, "cannot move to trash");
-    }
+    void move_to_trash(const Resolved& r) { trash_move(c_, r.abs, r.real); }
 
     void on_delete(const Delete& d) {
         require_rw();
@@ -806,7 +951,7 @@ private:
                 if (c_.cfg.trash) move_to_trash(to);
             }
             std::error_code ec;
-            fs::create_directories(to.abs.parent_path(), ec);
+            fio::create_dirs(to.abs.parent_path(), c_.cfg.dir_mode, ec);
             if (ec) throw OpError(ErrCode::IoError, "cannot create directory");
             recheck(to);
             fs::rename(from.abs, to.abs, ec);
@@ -825,7 +970,7 @@ private:
         if (st.exists && !st.is_dir) throw OpError(ErrCode::IoError, "a file exists at this path");
         if (st.is_symlink) throw OpError(ErrCode::PathDenied, "symlink");
         std::error_code ec;
-        fs::create_directories(r.abs, ec);
+        fio::create_dirs(r.abs, c_.cfg.dir_mode, ec);
         if (ec) throw OpError(ErrCode::IoError, "cannot create directory");
         recheck(r);
         ok();
@@ -918,6 +1063,26 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
         ServerCore& c;
         ~Active() { c.active--; }
     } active{c};
+    ClientState& cs = *c.cstate[size_t(idx)];
+    const ClientAcl& acl = c.cfg.clients[size_t(idx)];
+    struct Slot {
+        ClientState& cs;
+        bool held = false;
+        ~Slot() {
+            if (held) cs.sessions--;
+        }
+    } slot{cs};
+    if (acl.max_sessions && cs.sessions.fetch_add(1) >= int(acl.max_sessions)) {
+        cs.sessions--;
+        log_warn("client '" + acl.name + "' already has " + std::to_string(acl.max_sessions) +
+                 " sessions (max_sessions); refusing " + ip);
+        try {
+            ch->send_msg(encode(FileErr{ErrCode::Busy, "too many sessions for this client (max_sessions)"}));
+        } catch (const std::exception&) {
+        }
+        return;
+    }
+    slot.held = acl.max_sessions != 0;
     std::optional<Session> sess;
     try {
         ch->socket().set_timeouts(kHelloTimeoutMs, kHelloTimeoutMs);
@@ -933,7 +1098,7 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
             }
         } unreg{rec};
         if (stop.load()) return;
-        sess.emplace(c, *ch, c.cfg.clients[size_t(idx)], ip);
+        sess.emplace(c, *ch, acl, ip, cs);
         sess->run();
     } catch (const std::exception& e) {
         if (!stop.load()) {

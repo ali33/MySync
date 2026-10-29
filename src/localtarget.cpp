@@ -11,6 +11,7 @@
 #include <mutex>
 #include <vector>
 
+#include "fileio.h"
 #include "fsutil.h"
 #include "mysync/filter.h"
 #include "mysync/hash.h"
@@ -88,7 +89,7 @@ public:
             fs::create_directory(root, ec);
             if (ec) throw Error("cannot create destination " + cfg_.path + ": " + ec.message());
         }
-        fs::create_directories(fs::u8path(base_), ec);
+        fio::create_dirs(fs::u8path(base_), cfg_.dir_mode, ec);
         if (ec) throw Error("cannot create destination " + base_ + ": " + ec.message());
         std::lock_guard<std::mutex> lk(state_->mu);
         if (!state_->loaded) {
@@ -124,11 +125,19 @@ public:
             }
 
             std::error_code ec;
-            fs::create_directories(dest.parent_path(), ec);
+            fio::create_dirs(dest.parent_path(), cfg_.dir_mode, ec);
             if (ec) { r.error = "cannot create directory: " + ec.message(); return r; }
             uint8_t rnd[8];
             random_bytes(rnd, sizeof rnd);
             tmp = dest.parent_path() / fs::u8path(".mysync-tmp-" + to_hex(rnd, sizeof rnd));
+#ifndef _WIN32
+            {
+                // Create the temp file private (0600) before ofstream opens it: no window with the default umask.
+                int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+                if (fd < 0) { r.error = "cannot create temp file in destination"; tmp.clear(); return r; }
+                ::close(fd);
+            }
+#endif
 
             uint64_t total = 0;
             Hash256 got{};
@@ -162,9 +171,20 @@ public:
                 return r;
             }
             fsutil::fsync_path(tmp);
+            fio::set_mode(tmp, cfg_.file_mode);
             fsutil::set_mtime_ns(tmp, meta.mtime_ns);
+            // The previous content of an overwritten file goes to the trash first (rename, no copy).
+            fs::path trashed;
+            if (ds.ok && ds.is_file) trashed = move_to_trash(rel, dest);
             fs::rename(tmp, dest, ec);
-            if (ec) { r.error = "rename failed: " + ec.message(); cleanup(tmp); tmp.clear(); return r; }
+            if (ec) {
+                std::error_code e2;
+                if (!trashed.empty()) fs::rename(trashed, dest, e2);  // put the old version back
+                r.error = "rename failed: " + ec.message();
+                cleanup(tmp);
+                tmp.clear();
+                return r;
+            }
             tmp.clear();
             fsutil::FsStat fin = fsutil::stat_path(dest);
             if (fin.ok) cache_put(key, fin, meta.hash);
@@ -188,18 +208,7 @@ public:
         fs::path p = safe_join(base_, rel);
         fsutil::FsStat st = fsutil::stat_path(p);
         if (!st.ok) return;
-        fs::path trash_root = fs::u8path(base_) / "__sync" / "__trash";
-        fs::path stamp_dir = trash_root / fs::u8path(utc_stamp());
-        std::error_code ec;
-        for (int i = 2; fs::exists(stamp_dir, ec) && i < 1000; ++i)
-            stamp_dir = trash_root / fs::u8path(utc_stamp() + "-" + std::to_string(i));
-        fs::create_directories(stamp_dir, ec);
-        if (ec) throw Error("cannot create trash directory: " + ec.message());
-        fs::path to = safe_join(stamp_dir.u8string(), rel);
-        fs::create_directories(to.parent_path(), ec);
-        if (ec) throw Error("cannot create trash directory: " + ec.message());
-        fs::rename(p, to, ec);
-        if (ec) throw Error("cannot move to trash: " + ec.message());
+        move_to_trash(rel, p);
         std::string key = normalize_rel(rel);
         std::lock_guard<std::mutex> lk(state_->mu);
         state_->cache.erase(key);
@@ -213,13 +222,31 @@ public:
         state_->dirty = true;
     }
 
+    // Moves `p` (the destination path of `rel`) to <dest>/__sync/__trash/<UTC timestamp>/<rel> by rename and returns
+    // the new location. Throws Error.
+    fs::path move_to_trash(const std::string& rel, const fs::path& p) {
+        fs::path trash_root = fs::u8path(base_) / "__sync" / "__trash";
+        fs::path stamp_dir = trash_root / fs::u8path(utc_stamp());
+        std::error_code ec;
+        for (int i = 2; fs::exists(stamp_dir, ec) && i < 1000; ++i)
+            stamp_dir = trash_root / fs::u8path(utc_stamp() + "-" + std::to_string(i));
+        fio::create_dirs(stamp_dir, cfg_.dir_mode, ec);
+        if (ec) throw Error("cannot create trash directory: " + ec.message());
+        fs::path to = safe_join(stamp_dir.u8string(), rel);
+        fio::create_dirs(to.parent_path(), cfg_.dir_mode, ec);
+        if (ec) throw Error("cannot create trash directory: " + ec.message());
+        fs::rename(p, to, ec);
+        if (ec) throw Error("cannot move to trash: " + ec.message());
+        return to;
+    }
+
     void rename_path(const std::string& from, const std::string& to) override {
         require_root();
         fs::path a = safe_join(base_, from);
         fs::path b = safe_join(base_, to);
         if (!fsutil::stat_path(a).ok) return;  // already gone: the engine re-sends `to` if needed
         std::error_code ec;
-        fs::create_directories(b.parent_path(), ec);
+        fio::create_dirs(b.parent_path(), cfg_.dir_mode, ec);
         if (ec) throw Error("cannot create directory: " + ec.message());
         fs::rename(a, b, ec);
         if (ec) throw Error("rename failed: " + ec.message());
@@ -232,7 +259,7 @@ public:
         require_root();
         fs::path p = safe_join(base_, rel);
         std::error_code ec;
-        fs::create_directories(p, ec);
+        fio::create_dirs(p, cfg_.dir_mode, ec);
         if (ec) throw Error("cannot create directory: " + ec.message());
     }
 

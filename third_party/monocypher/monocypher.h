@@ -1,4 +1,4 @@
-// Monocypher version __git__
+// Monocypher 4.0.2 - vendored from https://github.com/LoupVaillant/Monocypher, tag 4.0.2 (commit 0d85f98c9d9b0227e42cf795cb527dff372b40a4). Unmodified except for this line (was "version __git__").
 //
 // This file is dual-licensed.  Choose whichever licence you want from
 // the two licences listed below.
