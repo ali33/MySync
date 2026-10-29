@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -16,6 +17,7 @@
 #endif
 
 #include "mysync/filter.h"
+#include "mysync/keys.h"
 
 namespace fs = std::filesystem;
 
@@ -700,22 +702,15 @@ PublicKey parse_public_key_hex(const std::string& hex) {
 }
 
 Bytes load_secret_key_file(const std::string& utf8_path) {
-    fs::path p = fs::u8path(utf8_path);
-#ifndef _WIN32
-    struct stat st;
-    if (::stat(p.c_str(), &st) != 0) throw Error("cannot read key file: " + utf8_path);
-    if (st.st_mode & (S_IRWXG | S_IRWXO))
-        throw Error("key file " + utf8_path + " is accessible by group/other; run: chmod 600 " + utf8_path);
-#endif
-    std::ifstream f(p, std::ios::binary);
-    if (!f) throw Error("cannot read key file: " + utf8_path);
+    std::string raw = read_secret_file(utf8_path);  // ownership / mode / symlink checks live there
     char buf[1024];
-    f.read(buf, sizeof buf);
-    size_t n = static_cast<size_t>(f.gcount());
-    if (n == sizeof buf) {
-        secure_wipe(buf, sizeof buf);
+    size_t n = raw.size();
+    if (n >= sizeof buf) {
+        secure_wipe(raw.data(), raw.size());
         throw Error("key file is too large: " + utf8_path);
     }
+    std::memcpy(buf, raw.data(), n);
+    secure_wipe(raw.data(), raw.size());
     size_t b = 0, e = n;
     auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
     while (b < e && ws(buf[b])) ++b;

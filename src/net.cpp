@@ -191,6 +191,9 @@ void Socket::shutdown_both() {
     if (fd_ == -1) return;
 #ifdef _WIN32
     ::shutdown(static_cast<sock_t>(fd_), SD_BOTH);
+    // shutdown() alone does not wake a recv blocked on an accepted Winsock socket; cancelling the pending I/O does,
+    // without closing the handle under the thread that owns it.
+    ::CancelIoEx(reinterpret_cast<HANDLE>(static_cast<sock_t>(fd_)), nullptr);
 #else
     ::shutdown(static_cast<sock_t>(fd_), SHUT_RDWR);
 #endif

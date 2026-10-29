@@ -44,6 +44,10 @@ constexpr size_t kMaxPending = 4096;             // pipelined NEED_* offers awai
 constexpr int64_t kMtimeTolNs = 1000;
 constexpr size_t kMaxTrees = 64;
 constexpr int64_t kOrphanAgeSec = 3600;
+constexpr int kHelloTimeoutMs = 5000;           // first record (HELLO) after the handshake
+constexpr int kMaxUnauthPerIp = 4;              // connections that have not finished the handshake, per source
+constexpr int64_t kThrottleWindowMs = 60000;
+constexpr int64_t kThrottleSweepMs = 10000;
 constexpr int64_t kRacyNs = 2000000000LL;  // files younger than this are never cached (same rule as scan_tree)
 
 int64_t steady_ms() {
@@ -85,14 +89,10 @@ std::string utc_stamp() {
 
 fs::path u8(const std::string& s) { return fs::u8path(s); }
 
-// Wakes a thread blocked in recv/send on `s`. shutdown() alone does not wake a blocked recv on accepted Winsock
-// sockets (observed), so Windows also closes the handle; the owning thread then fails with an Error.
-void wake(net::Socket& s) {
-    s.shutdown_both();
-#ifdef _WIN32
-    s.close();
-#endif
-}
+// Wakes a thread blocked in recv/send on `s` (shutdown_both also cancels pending I/O on Windows; the caller holds the session's mutex, so the socket is alive). Only
+// shutdown(): closing from this thread would race the owner's use of the descriptor; the owning thread sees the
+// failed recv and closes the socket itself.
+void wake(net::Socket& s) { s.shutdown_both(); }
 
 // True when any '/'-separated component is one of our temp files (clients must not address them).
 bool has_tmp_component(const std::string& rel) {
@@ -219,14 +219,33 @@ bool IpFilter::permits(const std::string& ip) const {
 
 // ---------------------------------------------------------------- AuthThrottle
 
+namespace {
+
+// Key under which a source is throttled: IPv4 as is, IPv6 reduced to its /64 prefix.
+std::string throttle_key(const std::string& ip) {
+    in6_addr a6;
+    if (ip.find(':') == std::string::npos || inet_pton(AF_INET6, ip.c_str(), &a6) != 1) return ip;
+    uint8_t b[16];
+    std::memcpy(b, &a6, 16);
+    static const uint8_t mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+    if (std::memcmp(b, mapped, 12) == 0)  // ::ffff:a.b.c.d is the IPv4 host
+        return std::to_string(b[12]) + "." + std::to_string(b[13]) + "." + std::to_string(b[14]) + "." +
+               std::to_string(b[15]);
+    return "v6/64:" + to_hex(b, 8);
+}
+
+}  // namespace
+
 bool AuthThrottle::blocked(const std::string& ip, int64_t now_ms) {
     if (max_ == 0) return false;
+    std::string key = throttle_key(ip);
     std::lock_guard<std::mutex> lk(m_);
-    auto it = fails_.find(ip);
+    auto it = fails_.find(key);
     if (it == fails_.end()) return false;
-    auto& q = it->second;
-    while (!q.empty() && now_ms - q.front() >= 60000) q.pop_front();
+    auto& q = it->second.q;
+    while (!q.empty() && now_ms - q.front() >= kThrottleWindowMs) q.pop_front();
     if (q.empty()) {
+        order_.erase(it->second.pos);
         fails_.erase(it);
         return false;
     }
@@ -235,16 +254,37 @@ bool AuthThrottle::blocked(const std::string& ip, int64_t now_ms) {
 
 void AuthThrottle::record_failure(const std::string& ip, int64_t now_ms) {
     if (max_ == 0) return;
+    std::string key = throttle_key(ip);
     std::lock_guard<std::mutex> lk(m_);
-    if (fails_.size() > 4096) {  // sweep so a scan from many addresses cannot grow memory without bound
-        for (auto it = fails_.begin(); it != fails_.end();) {
-            while (!it->second.empty() && now_ms - it->second.front() >= 60000) it->second.pop_front();
-            it = it->second.empty() ? fails_.erase(it) : std::next(it);
+    if (now_ms - last_sweep_ms_ >= kThrottleSweepMs) {  // order_ is by last failure: stop at the first live source
+        last_sweep_ms_ = now_ms;
+        while (!order_.empty()) {
+            auto it = fails_.find(order_.front());
+            if (it != fails_.end() && !it->second.q.empty() && now_ms - it->second.q.back() < kThrottleWindowMs) break;
+            if (it != fails_.end()) fails_.erase(it);
+            order_.pop_front();
         }
     }
-    auto& q = fails_[ip];
+    auto it = fails_.find(key);
+    if (it == fails_.end()) {
+        while (fails_.size() >= kMaxEntries && !order_.empty()) {  // hard cap: drop the longest-quiet source
+            fails_.erase(order_.front());
+            order_.pop_front();
+        }
+        it = fails_.emplace(key, Entry{}).first;
+        order_.push_back(key);
+        it->second.pos = std::prev(order_.end());
+    } else {
+        order_.splice(order_.end(), order_, it->second.pos);
+    }
+    auto& q = it->second.q;
     q.push_back(now_ms);
     while (q.size() > size_t(max_) + 8) q.pop_front();
+}
+
+size_t AuthThrottle::tracked() {
+    std::lock_guard<std::mutex> lk(m_);
+    return fails_.size();
 }
 
 // ---------------------------------------------------------------- server core
@@ -276,7 +316,37 @@ struct ServerCore {
     fs::path state_dir;
     std::mutex tm;
     std::map<std::string, std::shared_ptr<Tree>> trees;
-    std::atomic<int> active{0};
+    std::atomic<int> active{0};  // authenticated sessions (cfg.max_connections caps these)
+    std::mutex um;               // connections still in the handshake
+    std::map<std::string, int> unauth_by_key;
+    size_t unauth_total = 0;
+
+    size_t unauth_cap() const { return std::max<size_t>(8, cfg.max_connections / 2); }
+    bool unauth_acquire(const std::string& key) {
+        std::lock_guard<std::mutex> lk(um);
+        if (unauth_total >= unauth_cap()) return false;
+        int& n = unauth_by_key[key];
+        if (n >= kMaxUnauthPerIp) {
+            if (n == 0) unauth_by_key.erase(key);
+            return false;
+        }
+        n++;
+        unauth_total++;
+        return true;
+    }
+    void unauth_release(const std::string& key) {
+        std::lock_guard<std::mutex> lk(um);
+        auto it = unauth_by_key.find(key);
+        if (it == unauth_by_key.end()) return;
+        if (--it->second <= 0) unauth_by_key.erase(it);
+        if (unauth_total > 0) unauth_total--;
+    }
+    bool session_acquire() {
+        int cur = active.load();
+        while (cur < int(cfg.max_connections))
+            if (active.compare_exchange_weak(cur, cur + 1)) return true;
+        return false;
+    }
 
     ServerCore(ServerConfig c, const KeyPair& k)
         : cfg(std::move(c)), key(k), ipf(cfg.allow, cfg.deny), thr(cfg.max_auth_failures_per_min) {
@@ -383,7 +453,13 @@ public:
         }
         tree_ = c_.tree_for(prefix_);
 
-        Message first = decode(ch_.recv_msg());
+        // The first record must arrive promptly: a replayed msg1 completes the handshake but cannot produce it.
+        hello_pending_ = true;
+        Bytes raw_first = ch_.recv_msg_within(kHelloTimeoutMs);
+        int io_ms = int(c_.cfg.io_timeout_s ? c_.cfg.io_timeout_s : 60) * 1000;
+        ch_.socket().set_timeouts(io_ms, io_ms);
+        Message first = decode(raw_first);
+        hello_pending_ = false;
         const Hello* h = std::get_if<Hello>(&first);
         if (!h) {
             send(FileErr{ErrCode::BadRequest, "HELLO expected"});
@@ -404,7 +480,11 @@ public:
         c_.save_tree(*tree_, false);
     }
 
+    // True until the first record was received and decoded: a failure in that window counts against the source.
+    bool hello_pending() const { return hello_pending_; }
+
 private:
+    bool hello_pending_ = false;
     ServerCore& c_;
     SecureChannel& ch_;
     const ClientAcl& acl_;
@@ -796,13 +876,20 @@ private:
 
 void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRec& rec, std::atomic<bool>& stop) {
     struct Done {
-        ServerCore& c;
         SessRec& rec;
-        ~Done() {
-            c.active--;
-            rec.done = true;
+        ~Done() { rec.done = true; }
+    } done{rec};
+    // Holds one place of the "not yet authenticated" budget until the handshake is over (either way).
+    struct Unauth {
+        ServerCore& c;
+        std::string key;
+        bool held = true;
+        void release() {
+            if (held) c.unauth_release(key);
+            held = false;
         }
-    } done{c, rec};
+        ~Unauth() { release(); }
+    } unauth{c, throttle_key(ip)};
 
     std::optional<SecureChannel> ch;
     int idx = -1;
@@ -816,14 +903,24 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
             idx = found;
             return found >= 0;
         }));
-    } catch (const std::exception&) {
+    } catch (const std::exception&) {  // refused, torn, or out of time: all count against the source
+        unauth.release();
         c.thr.record_failure(ip, steady_ms());
         log_warn("authentication failed from " + ip);
         return;
     }
+    unauth.release();
+    if (!c.session_acquire()) {
+        log_warn("too many connections; refusing " + ip);
+        return;
+    }
+    struct Active {
+        ServerCore& c;
+        ~Active() { c.active--; }
+    } active{c};
+    std::optional<Session> sess;
     try {
-        int to = int(c.cfg.io_timeout_s ? c.cfg.io_timeout_s : 60) * 1000;
-        ch->socket().set_timeouts(to, to);
+        ch->socket().set_timeouts(kHelloTimeoutMs, kHelloTimeoutMs);
         {
             std::lock_guard<std::mutex> lk(rec.m);
             rec.sock = &ch->socket();
@@ -836,10 +933,17 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
             }
         } unreg{rec};
         if (stop.load()) return;
-        Session s(c, *ch, c.cfg.clients[size_t(idx)], ip);
-        s.run();
+        sess.emplace(c, *ch, c.cfg.clients[size_t(idx)], ip);
+        sess->run();
     } catch (const std::exception& e) {
-        if (!stop.load()) log_debug("session from " + ip + " ended: " + e.what());
+        if (!stop.load()) {
+            if (sess && sess->hello_pending()) {
+                c.thr.record_failure(ip, steady_ms());
+                log_warn("no valid HELLO from " + ip + ": " + e.what());
+            } else {
+                log_debug("session from " + ip + " ended: " + e.what());
+            }
+        }
     }
 }
 
@@ -895,11 +999,10 @@ void Server::run(std::atomic<bool>& stop) {
             log_debug("connection from " + ip + " refused: too many failed authentications");
             continue;
         }
-        if (c.active.load() >= int(c.cfg.max_connections)) {
-            log_warn("too many connections; refusing " + ip);
+        if (!c.unauth_acquire(throttle_key(ip))) {
+            log_warn("too many unauthenticated connections; refusing " + ip);
             continue;
         }
-        c.active++;
         auto rec = std::make_unique<SessRec>();
         SessRec* rp = rec.get();
         try {
@@ -907,7 +1010,7 @@ void Server::run(std::atomic<bool>& stop) {
                 session_main(c, std::move(sk), ip, *rp, stop);
             });
         } catch (const std::exception& e) {
-            c.active--;
+            c.unauth_release(throttle_key(ip));
             log_error(std::string("cannot start session thread: ") + e.what());
             continue;
         }

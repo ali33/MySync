@@ -13,8 +13,10 @@
 
 #include "../src/fileio.h"
 #include "mysync/hash.h"
+#include "mysync/net.h"
 #include "mysync/nettarget.h"
 #include "mysync/ratelimit.h"
+#include "mysync/secure_channel.h"
 #include "mysync/server.h"
 #include "testing.h"
 
@@ -569,4 +571,165 @@ TEST(rate_limiter_throttles) {
     for (int i = 0; i < 6; i++) lim.acquire(20000);  // 120 KB at 100 KB/s, ~10 KB burst credit
     double dt = secs_since(t0);
     CHECK(dt > 0.9 && dt < 3.0);
+}
+
+// ---------------------------------------------------------------- security hardening
+
+TEST(auth_throttle_ipv6_keyed_by_slash64) {
+    AuthThrottle t(3);
+    t.record_failure("2001:db8:0:1::1", 1000);
+    t.record_failure("2001:db8:0:1:aaaa::2", 1001);
+    t.record_failure("2001:db8:0:1:ffff:ffff:ffff:ffff", 1002);
+    CHECK(t.tracked() == 1u);                                  // one /64 = one source
+    CHECK(t.blocked("2001:db8:0:1::99", 2000));                // any address of it is blocked
+    CHECK(!t.blocked("2001:db8:0:2::1", 2000));                // the neighbouring /64 is not
+    CHECK(!t.blocked("1.2.3.4", 2000));
+    t.record_failure("::ffff:9.9.9.9", 1000);                  // IPv4-mapped = the IPv4 host, not one shared v6 key
+    t.record_failure("9.9.9.9", 1001);
+    t.record_failure("9.9.9.9", 1002);
+    CHECK(t.blocked("9.9.9.9", 2000));
+    CHECK(!t.blocked("9.9.9.8", 2000));
+}
+
+TEST(auth_throttle_hard_cap_evicts_oldest) {
+    AuthThrottle t(3);
+    for (size_t i = 0; i < AuthThrottle::kMaxEntries + 500; i++)
+        t.record_failure("10." + std::to_string(i / 65536) + "." + std::to_string((i / 256) % 256) + "." +
+                             std::to_string(i % 256),
+                         int64_t(i));  // all inside one 60 s window: the sweep cannot help, only the cap
+    CHECK(t.tracked() <= AuthThrottle::kMaxEntries);
+    // the oldest source was dropped, the newest is still tracked
+    for (int k = 0; k < 3; k++) t.record_failure("10.0.0.0", 20000);
+    CHECK(t.blocked("10.0.0.0", 20001));
+    CHECK(t.tracked() <= AuthThrottle::kMaxEntries);
+}
+
+TEST(auth_throttle_periodic_sweep_drops_expired) {
+    AuthThrottle t(3);
+    for (int i = 0; i < 300; i++)
+        t.record_failure("172.16." + std::to_string(i / 256) + "." + std::to_string(i % 256), 100);
+    CHECK(t.tracked() == 300u);
+    t.record_failure("8.8.8.8", 100 + 61000);  // past the window and the sweep period: the 300 are gone
+    CHECK(t.tracked() == 1u);
+}
+
+namespace {
+
+// Opens `n` raw TCP connections and keeps them silent (a handshake that never starts).
+std::vector<net::Socket> silent_connections(uint16_t port, int n) {
+    std::vector<net::Socket> v;
+    for (int i = 0; i < n; i++) v.push_back(net::Socket::connect("127.0.0.1", port, 3000));
+    return v;
+}
+
+ServerConfig quiet_cfg() {
+    ServerConfig c;
+    c.max_auth_failures_per_min = 0;  // do not let the abuse below lock the loopback address out
+    return c;
+}
+
+// True when the server closed `s` (EOF or reset) within ms, false if it is still held open.
+bool closed_by_server(net::Socket& s, int ms) {
+    s.set_timeouts(ms, ms);
+    uint8_t b;
+    try {
+        return s.recv_some(&b, 1) == 0;
+    } catch (const Error& e) {
+        return std::string(e.what()).find("timeout") == std::string::npos;
+    }
+}
+
+}  // namespace
+
+TEST(server_limits_unauthenticated_connections_per_ip) {
+    Env e(quiet_cfg());
+    auto held = silent_connections(e.srv->port(), 4);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    net::Socket fifth = net::Socket::connect("127.0.0.1", e.srv->port(), 3000);
+    CHECK(closed_by_server(fifth, 2500));        // over the per-source budget of 4
+    CHECK(!closed_by_server(held[0], 300));      // the first four are still waiting in the handshake
+    held.clear();                                // they leave: the budget is free again
+    bool ok = false;
+    for (int i = 0; i < 20 && !ok; i++) {
+        try {
+            auto t = e.target(e.rw);
+            t->open();
+            t->close();
+            ok = true;
+        } catch (const std::exception&) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        }
+    }
+    CHECK(ok);
+}
+
+TEST(server_unauthenticated_connections_do_not_use_session_slots) {
+    ServerConfig cfg = quiet_cfg();
+    cfg.max_connections = 2;
+    Env e(cfg);
+    auto held = silent_connections(e.srv->port(), 3);  // would have filled max_connections before
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    auto a = e.target(e.rw);
+    a->open();                                         // still served
+    a->close();
+    held.clear();
+}
+
+TEST(server_caps_authenticated_sessions_at_max_connections) {
+    ServerConfig cfg = quiet_cfg();
+    cfg.max_connections = 1;
+    Env e(cfg);
+    auto a = e.target(e.rw);
+    a->open();
+    auto b = e.target(e.ro);
+    CHECK_THROWS(b->open());                           // second authenticated session: refused
+    a->close();
+}
+
+TEST(server_counts_first_record_garbage_as_auth_failure) {
+    ServerConfig cfg;
+    cfg.max_auth_failures_per_min = 1;
+    Env e(cfg);
+    {
+        net::Socket s = net::Socket::connect("127.0.0.1", e.srv->port(), 3000);
+        SecureChannel ch = SecureChannel::client(std::move(s), e.rw, e.server_kp.pub);
+        Bytes junk(16, 0xee);
+        ch.send_msg(junk);                             // authentic record, but not a HELLO
+        ch.socket().set_timeouts(2000, 2000);
+        CHECK_THROWS(ch.recv_msg());                   // server hangs up
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    auto t = e.target(e.rw);
+    CHECK_THROWS(t->open());                           // the source is now throttled
+}
+
+TEST(server_counts_torn_handshake_as_auth_failure) {
+    ServerConfig cfg;
+    cfg.max_auth_failures_per_min = 1;
+    Env e(cfg);
+    {
+        net::Socket s = net::Socket::connect("127.0.0.1", e.srv->port(), 3000);
+        uint8_t half[20] = {1, 2, 3};
+        s.send_all(half, sizeof half);
+    }                                                  // closed mid-handshake
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    auto t = e.target(e.rw);
+    CHECK_THROWS(t->open());
+}
+
+TEST(server_drops_silent_session_after_handshake_within_hello_deadline) {
+    ServerConfig cfg;
+    cfg.max_auth_failures_per_min = 1;
+    Env e(cfg);
+    auto t0 = Clock::now();
+    {
+        net::Socket s = net::Socket::connect("127.0.0.1", e.srv->port(), 3000);
+        SecureChannel ch = SecureChannel::client(std::move(s), e.rw, e.server_kp.pub);  // e.g. a replayed msg1
+        ch.socket().set_timeouts(12000, 12000);
+        CHECK_THROWS(ch.recv_msg());                   // no HELLO from us: the server closes
+    }
+    double dt = secs_since(t0);
+    CHECK(dt > 4.0 && dt < 8.5);                       // ~5 s hello deadline
+    auto t = e.target(e.rw);
+    CHECK_THROWS(t->open());                           // and the source was charged for it
 }

@@ -27,12 +27,16 @@ public:
     // Client (initiator): server_pub is the pinned public key of the server.
     // Throws Error("authentication failed") if the server is not the holder of server_pub, we are not allowed
     // by the server, or the handshake is tampered with. The socket is closed on failure.
-    static SecureChannel client(net::Socket&& s, const KeyPair& self, const PubKey& server_pub);
+    // handshake_timeout_ms is a TOTAL budget for the whole handshake (not per recv): a peer that drips bytes
+    // cannot hold the connection any longer.
+    static SecureChannel client(net::Socket&& s, const KeyPair& self, const PubKey& server_pub,
+                                int handshake_timeout_ms = kHandshakeTimeoutMs);
     // Server (responder): is_allowed(client_pub) is called after the client's static key was decrypted and
     // authenticated against our key, before any reply. Returning false (or throwing) closes the connection
     // without sending anything and throws Error("authentication failed"). Compare keys with ct_equal.
     static SecureChannel server(net::Socket&& s, const KeyPair& self,
-                                const std::function<bool(const PubKey& client_pub)>& is_allowed);
+                                const std::function<bool(const PubKey& client_pub)>& is_allowed,
+                                int handshake_timeout_ms = kHandshakeTimeoutMs);
 
     SecureChannel() = default;
     ~SecureChannel();
@@ -45,6 +49,9 @@ public:
     void send_msg(const void* data, size_t n);
     // Throws Error on bad tag, replay, reorder, truncation, oversize frame. After any failure the channel is dead.
     Bytes recv_msg();
+    // Like recv_msg but the whole record (header + body) must arrive within total_ms; throws Error otherwise.
+    // Overwrites the socket's timeouts: the caller restores them afterwards.
+    Bytes recv_msg_within(int total_ms);
     net::Socket& socket() { return sock_; }
     // The authenticated static public key of the other side (server key for a client; client key for a server).
     const PubKey& peer_public() const { return peer_; }
@@ -52,6 +59,7 @@ public:
 private:
     static SecureChannel make(net::Socket&& s, const uint8_t send_key[32], const uint8_t recv_key[32], const PubKey& peer);
     void wipe();
+    Bytes recv_msg_impl(int total_ms);  // total_ms < 0: no overall deadline
 
     net::Socket sock_;
     uint8_t send_key_[32] = {};

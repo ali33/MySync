@@ -244,7 +244,7 @@ Message decode(const void* d, size_t n) {
         case MsgType::DeltaOps: {
             DeltaOps m;
             uint32_t cnt = r.u32();
-            if (size_t(cnt) * 5 > r.remaining()) throw Error("proto: bad op count");  // every op is >= 5 bytes
+            if (size_t(cnt) > r.remaining() / 5) throw Error("proto: bad op count");  // every op is >= 5 bytes
             m.ops.reserve(cnt);
             for (uint32_t i = 0; i < cnt; i++) {
                 delta::DeltaOp op;

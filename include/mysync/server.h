@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -50,17 +51,28 @@ private:
     std::vector<Net> allow_, deny_;
 };
 
-// Sliding-window limiter of failed authentications per source IP (60 s window). Thread-safe.
+// Sliding-window limiter of failed authentications per source (60 s window). Thread-safe. IPv4 addresses are keyed
+// as is, IPv6 addresses by their /64 (a single host owns a whole /64, so per-address keys are free to rotate).
+// At most kMaxEntries sources are tracked (the least recently failing one is dropped first) and expired entries
+// are swept periodically, never by an O(n) scan on every call.
 class AuthThrottle {
 public:
+    static constexpr size_t kMaxEntries = 10000;
     explicit AuthThrottle(uint32_t max_failures_per_min) : max_(max_failures_per_min) {}
     bool blocked(const std::string& ip, int64_t now_ms);
     void record_failure(const std::string& ip, int64_t now_ms);
+    size_t tracked();  // number of sources currently held
 
 private:
+    struct Entry {
+        std::deque<int64_t> q;
+        std::list<std::string>::iterator pos;  // place in order_
+    };
     uint32_t max_;
     std::mutex m_;
-    std::map<std::string, std::deque<int64_t>> fails_;
+    std::map<std::string, Entry> fails_;
+    std::list<std::string> order_;  // oldest last-failure first
+    int64_t last_sweep_ms_ = INT64_MIN / 2;
 };
 
 class Server {
@@ -76,7 +88,9 @@ public:
     Server& operator=(const Server&) = delete;
 
     // Blocks, serving until stop becomes true; then wakes and joins every session. An authentication handshake
-    // still in progress can delay the return by up to SecureChannel::kHandshakeTimeoutMs.
+    // still in progress can delay the return by up to SecureChannel::kHandshakeTimeoutMs (a total budget).
+    // Connections that have not finished the handshake are limited separately from cfg.max_connections (which caps
+    // authenticated sessions): at most 4 per source and max(8, max_connections / 2) in all.
     void run(std::atomic<bool>& stop);
     uint16_t port() const;
     const PubKey& public_key() const;

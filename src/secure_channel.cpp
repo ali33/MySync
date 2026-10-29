@@ -4,6 +4,8 @@
 
 #include "mysync/secure_channel.h"
 
+#include <chrono>
+#include <climits>
 #include <cstring>
 
 #include "monocypher.h"
@@ -24,6 +26,35 @@ uint32_t get_be32(const uint8_t* p) {
 void make_nonce(uint8_t nonce[24], uint64_t ctr) {
     std::memset(nonce, 0, 24);
     for (int i = 0; i < 8; i++) nonce[i] = uint8_t(ctr >> (8 * i));
+}
+
+using SteadyClock = std::chrono::steady_clock;
+
+// Milliseconds left until `deadline`; throws once it has passed. Always >= 1 so it can be used as a socket timeout.
+int ms_left(SteadyClock::time_point deadline) {
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - SteadyClock::now()).count();
+    if (ms <= 0) throw Error("deadline exceeded");
+    return ms > INT_MAX ? INT_MAX : int(ms);
+}
+
+// recv_all / send_all bounded by an ABSOLUTE deadline (a per-call socket timeout alone lets a peer that drips one
+// byte at a time hold the connection for as long as it likes).
+void recv_by(net::Socket& s, void* data, size_t n, SteadyClock::time_point deadline) {
+    char* p = static_cast<char*>(data);
+    size_t done = 0;
+    while (done < n) {
+        int left = ms_left(deadline);
+        s.set_timeouts(left, left);
+        size_t r = s.recv_some(p + done, n - done);
+        if (r == 0) throw Error("connection closed by peer");
+        done += r;
+    }
+}
+
+void send_by(net::Socket& s, const void* data, size_t n, SteadyClock::time_point deadline) {
+    int left = ms_left(deadline);
+    s.set_timeouts(left, left);
+    s.send_all(data, n);
 }
 
 struct AuthFailed {};  // internal marker, always surfaced as Error("authentication failed")
@@ -58,6 +89,7 @@ struct Sym {
         buf[32] = 2;
         prf(o2, temp, buf, 33);
         secure_wipe(temp, sizeof temp);
+        secure_wipe(buf, sizeof buf);  // holds o1
     }
 
     Sym() {
@@ -150,7 +182,8 @@ SecureChannel SecureChannel::make(net::Socket&& s, const uint8_t send_key[32], c
     return ch;
 }
 
-SecureChannel SecureChannel::client(net::Socket&& s, const KeyPair& self, const PubKey& server_pub) {
+SecureChannel SecureChannel::client(net::Socket&& s, const KeyPair& self, const PubKey& server_pub,
+                                    int handshake_timeout_ms) {
     if (!s.valid()) throw Error("invalid socket");
     KeyPair e;
     uint8_t k_send[32], k_recv[32], d[32];
@@ -160,7 +193,7 @@ SecureChannel SecureChannel::client(net::Socket&& s, const KeyPair& self, const 
         secure_wipe(d, 32);
     };
     try {
-        s.set_timeouts(kHandshakeTimeoutMs, kHandshakeTimeoutMs);
+        const auto deadline = SteadyClock::now() + std::chrono::milliseconds(handshake_timeout_ms);
         Sym st;
         st.mix_hash(server_pub.data(), 32);  // pre-message: <- s
 
@@ -175,10 +208,10 @@ SecureChannel SecureChannel::client(net::Socket&& s, const KeyPair& self, const 
         st.mix_key(d);
         Bytes pl = st.encrypt_and_hash(nullptr, 0);
         m1.insert(m1.end(), pl.begin(), pl.end());
-        s.send_all(m1.data(), m1.size());
+        send_by(s, m1.data(), m1.size(), deadline);
 
         uint8_t m2[kMsg2];
-        s.recv_all(m2, kMsg2);  // EOF here: the server rejected us (or is not who we pinned)
+        recv_by(s, m2, kMsg2, deadline);  // EOF here: the server rejected us (or is not who we pinned)
         st.mix_hash(m2, 32);
         dh(d, e.secret, m2);  // ee
         st.mix_key(d);
@@ -198,7 +231,7 @@ SecureChannel SecureChannel::client(net::Socket&& s, const KeyPair& self, const 
 }
 
 SecureChannel SecureChannel::server(net::Socket&& s, const KeyPair& self,
-                                    const std::function<bool(const PubKey&)>& is_allowed) {
+                                    const std::function<bool(const PubKey&)>& is_allowed, int handshake_timeout_ms) {
     if (!s.valid()) throw Error("invalid socket");
     KeyPair e;
     uint8_t k_send[32], k_recv[32], d[32];
@@ -208,12 +241,12 @@ SecureChannel SecureChannel::server(net::Socket&& s, const KeyPair& self,
         secure_wipe(d, 32);
     };
     try {
-        s.set_timeouts(kHandshakeTimeoutMs, kHandshakeTimeoutMs);
+        const auto deadline = SteadyClock::now() + std::chrono::milliseconds(handshake_timeout_ms);
         Sym st;
         st.mix_hash(self.pub.data(), 32);  // pre-message: <- s (ours)
 
         uint8_t m1[kMsg1];
-        s.recv_all(m1, kMsg1);
+        recv_by(s, m1, kMsg1, deadline);
         const uint8_t* re = m1;
         st.mix_hash(re, 32);
         dh(d, self.secret, re);  // es
@@ -238,7 +271,7 @@ SecureChannel SecureChannel::server(net::Socket&& s, const KeyPair& self,
         st.mix_key(d);
         Bytes pl = st.encrypt_and_hash(nullptr, 0);
         m2.insert(m2.end(), pl.begin(), pl.end());
-        s.send_all(m2.data(), m2.size());
+        send_by(s, m2.data(), m2.size(), deadline);
 
         st.split(k_recv, k_send);
         SecureChannel ch = make(std::move(s), k_send, k_recv, rs);
@@ -272,16 +305,25 @@ void SecureChannel::send_msg(const void* data, size_t n) {
     }
 }
 
-Bytes SecureChannel::recv_msg() {
+Bytes SecureChannel::recv_msg() { return recv_msg_impl(-1); }
+
+Bytes SecureChannel::recv_msg_within(int total_ms) { return recv_msg_impl(total_ms < 0 ? 0 : total_ms); }
+
+Bytes SecureChannel::recv_msg_impl(int total_ms) {
     if (dead_) throw Error("channel closed");
     try {
+        const auto deadline = SteadyClock::now() + std::chrono::milliseconds(total_ms < 0 ? 0 : total_ms);
+        auto rd = [&](void* d, size_t n) {
+            if (total_ms >= 0) recv_by(sock_, d, n, deadline);
+            else sock_.recv_all(d, n);
+        };
         uint8_t hdr[4];
-        sock_.recv_all(hdr, 4);
+        rd(hdr, 4);
         uint32_t len = get_be32(hdr);
         if (len > kMaxMessage) throw Error("frame too large");  // checked before allocation
         if (recv_ctr_ == UINT64_MAX) throw Error("receive counter exhausted");
         Bytes buf(size_t(len) + kTagSize);
-        sock_.recv_all(buf.data(), buf.size());
+        rd(buf.data(), buf.size());
         Bytes plain(len);
         uint8_t nonce[24];
         make_nonce(nonce, recv_ctr_);

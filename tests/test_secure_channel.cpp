@@ -2,12 +2,23 @@
 // Copyright (C) 2026 META.vn
 // Author: Nguyễn Đức Sơn
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <optional>
 #include <random>
 #include <thread>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include "mysync/net.h"
 #include "mysync/secure_channel.h"
@@ -516,4 +527,145 @@ TEST(keys_hex_and_file_roundtrip) {
     CHECK_THROWS(load_keypair((dir / "bad.key").u8string()));
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
+}
+
+namespace {
+using Clk = std::chrono::steady_clock;
+double secs_since_c(Clk::time_point t) { return std::chrono::duration<double>(Clk::now() - t).count(); }
+}  // namespace
+
+TEST(handshake_total_deadline_server_slow_drip) {
+    SockPair p = direct_pair();
+    Ident id = good_ident(21);
+    std::atomic<bool> stop{false};
+    std::thread drip([&] {  // one byte every 150 ms: every single recv is "in time", the total is not
+        try {
+            while (!stop.load()) {
+                uint8_t b = 7;
+                p.a.send_all(&b, 1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            }
+        } catch (const Error&) {}
+    });
+    auto t0 = Clk::now();
+    bool threw = false;
+    try {
+        SecureChannel::server(std::move(p.b), id.server, id.allow, 600);
+    } catch (const Error& e) {
+        threw = std::string(e.what()) == "authentication failed";
+    }
+    double dt = secs_since_c(t0);
+    stop = true;
+    drip.join();
+    CHECK(threw);
+    CHECK(dt >= 0.5 && dt < 2.0);
+}
+
+TEST(handshake_total_deadline_client_slow_drip) {
+    SockPair p = direct_pair();
+    Ident id = good_ident(22);
+    std::atomic<bool> stop{false};
+    std::thread drip([&] {
+        try {
+            while (!stop.load()) {
+                uint8_t b = 9;
+                p.b.send_all(&b, 1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            }
+        } catch (const Error&) {}
+    });
+    auto t0 = Clk::now();
+    bool threw = false;
+    try {
+        SecureChannel::client(std::move(p.a), id.client, id.pinned, 600);
+    } catch (const Error& e) {
+        threw = std::string(e.what()) == "authentication failed";
+    }
+    double dt = secs_since_c(t0);
+    stop = true;
+    drip.join();
+    CHECK(threw);
+    CHECK(dt >= 0.5 && dt < 2.0);
+}
+
+TEST(recv_msg_within_has_a_total_deadline) {
+    Ident id = good_ident(23);
+    HsResult c, s;
+    handshake_pair(c, s, id);
+    CHECK(c.ch && s.ch);
+    auto t0 = Clk::now();
+    CHECK_THROWS(s.ch->recv_msg_within(300));  // nothing was sent
+    double dt = secs_since_c(t0);
+    CHECK(dt >= 0.25 && dt < 1.5);
+    // a record that arrives in time is delivered
+    HsResult c2, s2;
+    handshake_pair(c2, s2, id);
+    c2.ch->send_msg(Bytes{1, 2, 3});
+    CHECK(s2.ch->recv_msg_within(2000) == (Bytes{1, 2, 3}));
+}
+
+TEST(keys_file_security) {
+    namespace fs = std::filesystem;
+    fs::path dir = fs::temp_directory_path() / ("mysync-test-keysec-" + std::to_string(std::random_device{}()));
+    fs::create_directories(dir);
+    KeyPair kp = generate_keypair();
+    std::string f = (dir / "id.key").u8string();
+    save_keypair(f, kp);
+    CHECK_EQ(read_secret_file(f), key_to_hex(kp.secret) + "\n");
+    CHECK(key_file_broad_acl(f).empty());  // a fresh key file names no broad principal
+#ifndef _WIN32
+    struct stat st;
+    CHECK(::stat(f.c_str(), &st) == 0);
+    CHECK((st.st_mode & 0777) == 0600);
+    // group/other bits are refused, checked on the open descriptor
+    CHECK(::chmod(f.c_str(), 0640) == 0);
+    std::string msg;
+    try { load_keypair(f); } catch (const Error& e) { msg = e.what(); }
+    CHECK(msg.find("chmod 600") != std::string::npos);
+    CHECK_THROWS(read_secret_file(f));
+    CHECK(::chmod(f.c_str(), 0600) == 0);
+    CHECK(load_keypair(f).pub == kp.pub);
+    // symlinks are never followed, for reading or for creating
+    std::string link = (dir / "link.key").u8string();
+    CHECK(::symlink(f.c_str(), link.c_str()) == 0);
+    CHECK_THROWS(load_keypair(link));
+    std::string dangling = (dir / "dangling.key").u8string();
+    std::string target = (dir / "victim.key").u8string();
+    CHECK(::symlink(target.c_str(), dangling.c_str()) == 0);
+    CHECK_THROWS(save_keypair(dangling, kp));
+    CHECK(!fs::exists(target));
+    // not a regular file
+    fs::create_directories(dir / "adir");
+    CHECK_THROWS(read_secret_file((dir / "adir").u8string()));
+#else
+    CHECK_THROWS(save_keypair(f, kp));  // CREATE_NEW: no overwrite
+    // the DACL is protected (no inherited ACEs) and holds only owner / SYSTEM / Administrators
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    PACL dacl = nullptr;
+    std::wstring wf = fs::u8path(f).wstring();
+    CHECK(::GetNamedSecurityInfoW(wf.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl,
+                                  nullptr, &sd) == ERROR_SUCCESS);
+    SECURITY_DESCRIPTOR_CONTROL ctl = 0;
+    DWORD rev = 0;
+    CHECK(::GetSecurityDescriptorControl(sd, &ctl, &rev));
+    CHECK((ctl & SE_DACL_PROTECTED) != 0);
+    CHECK(dacl != nullptr && dacl->AceCount >= 1 && dacl->AceCount <= 3);
+    ::LocalFree(sd);
+    // an Everyone ACE is detected (load only warns, it does not refuse)
+    PSECURITY_DESCRIPTOR open_sd = nullptr;
+    CHECK(::ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;FA;;;WD)(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)",
+                                                                 SDDL_REVISION_1, &open_sd, nullptr));
+    PACL open_dacl = nullptr;
+    BOOL present = FALSE, defaulted = FALSE;
+    CHECK(::GetSecurityDescriptorDacl(open_sd, &present, &open_dacl, &defaulted) && present);
+    CHECK(::SetNamedSecurityInfoW(const_cast<LPWSTR>(wf.c_str()), SE_FILE_OBJECT,
+                                  DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                                  open_dacl, nullptr) == ERROR_SUCCESS);
+    ::LocalFree(open_sd);
+    auto broad = key_file_broad_acl(f);
+    CHECK(broad.size() == 1 && broad[0] == "Everyone");
+    CHECK(load_keypair(f).pub == kp.pub);
+#endif
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
