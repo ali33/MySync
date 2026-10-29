@@ -62,7 +62,7 @@ install -m 0640 -o root -g mysync server.toml /etc/mysync/server.toml
 mysync service install -c /etc/mysync/server.toml --user mysync          # sinh /etc/systemd/system/mysync-server.service
 systemctl enable --now mysync-server
 ```
-Hoặc chép tay `examples/mysync.service` vào `/etc/systemd/system/` rồi `systemctl daemon-reload && systemctl enable --now mysync`. Thư mục cần **ghi** phải nằm trong `ReadWritePaths` (lệnh `service install` tự thêm từ cấu hình).
+Hoặc chép tay `examples/mysync.service` vào `/etc/systemd/system/` rồi `systemctl daemon-reload && systemctl enable --now mysync` (cách này tên dịch vụ là `mysync`, **không phải** `mysync-server`; các lệnh trạng thái/log/gỡ bên dưới phải dùng đúng tên bạn cài). Lưu ý `mysync service install` chỉ cài và `enable`, **không tự chạy**: cần `systemctl start` hoặc `enable --now`. Thư mục cần **ghi** phải nằm trong `ReadWritePaths` (lệnh `service install` tự thêm từ cấu hình).
 - Trạng thái: `systemctl status mysync-server`. Log: `journalctl -u mysync-server -f` (stderr được journald thu).
 - Gỡ: `systemctl disable --now mysync-server && mysync service uninstall -c /etc/mysync/server.toml`.
 
