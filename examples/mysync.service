@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 META.vn
+# Tác giả: Nguyễn Đức Sơn
+#
+# Mẫu systemd. `mysync service install -c <cấu hình> --user mysync` (chạy bằng root) sinh unit tương tự và cài sẵn.
+# Cài tay:
+#   useradd --system --no-create-home --shell /usr/sbin/nologin mysync
+#   install -d -o mysync -g mysync /srv/mysync /var/lib/mysync /var/log/mysync
+#   install -d /etc/mysync && install -m 0600 -o mysync -g mysync server.key /etc/mysync/server.key
+#   cp mysync.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now mysync
+# Máy khách: đổi --role client và đường dẫn cấu hình. Mọi thư mục cần GHI phải có trong ReadWritePaths.
+
+[Unit]
+Description=MySync file synchronisation (server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mysync
+Group=mysync
+ExecStart=/usr/local/bin/mysync run -c /etc/mysync/server.toml --role server --service
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Quyền tối thiểu
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/srv/mysync /var/lib/mysync /var/log/mysync
+# Cổng < 1024 cần dòng sau (hoặc dùng cổng cao như 5656):
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 META.vn
+# Tác giả: Nguyễn Đức Sơn
+#
+# MySync - cấu hình MÁY CHỦ (nhận tệp). Chạy: mysync run -c server.toml
+# Đường dẫn tương đối được hiểu so với thư mục chứa tệp này; khi chạy như dịch vụ hãy dùng đường dẫn tuyệt đối.
+#
+# Ánh xạ từ cấu hình C# cũ (ServerSample.config):
+#   serverPort        -> port
+#   bindIpAddress     -> bind
+#   path (mirror)     -> root
+#   maxConnections    -> max_connections
+#   allowIp / denyIP  -> allow / deny (nay hỗ trợ cả CIDR; deny thắng allow)
+#   securityCode      -> BỎ. Thay bằng cặp khoá: key_file (khoá bí mật của máy chủ) và public_key của từng [[client]]
+#   useTempFiles      -> BỎ (luôn ghi tệp tạm + kiểm hash + đổi tên nguyên tử)
+#   TRASH_DIR         -> trash = true (thùng rác nằm ở <root>/__sync/__trash/<thời gian UTC>/)
+#   cảnh báo email    -> BỎ (lỗi chỉ ghi log)
+
+[server]
+# Địa chỉ lắng nghe. "*" = mọi giao diện; hoặc IP cụ thể, ví dụ "192.168.1.10".
+bind = "*"
+
+# Cổng TCP (nhớ mở cổng này trên tường lửa).
+port = 5656
+
+# Thư mục gốc nhận tệp. Tạo sẵn và cấp quyền ghi cho tài khoản chạy dịch vụ.
+root = "/srv/mysync"
+
+# Khoá bí mật của máy chủ: một dòng 64 ký tự hex, tạo bằng `mysync keygen -o server.key`.
+# Quyền 0600 (Linux từ chối nếu nhóm/người khác đọc được). Khoá CÔNG KHAI in ra khi keygen
+# thì dán vào `server_key` trong cấu hình máy khách.
+key_file = "server.key"
+
+# Số kết nối đồng thời tối đa.
+max_connections = 20
+
+# Chống dò khoá: quá số lần xác thực sai mỗi phút từ một IP thì IP đó bị chặn tạm.
+max_auth_failures_per_min = 10
+
+# true = tệp bị xoá hoặc bị ghi đè được chuyển vào <root>/__sync/__trash/ thay vì mất hẳn.
+trash = true
+
+# IP được phép / bị cấm: IP đơn, CIDR ("10.0.0.0/8", "fd00::/8") hoặc "*". Deny thắng allow.
+allow = ["*"]
+deny = []
+
+# Thư mục trạng thái và tệp log. Rỗng = mặc định / chỉ ghi stderr.
+state_dir = ""
+log_file = ""
+# debug | info | warn | error
+log_level = "info"
+
+# Kích thước tối đa mỗi tệp nhận ("10GB", "500MB", số byte). 0 = không giới hạn.
+max_file_size = 0
+
+# Hết thời gian chờ I/O của một kết nối (giây).
+io_timeout_s = 60
+
+# ---- Máy khách được phép kết nối: mỗi máy một khối [[client]] -------------------------------------------
+# Chỉ khoá công khai có trong danh sách này mới vào được (Noise_IK, khoá được ghim, không cần CA).
+[[client]]
+name = "van-phong-ha-noi"
+# Khoá công khai của máy khách (dòng hex in ra khi chạy `mysync keygen` trên máy khách).
+public_key = "0000000000000000000000000000000000000000000000000000000000000000"
+# "rw" = đọc-ghi; "ro" = chỉ liệt kê/đọc, không ghi/xoá.
+access = "rw"
+# Chỉ cho máy này thấy thư mục con này của root ("" = cả root). Không có "/" đầu/cuối.
+prefix = "hanoi"
+
+# [[client]]
+# name = "may-giam-sat"
+# public_key = "..."
+# access = "ro"

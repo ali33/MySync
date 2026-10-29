@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 META.vn
+# Tác giả: Nguyễn Đức Sơn
+#
+# MySync - cấu hình MÁY KHÁCH (theo dõi thư mục và đẩy đi). Chạy: mysync run -c client.toml
+# Thử một lượt rồi thoát: mysync run -c client.toml --once
+# Đường dẫn tương đối được hiểu so với thư mục chứa tệp này; khi chạy như dịch vụ hãy dùng đường dẫn tuyệt đối.
+#
+# Ánh xạ từ cấu hình C# cũ (ClientSample.config / MirrorSettings):
+#   syncAddress (ip:port)   -> [[watch.target]] host / port (+ server_key); hoặc path = "..." (đích copy trực tiếp)
+#   securityCode            -> BỎ. Thay bằng key_file của máy này + server_key của máy chủ
+#   path                    -> [[watch]] path
+#   includeSubdirectories   -> recursive
+#   timeActionAfterChanged  -> quiet_ms
+#   syncDelay               -> sync_delay_ms
+#   startSync               -> start_sync
+#   enabled                 -> enabled
+#   filter / excluded       -> [watch.filter] include / exclude (regex nay áp lên đường dẫn TƯƠNG ĐỐI, không phải đường dẫn đầy đủ)
+#   fileSize / fileTime     -> size_min, size_max / mtime_after, mtime_before
+#   syncTasks (giờ cố định) -> schedule_at;  sleepTimeSpan -> schedule_interval_s
+#   Max_BandWidth           -> max_bandwidth_kbps
+#   đồng bộ xoá/đổi tên     -> propagate_delete (bên nhận chuyển vào __sync/__trash chứ không xoá thật)
+#   notifyFilter, Max_Cpu, FTP, cảnh báo email, NetworkMonitor, giao diện WinForms -> BỎ
+
+[client]
+# Khoá bí mật của máy này (tạo bằng `mysync keygen -o client.key`). Dòng khoá công khai in ra thì dán vào
+# [[client]] public_key trong server.toml bên máy chủ. Mỗi đích có thể ghi đè bằng key_file riêng.
+key_file = "client.key"
+
+# Nơi lưu chỉ mục (hash tệp, để lần chạy sau không băm lại) và trạng thái. Để NGOÀI thư mục đồng bộ.
+# Rỗng = <thư mục cấu hình>/state.
+state_dir = "state"
+
+# Tệp log ("" = chỉ stderr) và mức: debug | info | warn | error.
+log_file = ""
+log_level = "info"
+
+# Số kết nối song song tới MỖI đích (1..64).
+connections = 4
+
+# Nén khi truyền: "lz4" hoặc "none". Tệp có đuôi trong compress_skip_ext (đã nén sẵn) không bị nén lại.
+compress = "lz4"
+
+# Giới hạn băng thông tổng (kilobit/giây). 0 = không giới hạn.
+max_bandwidth_kbps = 0
+
+# Thử lại khi lỗi mạng/ghi: thời gian chờ tăng gấp đôi từ retry_min_ms tới retry_max_ms (có nhiễu ngẫu nhiên).
+# Sự kiện không bao giờ bị mất, chỉ chờ gửi lại.
+retry_min_ms = 1000
+retry_max_ms = 60000
+
+# ---- Một thư mục theo dõi: mỗi thư mục một khối [[watch]] ---------------------------------------------
+[[watch]]
+name = "tai-lieu"
+path = "/data/tailieu"
+enabled = true
+# Theo dõi cả thư mục con.
+recursive = true
+# Chờ tệp yên (không đổi) bao lâu trước khi gửi, mili giây. Tệp đang bị khoá hoặc ghi dở được chờ tiếp.
+quiet_ms = 300
+# Trễ thêm trước khi gửi sau một sự kiện.
+sync_delay_ms = 100
+# Đối chiếu toàn bộ khi khởi động: chỉ gửi cái thiếu/khác (so kích thước rồi hash BLAKE3).
+start_sync = true
+# true = xoá/đổi tên ở nguồn được áp lên đích (đích chuyển vào thùng rác). Khi đối chiếu, nếu sẽ xoá hơn 50% và hơn
+# 100 tệp của đích thì từ chối (phòng nguồn tạm thời trống).
+propagate_delete = true
+# Đồng bộ toàn bộ thêm vào giờ cố định hằng ngày (giờ địa phương) và/hoặc lặp mỗi N giây (0 = tắt).
+schedule_at = ["01:00", "12:10"]
+schedule_interval_s = 0
+# Quét lại toàn bộ định kỳ phòng mất sự kiện (giây, 0 = tắt).
+periodic_scan_s = 300
+
+# Bộ lọc (tuỳ chọn). Tệp tạm (~$x, x~, .tmp, đuôi có $ hoặc #) và thư mục __sync luôn bị bỏ qua.
+[watch.filter]
+# Chỉ lấy: đuôi (".docx") hoặc glob ("*.xlsx"). Rỗng = tất cả.
+include = [".docx", ".xlsx", ".pdf"]
+include_regex = []
+# Loại: chuỗi con (không phân biệt hoa thường) của đường dẫn tương đối, hoặc regex.
+exclude = ["/cache/", "thumbs.db"]
+exclude_regex = []
+# Kích thước: "10MB", "1.5GB", số byte. Rỗng = không chặn.
+# size_min = "10KB"
+size_max = "2GB"
+# Thời gian sửa đổi: "2026-01-01T00:00:00" (giờ địa phương) hoặc tương đối "7d", "12h".
+# mtime_after = "7d"
+# mtime_before = "2026-12-31T00:00:00"
+
+# Đích 1: máy chủ MySync qua mạng (khoá công khai của máy chủ được ghim: xác thực hai chiều, mã hoá).
+[[watch.target]]
+host = "may-chu.example.com"
+port = 5656
+# Khoá công khai của máy chủ (dòng hex in ra khi chạy keygen trên máy chủ).
+server_key = "0000000000000000000000000000000000000000000000000000000000000000"
+# key_file = "khac.key"      # (tuỳ chọn) khoá riêng cho đích này
+# remote_prefix = "hanoi"    # (tuỳ chọn) ghi vào thư mục con này của đích
+enabled = true
+
+# Đích 2: copy trực tiếp sang ổ/thư mục khác, chia sẻ mạng UNC (Windows) hoặc điểm mount CIFS/NFS (Linux),
+# không cần máy chủ MySync. Vẫn bỏ qua tệp trùng nội dung, ghi tạm + đổi tên nguyên tử, chặn thoát khỏi thư mục đích.
+[[watch.target]]
+path = "/mnt/nas/tailieu"
+# Windows: path = '\\nas\backup\tailieu'   (nháy đơn để khỏi phải nhân đôi dấu gạch ngược)
+enabled = true
