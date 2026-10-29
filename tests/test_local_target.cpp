@@ -2,6 +2,10 @@
 // Copyright (C) 2026 META.vn
 // Author: Nguyễn Đức Sơn
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -96,6 +100,25 @@ TEST(local_put_then_skip_identical) {
     CHECK_EQ(r2.bytes_on_wire, 0u);
     CHECK_EQ(count_tmp(fs::u8path(dst)), 0u);
 }
+
+#ifdef _WIN32
+TEST(local_unreadable_source_leaves_no_temp_file) {
+    Tmp tmp;
+    std::string src = tmp.sub("src"), dst = tmp.sub("dst");
+    fs::path f = fs::u8path(src) / "locked.txt";
+    write_file(f, "locked content");
+    FileMeta m = meta_of("locked.txt", f);
+    // Opened without sharing: stat works, reading does not.
+    HANDLE h = CreateFileW(f.wstring().c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    auto t = open_target(dst);
+    PutResult r = t->put_file("locked.txt", f.u8string(), m);
+    CHECK(r.status != PutResult::Sent);
+    CHECK(!r.error.empty());
+    CloseHandle(h);
+    CHECK_EQ(count_tmp(fs::u8path(dst)), 0u);
+}
+#endif
 
 TEST(local_skip_fixes_mtime_only) {
     Tmp tmp;

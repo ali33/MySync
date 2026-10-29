@@ -584,6 +584,35 @@ TEST(rate_limiter_throttles) {
     CHECK(dt > 0.9 && dt < 3.0);
 }
 
+TEST(rate_limiter_stop_cuts_sleep_short) {
+    RateLimiter lim(64);  // 8 KB/s: 100 KB would take ~12 s
+    std::atomic<bool> stop{false};
+    std::thread th([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        stop = true;
+    });
+    auto t0 = Clock::now();
+    lim.acquire(100000, &stop);
+    double dt = secs_since(t0);
+    th.join();
+    CHECK(dt >= 0.15);
+    CHECK(dt < 0.5);  // woke within a 100 ms slice of the flag
+    t0 = Clock::now();
+    lim.acquire(100000, &stop);  // already stopped: returns at once
+    CHECK(secs_since(t0) < 0.1);
+}
+
+TEST(rate_limiter_big_request_does_not_starve_a_small_one) {
+    RateLimiter lim(800);  // 100 KB/s, piece 25 KB
+    std::thread big([&] { lim.acquire(300000); });  // ~3 s in total
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto t0 = Clock::now();
+    lim.acquire(1000);
+    double dt = secs_since(t0);
+    big.join();
+    CHECK(dt < 1.5);  // one piece of debt (~0.25 s) ahead of it, not the whole 3 s
+}
+
 // ---------------------------------------------------------------- security hardening
 
 TEST(auth_throttle_ipv6_keyed_by_slash64) {
@@ -695,6 +724,28 @@ TEST(server_caps_authenticated_sessions_at_max_connections) {
     auto b = e.target(e.ro);
     CHECK_THROWS(b->open());                           // second authenticated session: refused
     a->close();
+}
+
+TEST(server_silent_authenticated_connection_does_not_take_a_session_slot) {
+    ServerConfig cfg = quiet_cfg();
+    cfg.max_connections = 1;
+    Env e(cfg, false, [](ClientAcl& a) { a.max_sessions = 1; });
+    // Valid key, handshake done, but no HELLO (e.g. a replayed msg1): must not occupy max_sessions / max_connections.
+    net::Socket s = net::Socket::connect("127.0.0.1", e.srv->port(), 3000);
+    SecureChannel ch = SecureChannel::client(std::move(s), e.rw, e.server_kp.pub);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    auto t = e.target(e.rw);
+    t->open();  // the real client of the same key is served
+    PutItem it = e.item_text("real.txt", "ok");
+    CHECK(t->put_file(it.rel, it.abs_src, it.meta).status == PutResult::Sent);
+    t->close();
+    // Still counted as unauthenticated until the hello deadline: its place frees only then.
+    auto h1 = silent_connections(e.srv->port(), 3);  // 1 (ch) + 3 = the per-IP budget of 4 is full
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    net::Socket extra = net::Socket::connect("127.0.0.1", e.srv->port(), 3000);
+    CHECK(closed_by_server(extra, 2000));
+    ch.socket().set_timeouts(8000, 8000);
+    CHECK_THROWS(ch.recv_msg());  // hello deadline: the server hangs up
 }
 
 TEST(server_counts_first_record_garbage_as_auth_failure) {

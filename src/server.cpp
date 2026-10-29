@@ -352,6 +352,7 @@ struct ServerCore {
     std::map<std::string, int> unauth_by_key;
     size_t unauth_total = 0;
     RateLimiter total_bandwidth;  // all clients together
+    const std::atomic<bool>* stop_flag = nullptr;  // set by Server::run before any session starts; cuts bandwidth sleeps
     std::vector<std::unique_ptr<ClientState>> cstate;  // parallel to cfg.clients
     std::mutex trash_mu;           // serialises moves into / purges of <root>/__sync/__trash
     bool trash_scanned = false;    // trash_bytes is valid (computed lazily, only when max_trash_bytes != 0)
@@ -561,7 +562,10 @@ public:
     Session(ServerCore& c, SecureChannel& ch, const ClientAcl& acl, std::string ip, ClientState& cs)
         : c_(c), ch_(ch), acl_(acl), ip_(std::move(ip)), cs_(cs) {}
 
-    void run() {
+    // Reads and validates the first record. Runs while the connection still holds its "unauthenticated" place,
+    // so a replayed msg1 (valid handshake, no HELLO) cannot take a session slot of the client it impersonates.
+    // Returns false when the peer was told why it is refused.
+    bool read_hello() {
         prefix_ = normalize_rel(acl_.prefix);
         while (!prefix_.empty() && prefix_.back() == '/') prefix_.pop_back();
         if (!prefix_.empty()) {
@@ -582,13 +586,18 @@ public:
         const Hello* h = std::get_if<Hello>(&first);
         if (!h) {
             send(FileErr{ErrCode::BadRequest, "HELLO expected"});
-            return;
+            return false;
         }
         if (h->proto_ver != kProtoVersion) {
             send(FileErr{ErrCode::Unsupported, "unsupported protocol version"});
-            return;
+            return false;
         }
         caps_ = h->caps & (kCapLz4 | kCapDelta);
+        return true;
+    }
+
+    // After a valid HELLO (and the session slots): answers it and serves requests until the peer leaves.
+    void serve() {
         send(HelloOk{kCapLz4 | kCapDelta, kDefaultMaxChunk});
         log_info("client '" + acl_.name + "' connected from " + ip_);
 
@@ -616,8 +625,8 @@ private:
 
     // Bandwidth caps: the client's own bucket first, then the server-wide one (the lower cap wins).
     void throttle(size_t n) {
-        cs_.bandwidth.acquire(n);
-        c_.total_bandwidth.acquire(n);
+        cs_.bandwidth.acquire(n, c_.stop_flag);
+        c_.total_bandwidth.acquire(n, c_.stop_flag);
     }
     Bytes recv() {
         Bytes b = ch_.recv_msg();
@@ -1054,35 +1063,10 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
         log_warn("authentication failed from " + ip);
         return;
     }
-    unauth.release();
-    if (!c.session_acquire()) {
-        log_warn("too many connections; refusing " + ip);
-        return;
-    }
-    struct Active {
-        ServerCore& c;
-        ~Active() { c.active--; }
-    } active{c};
+    // The unauthenticated place is kept until a valid HELLO arrives: only then does the connection count
+    // against max_connections / max_sessions.
     ClientState& cs = *c.cstate[size_t(idx)];
     const ClientAcl& acl = c.cfg.clients[size_t(idx)];
-    struct Slot {
-        ClientState& cs;
-        bool held = false;
-        ~Slot() {
-            if (held) cs.sessions--;
-        }
-    } slot{cs};
-    if (acl.max_sessions && cs.sessions.fetch_add(1) >= int(acl.max_sessions)) {
-        cs.sessions--;
-        log_warn("client '" + acl.name + "' already has " + std::to_string(acl.max_sessions) +
-                 " sessions (max_sessions); refusing " + ip);
-        try {
-            ch->send_msg(encode(FileErr{ErrCode::Busy, "too many sessions for this client (max_sessions)"}));
-        } catch (const std::exception&) {
-        }
-        return;
-    }
-    slot.held = acl.max_sessions != 0;
     std::optional<Session> sess;
     try {
         ch->socket().set_timeouts(kHelloTimeoutMs, kHelloTimeoutMs);
@@ -1099,7 +1083,35 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
         } unreg{rec};
         if (stop.load()) return;
         sess.emplace(c, *ch, acl, ip, cs);
-        sess->run();
+        if (!sess->read_hello()) return;
+        unauth.release();
+        if (!c.session_acquire()) {
+            log_warn("too many connections; refusing " + ip);
+            return;
+        }
+        struct Active {
+            ServerCore& c;
+            ~Active() { c.active--; }
+        } active{c};
+        struct Slot {
+            ClientState& cs;
+            bool held = false;
+            ~Slot() {
+                if (held) cs.sessions--;
+            }
+        } slot{cs};
+        if (acl.max_sessions && cs.sessions.fetch_add(1) >= int(acl.max_sessions)) {
+            cs.sessions--;
+            log_warn("client '" + acl.name + "' already has " + std::to_string(acl.max_sessions) +
+                     " sessions (max_sessions); refusing " + ip);
+            try {
+                ch->send_msg(encode(FileErr{ErrCode::Busy, "too many sessions for this client (max_sessions)"}));
+            } catch (const std::exception&) {
+            }
+            return;
+        }
+        slot.held = acl.max_sessions != 0;
+        sess->serve();
     } catch (const std::exception& e) {
         if (!stop.load()) {
             if (sess && sess->hello_pending()) {
@@ -1131,6 +1143,7 @@ const PubKey& Server::public_key() const { return p_->key.pub; }
 
 void Server::run(std::atomic<bool>& stop) {
     ServerCore& c = *p_;
+    c.stop_flag = &stop;
     std::vector<std::unique_ptr<SessRec>> recs;
     auto reap = [&] {
         for (auto it = recs.begin(); it != recs.end();) {

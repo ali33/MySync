@@ -103,6 +103,16 @@ public:
     PutResult put_file(const std::string& rel, const std::string& abs_src, const FileMeta& meta) override {
         PutResult r;
         fs::path tmp;
+        // Removes the temp file on every way out that has not renamed it into place (tmp is cleared then):
+        // the early returns after the temp file exists, and any exception.
+        struct TmpGuard {
+            fs::path& p;
+            ~TmpGuard() {
+                if (p.empty()) return;
+                std::error_code ec;
+                fs::remove(p, ec);
+            }
+        } tmp_guard{tmp};
         try {
             require_root();
             fs::path dest = safe_join(base_, rel);

@@ -318,3 +318,15 @@ TEST(config_server_bandwidth_caps) {
     CHECK(err_of(srv("max_bandwidth_kbps = -1\n"), true).find("out of range") != std::string::npos);
     CHECK(err_of(srv() + "max_bandwidth_kbps = \"5\"\n", true).find("integer") != std::string::npos);
 }
+
+TEST(config_bandwidth_floor_raises_tiny_caps) {
+    ServerConfig c = parse_server_config_text(
+        "[server]\nroot='r'\nkey_file='k'\nmax_bandwidth_kbps = 10\n[[client]]\nname='a'\npublic_key='" + K1 +
+        "'\nmax_bandwidth_kbps = 1\n[[client]]\nname='b'\npublic_key='" + K2 + "'\nmax_bandwidth_kbps = 0\n");
+    CHECK_EQ(c.max_bandwidth_kbps, 64u);
+    CHECK_EQ(c.clients[0].max_bandwidth_kbps, 64u);
+    CHECK_EQ(c.clients[1].max_bandwidth_kbps, 0u);  // 0 stays "no limit"
+    CHECK_EQ(parse_client_config_text("max_bandwidth_kbps = 63\n").max_bandwidth_kbps, 64u);
+    CHECK_EQ(parse_client_config_text("max_bandwidth_kbps = 64\n").max_bandwidth_kbps, 64u);
+    CHECK_EQ(parse_client_config_text("max_bandwidth_kbps = 0\n").max_bandwidth_kbps, 0u);
+}

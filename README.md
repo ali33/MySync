@@ -27,6 +27,45 @@ mysync service install -c server.toml        # cài dịch vụ (admin/root)
 ```
 Ghép máy, cấu hình mẫu và dịch vụ: `docs/SETUP.md`, `docs/SERVICE.md`, `examples/`.
 
+## Cài làm dịch vụ (từng bước)
+
+> **Lưu ý trung thực:** việc cài dịch vụ thật (Windows SCM, systemd) **chưa được kiểm trên máy thật** (xem `docs/STATUS.md`).
+> Đã kiểm: sinh tham số/unit, kiểm tên dịch vụ, chặn chèn lệnh, biên dịch. Hãy thử trên máy thử trước khi triển khai.
+> Chi tiết quyền và hành vi: `docs/SERVICE.md`.
+
+**Bước 0 — ghép máy chủ với máy khách (làm một lần):**
+1. Trên mỗi máy: `mysync keygen -o <tên>.key`. Lệnh in ra **khoá công khai** (64 ký tự hex); khoá bí mật nằm trong tệp, không gửi đi đâu.
+2. Máy chủ: dán khoá công khai của máy khách vào `server.toml`: `[[client]]` → `public_key = "..."`, `access = "rw"` hoặc `"ro"`.
+3. Máy khách: dán khoá công khai của máy chủ vào `client.toml`: `[[watch.target]]` → `server_key = "..."`; `key_file` trỏ tới khoá bí mật của chính máy khách.
+4. Kiểm thử foreground trước khi cài: `mysync run -c server.toml`, rồi `mysync run -c client.toml --once`.
+5. Trong cấu hình đặt **đường dẫn tuyệt đối** và `log_file` (không đặt thì log chỉ ra stderr; dịch vụ Windows sẽ không có log).
+Mẫu: `examples/server.toml`, `examples/client.toml`; từng bước ghép máy: `docs/SETUP.md`.
+
+**Windows** (PowerShell/CMD chạy bằng *Run as administrator*; tên dịch vụ mặc định `mysync-server` / `mysync-client`, đổi bằng `--name`):
+```
+mysync service install   -c C:\mysync\server.toml     # vai trò (server/client) tự nhận từ cấu hình
+mysync service start     -c C:\mysync\server.toml
+mysync service stop      -c C:\mysync\server.toml
+mysync service uninstall -c C:\mysync\server.toml
+```
+- Dịch vụ chạy bằng tài khoản **`NT AUTHORITY\LocalService`** (đặc quyền thấp); đổi bằng `--user`. Khởi động tự động (trễ), tự chạy lại khi lỗi.
+- LocalService phải được cấp quyền trước, ví dụ: `icacls "D:\data" /grant "NT AUTHORITY\LocalService:(OI)(CI)M"` cho thư mục đồng bộ, `state_dir` và thư mục log; tệp khoá chỉ cho LocalService đọc.
+- Log: tệp ở `log_file` trong cấu hình. Trạng thái: `sc query mysync-server` hoặc `services.msc`.
+
+**Linux** (systemd, chạy bằng root):
+```
+useradd --system --no-create-home --shell /usr/sbin/nologin mysync
+install -m 0755 build/mysync /usr/local/bin/mysync
+install -d -o mysync -g mysync /srv/mysync /var/lib/mysync /var/log/mysync /etc/mysync
+install -m 0600 -o mysync -g mysync server.key /etc/mysync/server.key     # khoá bí mật: chế độ 0600, chủ là user dịch vụ
+install -m 0640 -o root -g mysync server.toml /etc/mysync/server.toml
+mysync service install -c /etc/mysync/server.toml --user mysync          # sinh /etc/systemd/system/mysync-server.service
+systemctl enable --now mysync-server
+```
+Hoặc chép tay `examples/mysync.service` vào `/etc/systemd/system/` rồi `systemctl daemon-reload && systemctl enable --now mysync`. Thư mục cần **ghi** phải nằm trong `ReadWritePaths` (lệnh `service install` tự thêm từ cấu hình).
+- Trạng thái: `systemctl status mysync-server`. Log: `journalctl -u mysync-server -f` (stderr được journald thu).
+- Gỡ: `systemctl disable --now mysync-server && mysync service uninstall -c /etc/mysync/server.toml`.
+
 ## Tài liệu
 - `docs/FEATURES.md` — bảng đối chiếu tính năng cũ → mới (giữ / đổi / bỏ, kèm lý do)
 - `docs/DESIGN.md` — kiến trúc, giao thức

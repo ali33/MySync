@@ -12,7 +12,7 @@ Cài / gỡ dịch vụ cần quyền quản trị (Windows: Administrator; Linu
   - thư mục đồng bộ (server: thư mục gốc nhận; client: thư mục nguồn): `icacls "D:\data" /grant "NT AUTHORITY\LocalService:(OI)(CI)M"`
     (client chỉ đọc nguồn thì dùng `(OI)(CI)RX`; thư mục `__sync` bên trong cần `M`)
   - thư mục trạng thái/index (`state_dir`) và tệp log: `M`
-  - tệp cấu hình và tệp khoá PSK: `R` cho LocalService, và **gỡ quyền đọc của nhóm Users/Everyone** trên tệp khoá.
+  - tệp cấu hình và tệp khoá bí mật: `R` cho LocalService, và **gỡ quyền đọc của nhóm Users/Everyone** trên tệp khoá.
 - Khởi động `Auto (Delayed)` để mạng lên trước. Recovery: tự khởi động lại sau 5 s, 5 s, 30 s (đặt lại bộ đếm sau 24 h), kể cả khi tiến trình thoát với mã khác 0.
 - Dừng: SCM gửi STOP/SHUTDOWN → cờ `stop` bật → thân dịch vụ phải thoát trong 30 s.
 - Đường dẫn trong cấu hình nên là tuyệt đối (thư mục làm việc của dịch vụ là `C:\Windows\System32`). Ổ ánh xạ mạng (`Z:`) không tồn tại trong phiên dịch vụ; dùng UNC và cấp quyền cho máy.
@@ -23,7 +23,7 @@ Cài / gỡ dịch vụ cần quyền quản trị (Windows: Administrator; Linu
 `ProtectKernel*`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `Restart=on-failure`.
 
 - Hệ thống tệp chỉ đọc theo mặc định: mọi thư mục cần ghi phải liệt kê ở `ServiceSpec::read_write_paths` (thư mục đồng bộ, `state_dir`, thư mục chứa log). Đường dẫn không được chứa khoảng trắng, nháy, `\`, `%`, `$`.
-- Chạy bằng user riêng (`run_as`), tạo trước: `useradd --system --no-create-home mysync`; cấp quyền ghi cho user đó lên các thư mục trên; tệp khoá PSK mode 0600 thuộc user đó.
+- Chạy bằng user riêng (`run_as`), tạo trước: `useradd --system --no-create-home mysync`; cấp quyền ghi cho user đó lên các thư mục trên; tệp khoá bí mật mode 0600 thuộc user đó.
 - Cổng < 1024 cần `AmbientCapabilities=CAP_NET_BIND_SERVICE` (unit sinh ra không cấp; dùng cổng cao hoặc chỉnh tay).
 - Mọi lệnh `systemctl` chạy bằng `fork/execvp` với mảng đối số, tên dịch vụ chỉ nhận `[A-Za-z0-9_.-]`.
 

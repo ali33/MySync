@@ -438,6 +438,17 @@ void get_pubkey(KV& kv, const char* k, PublicKey& out, bool& present) {
     }
 }
 
+// A positive cap below this is raised to it: the limiter's smallest useful piece is a few KiB.
+constexpr uint32_t kMinBandwidthKbps = 64;
+
+void raise_small_bandwidth(uint32_t& v, const char* where) {
+    if (v > 0 && v < kMinBandwidthKbps) {
+        log_warn(std::string("config: ") + where + " max_bandwidth_kbps = " + std::to_string(v) + " is too low; using " +
+                 std::to_string(kMinBandwidthKbps));
+        v = kMinBandwidthKbps;
+    }
+}
+
 // ---------------------------------------------------------------- servers
 
 void apply_server(const Section& sec, ServerConfig& c) {
@@ -448,6 +459,7 @@ void apply_server(const Section& sec, ServerConfig& c) {
     get_str(kv, "key_file", c.key_file);
     get_num(kv, "max_connections", c.max_connections, 1, 100000);
     get_num(kv, "max_bandwidth_kbps", c.max_bandwidth_kbps, 0, INT32_MAX);
+    raise_small_bandwidth(c.max_bandwidth_kbps, "[server]");
     get_num(kv, "max_auth_failures_per_min", c.max_auth_failures_per_min, 1, 1000000);
     get_bool(kv, "trash", c.trash);
     {
@@ -500,6 +512,7 @@ void apply_client_acl(const Section& sec, ClientAcl& a) {
     a.read_only = access == "ro";
     get_num(kv, "max_sessions", a.max_sessions, 1, 10000);
     get_num(kv, "max_bandwidth_kbps", a.max_bandwidth_kbps, 0, INT32_MAX);
+    raise_small_bandwidth(a.max_bandwidth_kbps, "[[client]]");
     get_size(kv, "max_write_bytes_per_hour", a.max_write_bytes_per_hour);
     const Entry* pe = nullptr;
     for (const auto& x : sec.entries)
@@ -542,6 +555,7 @@ void apply_client(const Section& sec, ClientConfig& c) {
         if (e && c.compress != "none" && c.compress != "lz4") fail(e->line, "compress must be \"none\" or \"lz4\"");
     }
     get_num(kv, "max_bandwidth_kbps", c.max_bandwidth_kbps, 0, INT32_MAX);
+    raise_small_bandwidth(c.max_bandwidth_kbps, "client");
     get_num(kv, "retry_min_ms", c.retry_min_ms, 1, INT32_MAX);
     get_num(kv, "retry_max_ms", c.retry_max_ms, 1, INT32_MAX);
     kv.finish();
