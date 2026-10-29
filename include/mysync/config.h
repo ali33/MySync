@@ -12,6 +12,7 @@
 // Server file: keys at top level (optionally under a [server] table) plus [[client]] entries
 // (name, public_key, access = "rw"|"ro", prefix, max_sessions, max_write_bytes_per_hour).
 // Client file: keys at top level (optionally under [client]), then [[watch]], [watch.filter], [[watch.target]] (network: host/server_key, or local: path).
+// Both files also accept a [control] table (enabled, allow, group, name) for the local GUI channel.
 // Every error is thrown as Error with the offending line ("unknown key 'x' at line N").
 #include <array>
 #include <cstdint>
@@ -99,6 +100,11 @@ struct ServerConfig {
     uint32_t file_mode = 0640;
     uint32_t dir_mode = 0750;
     uint32_t io_timeout_s = 60;
+    // Local control channel (GUI <-> daemon, see gui/ipc.h). [control] table: enabled, allow, group, name.
+    bool control_enabled = true;
+    std::vector<std::string> control_allow;  // Windows: "S-1-5-..." or "DOMAIN\user" besides SYSTEM + Administrators
+    std::string control_group;               // Linux: group allowed on the socket ("" = owner + root only)
+    std::string control_name;                // endpoint name; empty = the service name (mysync-server / mysync-client)
 };
 
 struct ClientConfig {
@@ -116,6 +122,11 @@ struct ClientConfig {
                                                ".jpeg", ".png", ".gif", ".webp", ".mp3", ".mp4", ".mkv", ".avi",
                                                ".mov", ".docx", ".xlsx", ".pptx", ".pdf"};
     std::vector<WatchConfig> watches;
+    // Local control channel (GUI <-> daemon, see gui/ipc.h). [control] table: enabled, allow, group, name.
+    bool control_enabled = true;
+    std::vector<std::string> control_allow;  // Windows: "S-1-5-..." or "DOMAIN\user" besides SYSTEM + Administrators
+    std::string control_group;               // Linux: group allowed on the socket ("" = owner + root only)
+    std::string control_name;                // endpoint name; empty = the service name (mysync-server / mysync-client)
 };
 
 // Parse + validate (port 1..65535, key_file required, connections 1..64 ...).

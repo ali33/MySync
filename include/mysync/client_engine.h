@@ -19,6 +19,7 @@
 #include <string>
 
 #include "mysync/config.h"
+#include "mysync/gui/status.h"
 
 namespace mysync {
 
@@ -49,6 +50,13 @@ public:
     void sync_once(std::atomic<bool>& stop);
 
     EngineStats stats() const;
+    // Light, thread-safe status for the GUI (role Client): per (watch, target) state, queue length, files in flight
+    // (at most 20 names), rates, totals and the last error. Safe to call while run() starts or stops; carries no secrets.
+    // Empty `targets` before run()/sync_once() has built the engine.
+    gui::StatusSnapshot snapshot() const;
+    // Builds the engine from the configuration without starting anything (reads the key files and the index) and
+    // throws Error exactly as run() would for an unusable configuration. Used to vet a reloaded configuration.
+    void check_config();
     // True when the initial reconcile of every target is finished and nothing is queued or in flight.
     bool idle() const;
 

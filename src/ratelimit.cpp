@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <thread>
 
+#include "mysync/util.h"
+
 namespace mysync {
 
 RateLimiter::RateLimiter(uint32_t kbps)
@@ -14,6 +16,8 @@ RateLimiter::RateLimiter(uint32_t kbps)
       tokens_(capacity_), last_(Clock::now()) {}
 
 void RateLimiter::acquire(uint64_t bytes, const std::atomic<bool>* stop) {
+    total_ += bytes;
+    if (cancelled_.load()) throw Error("transfer cancelled: the client is stopping");
     if (rate_ == 0 || bytes == 0) return;
     const uint64_t piece = std::max<uint64_t>(rate_ / 4, 4096);
     while (bytes > 0) {
@@ -33,6 +37,7 @@ void RateLimiter::acquire(uint64_t bytes, const std::atomic<bool>* stop) {
         auto until = Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(wait_s));
         for (;;) {
             if (stop && stop->load()) return;
+            if (cancelled_.load()) throw Error("transfer cancelled: the client is stopping");
             auto left = until - Clock::now();
             if (left <= Clock::duration::zero()) break;
             std::this_thread::sleep_for(std::min<Clock::duration>(left, std::chrono::milliseconds(100)));

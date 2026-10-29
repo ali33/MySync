@@ -21,6 +21,7 @@
 
 #include "fsutil.h"
 #include "mysync/filter.h"
+#include "mysync/gui/status.h"
 #include "mysync/hash.h"
 #include "mysync/index.h"
 #include "mysync/keys.h"
@@ -298,6 +299,39 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         return idle_locked();
     }
+
+    // Snapshot for the GUI.
+    gui::TargetStatus status() {
+        gui::TargetStatus s;
+        s.watch = watch_.name();
+        s.target = label_;
+        EngineStats st = c_.load();
+        s.sent = st.sent;
+        s.skipped = st.skipped;
+        s.failed = st.failed;
+        s.bytes = st.bytes;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            uint64_t q = 0;
+            for (const auto& kv : ops_) {
+                if (kv.second.inflight) {
+                    if (s.active_files.size() < gui::kMaxActiveFiles) s.active_files.push_back(kv.first);
+                } else {
+                    ++q;
+                }
+            }
+            s.queued = q + renames_.size();
+            s.last_error = last_error_;
+            s.last_error_unix_ms = last_error_ms_;
+            s.state = fail_state_ == 2   ? gui::TargetState::Disconnected
+                      : fail_state_ == 1 ? gui::TargetState::Error
+                      : idle_locked()    ? gui::TargetState::Idle
+                                         : gui::TargetState::Syncing;
+        }
+        s.tx_bps = tx_meter_.update(st.bytes);
+        return s;
+    }
+
     bool finished() {  // idle or abandoned (once mode)
         std::lock_guard<std::mutex> lk(mu_);
         return gave_up_ || idle_locked();
@@ -532,6 +566,18 @@ private:
 
     std::string prefix() const { return "[" + watch_.name() + " -> " + label_ + "] "; }
 
+    // state: 1 = a file failed (retrying), 2 = the target itself could not be reached / used
+    void note_error(const std::string& msg, int state) {
+        std::lock_guard<std::mutex> lk(mu_);
+        last_error_ = msg.size() > 500 ? msg.substr(0, 500) : msg;
+        last_error_ms_ = now_unix_ns() / 1000000;
+        fail_state_ = state;
+    }
+    void note_success(int clears) {  // a connection (2) or a file (1) went well: that kind of failure is over
+        std::lock_guard<std::mutex> lk(mu_);
+        if (fail_state_ != 0 && fail_state_ <= clears) fail_state_ = 0;
+    }
+
     // ---- controller: reconcile ----
     void controller_loop() {
         int fails = 0;
@@ -551,6 +597,7 @@ private:
                 ok = true;
             } catch (const std::exception& e) {
                 log_error(prefix() + "reconcile failed: " + e.what());
+                note_error(std::string("reconcile failed: ") + e.what(), 2);
             }
             if (ok) {
                 fails = 0;
@@ -558,6 +605,7 @@ private:
                     std::lock_guard<std::mutex> lk(mu_);
                     reconciling_ = false;
                     reconcile_done_ = true;
+                    if (fail_state_ == 2) fail_state_ = 0;
                 }
                 cv_.notify_all();
                 bool report;
@@ -685,10 +733,12 @@ private:
                 }
                 run_batch(*tgt, batch, done);
                 streak_ = 0;
+                note_success(2);
             } catch (const std::exception& e) {
                 int streak = ++streak_;
                 uint32_t delay = backoff_ms(streak);
                 log_warn(prefix() + "error: " + e.what() + " (retry in " + std::to_string(delay) + " ms)");
+                note_error(e.what(), 2);
                 ++c_.failed;
                 ++global_.failed;
                 for (size_t i = 0; i < batch.size(); ++i) {
@@ -748,6 +798,7 @@ private:
                     it.meta = watch_.meta_for(op.rel, abs, st);
                 } catch (const std::exception& e) {
                     log_warn(prefix() + "cannot read " + op.rel + ": " + e.what());
+                    note_error("cannot read " + op.rel + ": " + e.what(), 1);
                     ++c_.failed;
                     ++global_.failed;
                     watch_.index_erase(op.rel);
@@ -795,14 +846,17 @@ private:
                 ++global_.sent;
                 c_.bytes += r.bytes_on_wire;
                 global_.bytes += r.bytes_on_wire;
+                note_success(1);
                 finish(batch[i], Outcome::Done);
             } else if (r.status == PutResult::Skipped) {
                 ++c_.skipped;
                 ++global_.skipped;
+                note_success(1);
                 finish(batch[i], Outcome::Done);
             } else {
                 ++c_.failed;
                 ++global_.failed;
+                note_error(batch[i].rel + ": " + r.error, 1);
                 if (batch[i].attempts == 0 || (batch[i].attempts & (batch[i].attempts - 1)) == 0)
                     log_warn(prefix() + "failed " + batch[i].rel + ": " + r.error + " (attempt " +
                              std::to_string(batch[i].attempts + 1) + ")");
@@ -822,6 +876,10 @@ private:
     Counters& global_;
     Counters c_;
     EngineStats logged_;
+    gui::RateMeter tx_meter_;
+    std::string last_error_;       // guarded by mu_
+    int64_t last_error_ms_ = 0;
+    int fail_state_ = 0;           // 0 ok, 1 file failures, 2 target unreachable
 
     std::mutex mu_;
     std::condition_variable cv_;
@@ -981,8 +1039,15 @@ struct SyncEngine::Impl {
     std::vector<std::unique_ptr<WatchCtx>> watches;
     std::vector<std::unique_ptr<TargetRunner>> runners;
     bool once = false;
+    mutable std::mutex lay_mu;  // guards watches / runners against snapshot() running on another thread
+    gui::RateMeter tx_meter;
 
     void build() {
+        std::lock_guard<std::mutex> lk(lay_mu);
+        build_locked();
+    }
+
+    void build_locked() {
         watches.clear();
         runners.clear();
         keys.clear();
@@ -1047,11 +1112,19 @@ struct SyncEngine::Impl {
     }
 
     void shutdown() {
-        for (auto& w : watches) w->stop();
-        for (auto& r : runners) r->stop();
-        for (auto& w : watches) w->save_index();
-        runners.clear();
-        watches.clear();
+        if (limiter) limiter->cancel();  // transfers in flight (even throttled ones) end now, workers can be joined
+        std::vector<std::unique_ptr<WatchCtx>> w;
+        std::vector<std::unique_ptr<TargetRunner>> r;
+        {
+            std::lock_guard<std::mutex> lk(lay_mu);
+            w.swap(watches);
+            r.swap(runners);
+        }
+        for (auto& x : w) x->stop();
+        for (auto& x : r) x->stop();
+        for (auto& x : w) x->save_index();
+        r.clear();
+        w.clear();
     }
 };
 
@@ -1067,6 +1140,33 @@ SyncEngine::~SyncEngine() {
 EngineStats SyncEngine::stats() const {
     EngineStats s = p_->global.load();
     return s;
+}
+
+gui::StatusSnapshot SyncEngine::snapshot() const {
+    gui::StatusSnapshot s;
+    s.role = gui::Role::Client;
+    {
+        std::lock_guard<std::mutex> lk(p_->lay_mu);
+        for (const auto& w : p_->watches)
+            for (TargetRunner* r : w->runners()) s.targets.push_back(r->status());
+        if (p_->limiter) s.total_tx_bps = p_->tx_meter.update(p_->limiter->total_bytes());
+    }
+    EngineStats g = p_->global.load();
+    s.total_sent = g.sent;
+    s.total_skipped = g.skipped;
+    s.total_failed = g.failed;
+    // Per-target rates are measured on completed files; a single target is more exact from the live byte meter.
+    if (s.targets.size() == 1) s.targets[0].tx_bps = s.total_tx_bps;
+    return s;
+}
+
+void SyncEngine::check_config() {
+    p_->once = false;
+    p_->build();
+    // Discarded without saving the indexes: another engine may be running on the same state_dir right now.
+    std::lock_guard<std::mutex> lk(p_->lay_mu);
+    p_->runners.clear();
+    p_->watches.clear();
 }
 
 bool SyncEngine::idle() const {

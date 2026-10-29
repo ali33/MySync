@@ -334,13 +334,28 @@ struct ClientState {
     std::atomic<int> sessions{0};
     WriteQuota quota;
     RateLimiter bandwidth;  // shared by every connection of this client (received + sent bytes)
-    ClientState(uint64_t bytes_per_hour, uint32_t kbps) : quota(bytes_per_hour), bandwidth(kbps) {}
+    uint64_t quota_limit;   // identity of the limits, so a reload keeps the live state when they did not change
+    uint32_t kbps;
+    std::atomic<uint64_t> bytes_rx{0}, bytes_tx{0};  // for the GUI status only
+    gui::RateMeter rx_meter, tx_meter;
+    ClientState(uint64_t bytes_per_hour, uint32_t kbps_)
+        : quota(bytes_per_hour), bandwidth(kbps_), quota_limit(bytes_per_hour), kbps(kbps_) {}
+};
+
+// Everything a RELOAD can change, as one immutable snapshot: a session keeps the Policy it started with, so a
+// reload only affects sessions that start afterwards (plus the revocation check in Session::serve).
+struct Policy {
+    ServerConfig cfg;
+    IpFilter ipf;
+    std::vector<std::shared_ptr<ClientState>> cstate;  // parallel to cfg.clients
+    std::shared_ptr<RateLimiter> total_bw;              // all clients together
+    explicit Policy(ServerConfig c)
+        : cfg(std::move(c)), ipf(cfg.allow, cfg.deny), total_bw(std::make_shared<RateLimiter>(cfg.max_bandwidth_kbps)) {}
 };
 
 struct ServerCore {
-    ServerConfig cfg;
+    ServerConfig cfg;  // as started: bind / port / root / key_file never change; the rest lives in `pol`
     KeyPair key;
-    IpFilter ipf;
     AuthThrottle thr;
     net::Socket lsock;
     std::string root;
@@ -351,14 +366,28 @@ struct ServerCore {
     std::mutex um;               // connections still in the handshake
     std::map<std::string, int> unauth_by_key;
     size_t unauth_total = 0;
-    RateLimiter total_bandwidth;  // all clients together
+    mutable std::mutex pm;
+    std::shared_ptr<const Policy> pol;
+    std::atomic<uint32_t> max_conn{0};
+    std::atomic<uint64_t> total_rx{0}, total_tx{0};  // bytes through the sessions, for the GUI status
+    gui::RateMeter rx_meter, tx_meter;
     const std::atomic<bool>* stop_flag = nullptr;  // set by Server::run before any session starts; cuts bandwidth sleeps
-    std::vector<std::unique_ptr<ClientState>> cstate;  // parallel to cfg.clients
+    std::shared_ptr<const Policy> policy() const {
+        std::lock_guard<std::mutex> lk(pm);
+        return pol;
+    }
+    // False when the client was removed from the allowlist, or its access / prefix changed, by a reload.
+    bool still_permitted(const ClientAcl& a) const {
+        auto p = policy();
+        for (const ClientAcl& n : p->cfg.clients)
+            if (n.public_key == a.public_key) return n.read_only == a.read_only && n.prefix == a.prefix;
+        return false;
+    }
     std::mutex trash_mu;           // serialises moves into / purges of <root>/__sync/__trash
     bool trash_scanned = false;    // trash_bytes is valid (computed lazily, only when max_trash_bytes != 0)
     uint64_t trash_bytes = 0;
 
-    size_t unauth_cap() const { return std::max<size_t>(8, cfg.max_connections / 2); }
+    size_t unauth_cap() const { return std::max<size_t>(8, max_conn.load() / 2); }
     bool unauth_acquire(const std::string& key) {
         std::lock_guard<std::mutex> lk(um);
         if (unauth_total >= unauth_cap()) return false;
@@ -380,14 +409,13 @@ struct ServerCore {
     }
     bool session_acquire() {
         int cur = active.load();
-        while (cur < int(cfg.max_connections))
+        while (cur < int(max_conn.load()))
             if (active.compare_exchange_weak(cur, cur + 1)) return true;
         return false;
     }
 
     ServerCore(ServerConfig c, const KeyPair& k)
-        : cfg(std::move(c)), key(k), ipf(cfg.allow, cfg.deny), thr(cfg.max_auth_failures_per_min),
-          total_bandwidth(cfg.max_bandwidth_kbps) {
+        : cfg(std::move(c)), key(k), thr(cfg.max_auth_failures_per_min) {
         if (cfg.root.empty()) throw Error("server root is not set");
         net::init();
         std::error_code ec;
@@ -398,9 +426,14 @@ struct ServerCore {
         state_dir = cfg.state_dir.empty() ? (u8(root) / "__sync" / "__meta") : u8(cfg.state_dir);
         fio::create_dirs(state_dir, cfg.dir_mode, ec);
         if (ec) throw Error("cannot create state directory");
-        for (size_t i = 0; i < cfg.clients.size(); i++)
-            cstate.push_back(std::make_unique<ClientState>(cfg.clients[i].max_write_bytes_per_hour,
-                                                         cfg.clients[i].max_bandwidth_kbps));
+        {
+            auto p = std::make_shared<Policy>(cfg);
+            for (size_t i = 0; i < cfg.clients.size(); i++)
+                p->cstate.push_back(std::make_shared<ClientState>(cfg.clients[i].max_write_bytes_per_hour,
+                                                                  cfg.clients[i].max_bandwidth_kbps));
+            pol = p;
+            max_conn = cfg.max_connections;
+        }
         lsock = net::Socket::listen(cfg.bind, cfg.port);
         clean_orphans(root);
     }
@@ -445,6 +478,7 @@ struct ServerCore {
 namespace {
 
 using detail::ClientState;
+using detail::Policy;
 using detail::ServerCore;
 using detail::SessRec;
 using detail::Tree;
@@ -506,9 +540,9 @@ void trash_purge_to(ServerCore& c, uint64_t target) {
 
 // Moves `abs` (file or directory) into <root>/__sync/__trash/<UTC timestamp>/<real> by rename and returns the new
 // location. Enforces max_trash_bytes: older entries are purged first; an item larger than the cap is refused.
-fs::path trash_move(ServerCore& c, const fs::path& abs, const std::string& real) {
+fs::path trash_move(ServerCore& c, const ServerConfig& cfg, const fs::path& abs, const std::string& real) {
     std::lock_guard<std::mutex> lk(c.trash_mu);
-    const uint64_t limit = c.cfg.max_trash_bytes;
+    const uint64_t limit = cfg.max_trash_bytes;
     uint64_t sz = 0;
     if (limit) {
         sz = tree_bytes(abs);
@@ -522,7 +556,7 @@ fs::path trash_move(ServerCore& c, const fs::path& abs, const std::string& real)
     }
     fs::path base = u8(c.root) / "__sync" / "__trash" / utc_stamp() / u8(real);
     std::error_code ec;
-    fio::create_dirs(base.parent_path(), c.cfg.dir_mode, ec);
+    fio::create_dirs(base.parent_path(), cfg.dir_mode, ec);
     if (ec) throw OpError(ErrCode::IoError, "cannot create trash directory");
     fs::path cand = base;
     for (int n = 1; fio::stat_path(cand).exists || fs::is_symlink(cand, ec); n++)
@@ -559,8 +593,9 @@ struct Pending {
 
 class Session {
 public:
-    Session(ServerCore& c, SecureChannel& ch, const ClientAcl& acl, std::string ip, ClientState& cs)
-        : c_(c), ch_(ch), acl_(acl), ip_(std::move(ip)), cs_(cs) {}
+    Session(ServerCore& c, SecureChannel& ch, const ClientAcl& acl, std::string ip, ClientState& cs,
+            std::shared_ptr<const Policy> pol)
+        : c_(c), pol_(std::move(pol)), ch_(ch), acl_(acl), ip_(std::move(ip)), cs_(cs) {}
 
     // Reads and validates the first record. Runs while the connection still holds its "unauthenticated" place,
     // so a replayed msg1 (valid handshake, no HELLO) cannot take a session slot of the client it impersonates.
@@ -572,14 +607,14 @@ public:
             if (is_internal_dir(prefix_)) throw Error("client prefix points into the internal directory");
             fs::path p = safe_join(c_.root, prefix_);  // throws on a malicious prefix: session refused
             std::error_code ec;
-            fio::create_dirs(p, c_.cfg.dir_mode, ec);
+            fio::create_dirs(p, pol_->cfg.dir_mode, ec);
         }
         tree_ = c_.tree_for(prefix_);
 
         // The first record must arrive promptly: a replayed msg1 completes the handshake but cannot produce it.
         hello_pending_ = true;
         Bytes raw_first = ch_.recv_msg_within(kHelloTimeoutMs);
-        int io_ms = int(c_.cfg.io_timeout_s ? c_.cfg.io_timeout_s : 60) * 1000;
+        int io_ms = int(pol_->cfg.io_timeout_s ? pol_->cfg.io_timeout_s : 60) * 1000;
         ch_.socket().set_timeouts(io_ms, io_ms);
         Message first = decode(raw_first);
         hello_pending_ = false;
@@ -603,6 +638,10 @@ public:
 
         for (;;) {
             Message m = decode(recv());
+            if (!c_.still_permitted(acl_)) {  // removed from the allowlist (or access changed) by a reload
+                log_warn("client '" + acl_.name + "' is no longer permitted by the configuration: session closed");
+                break;
+            }
             if (!dispatch(m)) break;
         }
         c_.save_tree(*tree_, false);
@@ -614,8 +653,9 @@ public:
 private:
     bool hello_pending_ = false;
     ServerCore& c_;
+    std::shared_ptr<const Policy> pol_;  // the policy this session started with
     SecureChannel& ch_;
-    const ClientAcl& acl_;
+    ClientAcl acl_;
     std::string ip_;
     ClientState& cs_;
     std::string prefix_;
@@ -626,17 +666,21 @@ private:
     // Bandwidth caps: the client's own bucket first, then the server-wide one (the lower cap wins).
     void throttle(size_t n) {
         cs_.bandwidth.acquire(n, c_.stop_flag);
-        c_.total_bandwidth.acquire(n, c_.stop_flag);
+        pol_->total_bw->acquire(n, c_.stop_flag);
     }
     Bytes recv() {
         Bytes b = ch_.recv_msg();
         throttle(b.size());
+        cs_.bytes_rx += b.size();
+        c_.total_rx += b.size();
         return b;
     }
     void send(const Message& m) {
         Bytes b = encode(m);
         throttle(b.size());
         ch_.send_msg(b);
+        cs_.bytes_tx += b.size();
+        c_.total_tx += b.size();
     }
     void ok() { send(FileOk{}); }
     void err(ErrCode code, const std::string& msg) { send(FileErr{code, msg}); }
@@ -724,7 +768,7 @@ private:
         if (acl_.read_only) throw OpError(ErrCode::PathDenied, "read-only client");
         if (pending_.size() >= kMaxPending) throw OpError(ErrCode::Busy, "too many pending files");
         Resolved r = resolve(o.path);
-        if (c_.cfg.max_file_size && o.size > c_.cfg.max_file_size) throw OpError(ErrCode::TooLarge, "file too large");
+        if (pol_->cfg.max_file_size && o.size > pol_->cfg.max_file_size) throw OpError(ErrCode::TooLarge, "file too large");
         fio::StatInfo st = fio::stat_path(r.abs);
         if (st.is_symlink) throw OpError(ErrCode::PathDenied, "symlink at destination");
         if (st.exists && !st.is_regular) throw OpError(ErrCode::IoError, "destination is not a regular file");
@@ -785,7 +829,7 @@ private:
         // (a symlinked ancestor could have appeared in between).
         bool existed = fs::is_directory(dir, ec);
         if (!existed) {
-            fio::create_dirs(dir, c_.cfg.dir_mode, ec);
+            fio::create_dirs(dir, pol_->cfg.dir_mode, ec);
             if (ec) throw OpError(ErrCode::IoError, "cannot create directory");
             recheck(p.r);
         }
@@ -884,12 +928,12 @@ private:
             if (!(a && b)) throw OpError(ErrCode::HashMismatch, "hash mismatch");
             p->applier.reset();
             const int64_t mtime = std::max<int64_t>(0, p->mtime_ns);
-            if (!p->tmp.sync_and_close(mtime, c_.cfg.file_mode)) log_debug("cannot set modification time");
+            if (!p->tmp.sync_and_close(mtime, pol_->cfg.file_mode)) log_debug("cannot set modification time");
             // The previous content of an overwritten file goes to the trash first (rename, no copy).
             fs::path trashed;
-            if (c_.cfg.trash) {
+            if (pol_->cfg.trash) {
                 fio::StatInfo old = fio::stat_path(p->r.abs);
-                if (old.exists && old.is_regular) trashed = trash_move(c_, p->r.abs, p->r.real);
+                if (old.exists && old.is_regular) trashed = trash_move(c_, pol_->cfg, p->r.abs, p->r.real);
             }
             std::error_code ec;
             fs::rename(p->tmp.path(), p->r.abs, ec);  // atomic replace; a directory at the destination fails here
@@ -922,7 +966,7 @@ private:
         if (acl_.read_only) throw OpError(ErrCode::PathDenied, "read-only client");
     }
 
-    void move_to_trash(const Resolved& r) { trash_move(c_, r.abs, r.real); }
+    void move_to_trash(const Resolved& r) { trash_move(c_, pol_->cfg, r.abs, r.real); }
 
     void on_delete(const Delete& d) {
         require_rw();
@@ -932,7 +976,7 @@ private:
             ok();
             return;
         }
-        if (c_.cfg.trash) {
+        if (pol_->cfg.trash) {
             move_to_trash(r);
         } else {
             std::error_code ec;
@@ -957,10 +1001,10 @@ private:
             if (stt.exists) {
                 if (stt.is_dir || sf.is_dir || stt.is_symlink)
                     throw OpError(ErrCode::IoError, "destination exists");
-                if (c_.cfg.trash) move_to_trash(to);
+                if (pol_->cfg.trash) move_to_trash(to);
             }
             std::error_code ec;
-            fio::create_dirs(to.abs.parent_path(), c_.cfg.dir_mode, ec);
+            fio::create_dirs(to.abs.parent_path(), pol_->cfg.dir_mode, ec);
             if (ec) throw OpError(ErrCode::IoError, "cannot create directory");
             recheck(to);
             fs::rename(from.abs, to.abs, ec);
@@ -979,7 +1023,7 @@ private:
         if (st.exists && !st.is_dir) throw OpError(ErrCode::IoError, "a file exists at this path");
         if (st.is_symlink) throw OpError(ErrCode::PathDenied, "symlink");
         std::error_code ec;
-        fio::create_dirs(r.abs, c_.cfg.dir_mode, ec);
+        fio::create_dirs(r.abs, pol_->cfg.dir_mode, ec);
         if (ec) throw OpError(ErrCode::IoError, "cannot create directory");
         recheck(r);
         ok();
@@ -1047,11 +1091,12 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
 
     std::optional<SecureChannel> ch;
     int idx = -1;
+    std::shared_ptr<const Policy> pol = c.policy();  // fixed for this session, whatever a reload does meanwhile
     try {
         ch.emplace(SecureChannel::server(std::move(sock), c.key, [&](const PubKey& k) {
             int found = -1;
-            for (size_t i = 0; i < c.cfg.clients.size(); i++) {  // no early exit: time does not reveal the position
-                bool eq = ct_equal(k.data(), c.cfg.clients[i].public_key.data(), 32);
+            for (size_t i = 0; i < pol->cfg.clients.size(); i++) {  // no early exit: time does not reveal the position
+                bool eq = ct_equal(k.data(), pol->cfg.clients[i].public_key.data(), 32);
                 if (eq && found < 0) found = int(i);
             }
             idx = found;
@@ -1065,8 +1110,8 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
     }
     // The unauthenticated place is kept until a valid HELLO arrives: only then does the connection count
     // against max_connections / max_sessions.
-    ClientState& cs = *c.cstate[size_t(idx)];
-    const ClientAcl& acl = c.cfg.clients[size_t(idx)];
+    ClientState& cs = *pol->cstate[size_t(idx)];
+    const ClientAcl& acl = pol->cfg.clients[size_t(idx)];
     std::optional<Session> sess;
     try {
         ch->socket().set_timeouts(kHelloTimeoutMs, kHelloTimeoutMs);
@@ -1082,7 +1127,7 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
             }
         } unreg{rec};
         if (stop.load()) return;
-        sess.emplace(c, *ch, acl, ip, cs);
+        sess.emplace(c, *ch, acl, ip, cs, pol);
         if (!sess->read_hello()) return;
         unauth.release();
         if (!c.session_acquire()) {
@@ -1141,6 +1186,59 @@ uint16_t Server::port() const { return p_->lsock.local_port(); }
 
 const PubKey& Server::public_key() const { return p_->key.pub; }
 
+gui::StatusSnapshot Server::snapshot() const {
+    ServerCore& c = *p_;
+    std::shared_ptr<const detail::Policy> pol = c.policy();
+    gui::StatusSnapshot s;
+    s.role = gui::Role::Server;
+    s.listen = c.cfg.bind + ":" + std::to_string(c.lsock.local_port());
+    s.sessions = static_cast<uint32_t>(std::max(0, c.active.load()));
+    s.max_connections = c.max_conn.load();
+    s.total_rx_bps = c.rx_meter.update(c.total_rx.load());
+    s.total_tx_bps = c.tx_meter.update(c.total_tx.load());
+    for (size_t i = 0; i < pol->cfg.clients.size(); i++) {
+        detail::ClientState& cs = *pol->cstate[i];
+        gui::PeerStatus ps;
+        ps.name = pol->cfg.clients[i].name;
+        ps.sessions = static_cast<uint32_t>(std::max(0, cs.sessions.load()));
+        ps.bytes_rx = cs.bytes_rx.load();
+        ps.bytes_tx = cs.bytes_tx.load();
+        ps.rx_bps = cs.rx_meter.update(ps.bytes_rx);
+        ps.tx_bps = cs.tx_meter.update(ps.bytes_tx);
+        s.peers.push_back(std::move(ps));
+    }
+    return s;
+}
+
+void Server::apply_config(const ServerConfig& n) {
+    ServerCore& c = *p_;
+    if (n.bind != c.cfg.bind || n.port != c.lsock.local_port())
+        throw Error("changing bind / port needs a restart of the server (reload refused, the running configuration is unchanged)");
+    if (n.root != c.cfg.root || n.key_file != c.cfg.key_file || n.state_dir != c.cfg.state_dir)
+        throw Error("changing root / key_file / state_dir needs a restart of the server (reload refused, the running "
+                    "configuration is unchanged)");
+    std::shared_ptr<const detail::Policy> old = c.policy();
+    auto np = std::make_shared<detail::Policy>(n);  // throws Error on a malformed allow / deny entry, nothing swapped yet
+    for (const ClientAcl& a : n.clients) {
+        std::shared_ptr<detail::ClientState> reuse;
+        for (size_t i = 0; i < old->cfg.clients.size(); i++) {
+            const ClientAcl& o = old->cfg.clients[i];
+            if (o.public_key == a.public_key && old->cstate[i]->quota_limit == a.max_write_bytes_per_hour &&
+                old->cstate[i]->kbps == a.max_bandwidth_kbps)
+                reuse = old->cstate[i];
+        }
+        np->cstate.push_back(reuse ? reuse
+                                   : std::make_shared<detail::ClientState>(a.max_write_bytes_per_hour, a.max_bandwidth_kbps));
+    }
+    if (old->cfg.max_bandwidth_kbps == n.max_bandwidth_kbps) np->total_bw = old->total_bw;
+    {
+        std::lock_guard<std::mutex> lk(c.pm);
+        c.pol = np;
+    }
+    c.max_conn = n.max_connections;
+    c.thr.set_max(n.max_auth_failures_per_min);
+}
+
 void Server::run(std::atomic<bool>& stop) {
     ServerCore& c = *p_;
     c.stop_flag = &stop;
@@ -1169,7 +1267,7 @@ void Server::run(std::atomic<bool>& stop) {
         }
         if (!s.valid()) continue;
         ip = norm_ip(ip);
-        if (!c.ipf.permits(ip)) {
+        if (!c.policy()->ipf.permits(ip)) {
             log_warn("connection from " + ip + " refused by access list");
             continue;
         }

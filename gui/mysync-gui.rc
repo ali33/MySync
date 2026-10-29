@@ -1,0 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 META.vn
+// Author: Nguyễn Đức Sơn
+#include <winuser.h>
+1 RT_MANIFEST "mysync-gui.manifest"

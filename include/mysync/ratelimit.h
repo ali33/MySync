@@ -21,11 +21,18 @@ public:
     // Sleeps in slices of <= 100 ms and returns early once *stop becomes true (stop may be null).
     void acquire(uint64_t bytes, const std::atomic<bool>* stop = nullptr);
     uint64_t bytes_per_sec() const { return rate_; }
+    // Shutdown latch: after cancel(), acquire() throws Error at once, so a transfer stuck behind the bandwidth cap
+    // (or just in the middle of a big file) ends promptly instead of running on unthrottled. One-way.
+    void cancel() { cancelled_ = true; }
+    // Bytes that passed through acquire() since construction (live transfer meter for the GUI).
+    uint64_t total_bytes() const { return total_.load(); }
 
 private:
     using Clock = std::chrono::steady_clock;
     const uint64_t rate_;      // bytes per second, 0 = unlimited
     const double capacity_;    // bytes
+    std::atomic<bool> cancelled_{false};
+    std::atomic<uint64_t> total_{0};
     std::mutex m_;
     double tokens_;
     Clock::time_point last_;

@@ -19,3 +19,16 @@ rồi sinh lại `CHECKSUMS.sha256` trong cùng một lần đổi, và cập nh
 - **BLAKE3**: chỉ biên dịch các tệp `.c` (kể cả biến thể SSE2/SSE4.1/AVX2/AVX-512 bằng intrinsics, xem
   `CMakeLists.txt`); các tệp `.S` / `.asm` đi kèm không được dùng nhưng vẫn nằm trong danh sách kiểm.
 - Checksum tính trên byte thô của tệp. Đừng để git đổi kiểu xuống dòng: `third_party/.gitattributes` đặt `-text`.
+
+## wxWidgets (chỉ khi dựng giao diện `mysync-gui`, không chép vào cây mã)
+
+Chỉ dùng khi cấu hình `-DMYSYNC_BUILD_GUI=ON`; lõi `mysync`/`mysync_tests` không phụ thuộc wx. Logic ở `cmake/mysync_gui.cmake`.
+
+| Mục | Giá trị |
+|---|---|
+| Phiên bản | 3.2.9 (bản 3.2.x ổn định mới nhất xác minh được trên GitHub Releases; 3.2.6 cũng tồn tại, SHA-256 `939e5b77ddc5b6092d1d7d29491fe67010a2433cf9b9c0d841ee4d04acb9dce7`, nhưng chọn 3.2.9 vì GCC 15 của MinGW mới) |
+| Nguồn | https://github.com/wxWidgets/wxWidgets/releases/download/v3.2.9/wxWidgets-3.2.9.tar.bz2 |
+| SHA-256 (tải về và tính thật) | `fb90f9538bffd6a02edbf80037a0c14c2baf9f509feac8f76ab2a5e4321f112b` (27 366 567 byte) |
+| Giấy phép | wxWindows Library Licence 3.1 (LGPL-2 kèm ngoại lệ liên kết) — tương thích GPL-2.0-or-later; cho phép liên kết tĩnh |
+| Cách lấy | Ưu tiên `find_package(wxWidgets 3.2)` (bản hệ thống). Dự phòng: `FetchContent` tarball trên, `URL_HASH SHA256=` ghim; `-DMYSYNC_WX_FETCH=ON` ép tải, `=OFF` cấm tải |
+| Thành phần | core + base (+ adv cho `wxTaskBarIcon`), liên kết tĩnh; tắt html, richtext, aui, propgrid, ribbon, stc, xrc, webview, mediactrl, opengl, xml, webrequest, debugreport, sound; không dựng samples/tests/demos |

@@ -26,6 +26,10 @@ enum class LogLevel { Debug = 0, Info, Warn, Error };
 void log_set_level(LogLevel);
 void log_set_file(const std::string& utf8_path);  // "" = stderr only; appends
 void log_write(LogLevel, const std::string& msg); // timestamped single line
+// Optional observer of Warn / Error lines (the message text only, as passed to log_write). Used by the GUI control
+// channel to keep a ring of recent problems. Must be quick and must not log. nullptr removes it.
+using LogTap = void (*)(LogLevel, const std::string& msg);
+void log_set_tap(LogTap);
 inline void log_debug(const std::string& m) { log_write(LogLevel::Debug, m); }
 inline void log_info(const std::string& m) { log_write(LogLevel::Info, m); }
 inline void log_warn(const std::string& m) { log_write(LogLevel::Warn, m); }

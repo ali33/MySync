@@ -95,6 +95,8 @@ std::string systemd_unit_text(const std::string& name, const std::string& exe, c
     u += "RestrictSUIDSGID=true\nRestrictRealtime=true\nLockPersonality=true\n";
     u += "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\n";
     u += "SystemCallArchitectures=native\n";
+    // /run is read-only under ProtectSystem=strict: systemd creates /run/mysync for the GUI control socket
+    u += "RuntimeDirectory=mysync\nRuntimeDirectoryMode=0750\nRuntimeDirectoryPreserve=yes\n";
     if (!rw_paths.empty()) {
         u += "ReadWritePaths=";
         for (size_t i = 0; i < rw_paths.size(); ++i) u += (i ? " " : "") + rw_paths[i];
@@ -361,13 +363,16 @@ namespace {
 
 // fork + execvp with an argv array (never a shell string): no injection through names or paths.
 bool run_cmd(const std::vector<std::string>& argv, std::string* err) {
+    std::vector<std::string> abs_argv = argv;
+    if (!abs_argv.empty() && abs_argv[0] == "systemctl")
+        abs_argv[0] = access("/usr/bin/systemctl", X_OK) == 0 ? "/usr/bin/systemctl" : "/bin/systemctl";
     std::vector<char*> av;
-    for (auto& a : argv) av.push_back(const_cast<char*>(a.c_str()));
+    for (auto& a : abs_argv) av.push_back(const_cast<char*>(a.c_str()));
     av.push_back(nullptr);
     pid_t pid = fork();
     if (pid < 0) { set_err(err, std::string("fork failed: ") + std::strerror(errno)); return false; }
     if (pid == 0) {
-        execvp(av[0], av.data());
+        execv(av[0], av.data());  // absolute path only (see below): PATH is never consulted
         _exit(127);
     }
     int status = 0;

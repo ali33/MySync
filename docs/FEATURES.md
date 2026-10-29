@@ -30,7 +30,7 @@ Bản quyền (C) 2026 META.vn · Tác giả: Nguyễn Đức Sơn · GPL-2.0-or
 | Cảnh báo (AlertSender: email, Yahoo, SendAlertProvider, AlertAddressItem) | Bỏ — theo quyết định người dùng | Lỗi vận hành chỉ ghi log. Lưu ý: ClientSample/ServerSample.config cũ chứa mật khẩu SMTP/Yahoo ở dạng rõ trong repo nguồn. |
 | FTP (Simple/FTPClient.cs) | Bỏ — theo quyết định người dùng | |
 | NetworkMonitor (NetworkAdapter, NetworkMonitor) | Bỏ — theo quyết định người dùng | Mất mạng xử lý bằng retry/backoff (`retry_min_ms`, `retry_max_ms`). |
-| Giao diện WinForms (FrmMain, FrmMirrorItem, MirrorItemView) | Bỏ — theo quyết định người dùng | Chỉ CLI + file cấu hình. |
+| Giao diện WinForms (FrmMain, FrmMirrorItem, MirrorItemView) | Đổi — thay bằng wxWidgets, theo quyết định người dùng | `mysync-gui` (binary riêng, tuỳ chọn `MYSYNC_BUILD_GUI`): xem trạng thái + icon khay, sửa cấu hình không cần mở TOML, quản lý service, ghép máy/khoá; nói chuyện với daemon qua IPC cục bộ (named pipe / Unix socket), xem `docs/GUI.md`. Lõi CLI vẫn không phụ thuộc wx. |
 | Formater Bin / Bson / ProtoBuf / IFormater | Bỏ — theo quyết định người dùng | Giao thức dùng một mã hoá nhị phân gọn tự thiết kế (protocol.h). JSON chỉ nếu cần cho chẩn đoán. |
 | FingerPrint (vân tay máy bằng WMI+MD5) | Bỏ | Chỉ dùng cho nhận dạng/giấy phép máy cũ; MD5 yếu; thay bằng xác thực khoá. (Không có yêu cầu nghiệp vụ nào được ghi nhận cho nó.) |
 | PipeStream, TimeoutHelper, StackQueue, TimeTask, TaskScheduler | Đổi | Thay bằng hàng đợi/luồng chuẩn C++ và timeout của Socket. |

@@ -8,6 +8,7 @@
 // [client] / [[watch]] is a client file (the two parsers are strict and reject each other's tables). Role is detected
 // from those markers; --role server|client overrides the detection. A machine that is both server and client runs two
 // processes / two services from two files.
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
@@ -27,6 +28,10 @@
 
 #include "mysync/client_engine.h"
 #include "mysync/config.h"
+#include "mysync/gui/config_io.h"
+#include "mysync/gui/daemon.h"
+#include "mysync/gui/service_ctl.h"
+#include "mysync/gui/trust.h"
 #include "mysync/hash.h"
 #include "mysync/keys.h"
 #include "mysync/server.h"
@@ -55,6 +60,8 @@ const char* kHelp =
     "                                          run in the foreground (Ctrl+C stops). --once = one sync pass, then exit\n"
     "  mysync status -c <config> [--role ...]  show the loaded configuration (no secrets)\n"
     "  mysync service install|uninstall|start|stop [-c <config>] [--role server|client] [--name N] [--user U]\n"
+    "                  [--trust-writer <account>]...   (install: also allowed to edit the configuration; kept in the service arguments)\n"
+    "                  [--control-allow <SID|DOMAIN\\user>]...   (install: admit that account to the GUI control channel)\n"
     "                                          install/remove/start/stop the Windows service or systemd unit (admin/root)\n"
     "  mysync hash <file>                      BLAKE3 of a file\n"
     "  mysync version | help\n"
@@ -149,6 +156,8 @@ struct Opts {
     std::string out;
     bool once = false;
     bool service = false;
+    std::vector<std::string> control_allow;
+    std::vector<std::string> trust_writers;
     std::vector<std::string> pos;
 };
 
@@ -165,6 +174,8 @@ Opts parse_opts(const std::vector<std::string>& a, size_t from) {
         else if (s == "--name") o.name = val();
         else if (s == "--user") o.user = val();
         else if (s == "-o" || s == "--out") o.out = val();
+        else if (s == "--control-allow") o.control_allow.push_back(val());
+        else if (s == "--trust-writer") o.trust_writers.push_back(val());
         else if (s == "--once") o.once = true;
         else if (s == "--service") o.service = true;
         else if (s == "--foreground") {}
@@ -299,11 +310,16 @@ int cmd_run(const Opts& o) {
         if (o.once) usage("--once only applies to a client");
         setup_log(l.server.log_level, l.server.log_file);
         ServerConfig sc = l.server;
-        body = [sc](std::atomic<bool>& stop) {
-            Server srv(sc);
-            log_info("MySync server " + std::string(kVersion) + " listening on " + sc.bind + ":" + std::to_string(srv.port()) +
-                     ", root " + sc.root + ", public key " + key_to_hex(srv.public_key()));
-            srv.run(stop);
+        gui::DaemonOptions dopt;
+        dopt.service_name = o.name.empty() ? default_service_name(l.role) : o.name;
+        dopt.config_path = l.path;
+        dopt.version = kVersion;
+        dopt.enforce_config_trust = o.service || gui::ServiceController::is_elevated();
+        dopt.trusted_writers = o.trust_writers;
+        std::string dir = l.dir;
+        body = [sc, dir, dopt](std::atomic<bool>& stop) {
+            gui::ServerDaemon d(sc, dir, dopt);
+            d.run(stop);  // the Server, plus the GUI control channel and hot reload
             log_info("server stopped");
         };
     } else {
@@ -312,15 +328,22 @@ int cmd_run(const Opts& o) {
         std::string dir = l.dir;
         bool once = o.once;
         int* prc = &rc;
-        body = [cc, dir, once, prc](std::atomic<bool>& stop) {
-            SyncEngine eng(cc, dir);
+        gui::DaemonOptions dopt;
+        dopt.service_name = o.name.empty() ? default_service_name(l.role) : o.name;
+        dopt.config_path = l.path;
+        dopt.version = kVersion;
+        dopt.enforce_config_trust = o.service || gui::ServiceController::is_elevated();
+        dopt.trusted_writers = o.trust_writers;
+        body = [cc, dir, once, prc, dopt](std::atomic<bool>& stop) {
             log_info("MySync client " + std::string(kVersion) + (once ? ": one sync pass" : ": watching"));
             if (once) {
+                SyncEngine eng(cc, dir);
                 eng.sync_once(stop);
                 EngineStats s = eng.stats();
                 if (s.gave_up > 0) *prc = 1;
             } else {
-                eng.run(stop);
+                gui::ClientDaemon d(cc, dir, dopt);
+                d.run(stop);  // the engine, plus the GUI control channel and hot reload
             }
         };
     }
@@ -339,7 +362,23 @@ int cmd_run(const Opts& o) {
     return rc;
 }
 
+int cmd_service_impl(const Opts& o);
+
+// Exit codes of this command are the stable gui::ServiceExit values: the GUI (which may run this elevated and can
+// only read the exit code) maps them to messages.
 int cmd_service(const Opts& o) {
+    try {
+        return cmd_service_impl(o);
+    } catch (const UsageError& e) {
+        std::cerr << "mysync: " << e.what() << "\n";
+        return gui::kServiceBadArguments;
+    } catch (const Error& e) {
+        std::cerr << "mysync: " << e.what() << "\n";
+        return gui::kServiceConfigError;
+    }
+}
+
+int cmd_service_impl(const Opts& o) {
     if (o.pos.size() != 1) usage("usage: mysync service install|uninstall|start|stop [options]");
     const std::string& act = o.pos[0];
     if (act != "install" && act != "uninstall" && act != "start" && act != "stop") usage("unknown service action " + act);
@@ -357,6 +396,16 @@ int cmd_service(const Opts& o) {
     bool ok = false;
     if (act == "install") {
         if (o.config.empty()) usage("service install needs -c <config>");
+        for (const auto& a : o.control_allow)
+            if (!gui::valid_control_allow_entry(a)) usage("invalid --control-allow entry (use a SID like S-1-5-21-... or DOMAIN\\user)");
+        for (const auto& a : o.trust_writers)
+            if (!gui::valid_trust_writer_entry(a)) usage("invalid --trust-writer entry");
+        // The accounts the administrator names now are the only additions to "who may edit the configuration": they
+        // go into the service arguments, never into (or from) the file itself.
+        std::vector<std::string> trusted = o.trust_writers;
+        trusted.insert(trusted.end(), o.control_allow.begin(), o.control_allow.end());
+        // The service will obey this file with elevated rights: nobody else may be able to edit it or its folder.
+        gui::require_trusted_config(l.path, trusted);
         std::string exe = self_exe();
         if (exe.empty()) throw Error("cannot determine the path of the mysync executable");
         ServiceSpec sp;
@@ -366,6 +415,10 @@ int cmd_service(const Opts& o) {
         sp.exe_path = exe;
         sp.args = {"run", "-c", l.path, "--role", role == Role::Server ? "server" : "client", "--service", "--name", name};
         sp.run_as = o.user;
+        for (const auto& t : trusted) {
+            sp.args.push_back("--trust-writer");
+            sp.args.push_back(t);
+        }
         auto add = [&](const std::string& p) {
             if (!p.empty()) sp.read_write_paths.push_back(p);
         };
@@ -381,6 +434,22 @@ int cmd_service(const Opts& o) {
                     if (t.is_local()) add(resolve(l.dir, t.path));
         }
         ok = service_install(sp, &err);
+        if (ok && !o.control_allow.empty()) {
+            // Written only now that the service exists; if that fails the installation is undone.
+            try {
+                gui::ConfigEditor ed = gui::ConfigEditor::open(l.path, l.role == Role::Server ? gui::ConfigRole::Server : gui::ConfigRole::Client);
+                auto& allow = l.role == Role::Server ? ed.server().control_allow : ed.client().control_allow;
+                for (const auto& a : o.control_allow)
+                    if (std::find(allow.begin(), allow.end(), a) == allow.end()) allow.push_back(a);
+                ed.save();
+            } catch (const std::exception& e) {
+                std::string ignore;
+                service_uninstall(name, &ignore);
+                err = std::string("the configuration could not be updated with --control-allow (") + e.what() +
+                      "); the service installation was rolled back";
+                ok = false;
+            }
+        }
     } else if (act == "uninstall") {
         ok = service_uninstall(name, &err);
     } else if (act == "start") {
@@ -390,7 +459,7 @@ int cmd_service(const Opts& o) {
     }
     if (!ok) {
         std::cerr << "mysync: service " << act << " failed: " << err << "\n";
-        return 1;
+        return gui::service_exit_code_for_error(err);
     }
     std::cout << "service " << name << ": " << act << " ok\n";
     return 0;

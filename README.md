@@ -66,8 +66,16 @@ Hoặc chép tay `examples/mysync.service` vào `/etc/systemd/system/` rồi `sy
 - Trạng thái: `systemctl status mysync-server`. Log: `journalctl -u mysync-server -f` (stderr được journald thu).
 - Gỡ: `systemctl disable --now mysync-server && mysync service uninstall -c /etc/mysync/server.toml`.
 
+## Giao diện đồ hoạ (tuỳ chọn)
+`mysync-gui` (wxWidgets 3.2, Windows + Linux GTK3) là binary riêng, mặc định **không** dựng để lõi vẫn build một lệnh:
+```
+cmake -S . -B build-gui -DMYSYNC_BUILD_GUI=ON && cmake --build build-gui --target mysync-gui
+```
+Bốn tab: **Trạng thái** (kèm icon khay đổi màu), **Cấu hình** (sửa không cần mở TOML), **Dịch vụ** (cài/gỡ/start/stop, tự nâng quyền UAC/pkexec), **Ghép máy và Khoá**. GUI nói chuyện với daemon qua kênh cục bộ (named pipe/Unix socket, có phân quyền), không mở cổng TCP và không đưa khoá bí mật qua kênh. Chi tiết, hạn chế: `docs/GUI.md`, `docs/GUI-CORE.md`.
+
 ## Tài liệu
 - `docs/FEATURES.md` — bảng đối chiếu tính năng cũ → mới (giữ / đổi / bỏ, kèm lý do)
 - `docs/DESIGN.md` — kiến trúc, giao thức
 - `docs/SETUP.md`, `docs/SERVICE.md` — triển khai
+- `docs/GUI.md`, `docs/GUI-CORE.md` — giao diện đồ hoạ và kênh điều khiển cục bộ
 - `docs/STATUS.md` — đã kiểm gì, chưa kiểm gì, hạn chế đã biết

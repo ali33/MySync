@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "mysync/config.h"
+#include "mysync/gui/status.h"
 #include "mysync/keys.h"
 
 namespace mysync {
@@ -64,6 +65,7 @@ class AuthThrottle {
 public:
     static constexpr size_t kMaxEntries = 10000;
     explicit AuthThrottle(uint32_t max_failures_per_min) : max_(max_failures_per_min) {}
+    void set_max(uint32_t v) { max_ = v; }  // takes effect for the next call (config reload)
     bool blocked(const std::string& ip, int64_t now_ms);
     void record_failure(const std::string& ip, int64_t now_ms);
     size_t tracked();  // number of sources currently held
@@ -73,7 +75,7 @@ private:
         std::deque<int64_t> q;
         std::list<std::string>::iterator pos;  // place in order_
     };
-    uint32_t max_;
+    std::atomic<uint32_t> max_;
     std::mutex m_;
     std::map<std::string, Entry> fails_;
     std::list<std::string> order_;  // oldest last-failure first
@@ -116,6 +118,16 @@ public:
     void run(std::atomic<bool>& stop);
     uint16_t port() const;
     const PubKey& public_key() const;
+
+    // Lightweight, thread-safe status for the GUI (role Server): listen address, sessions, per-client name /
+    // sessions / bytes / rates. Carries no key material.
+    gui::StatusSnapshot snapshot() const;
+    // Hot reload: swaps the allowlist, ip allow/deny, limits, quotas, trash / mode / size settings and the
+    // auth-failure throttle for sessions that start afterwards. A live session keeps its policy, except that it is
+    // closed at its next request when its client was removed from the allowlist or its access / prefix changed.
+    // Throws Error (and changes nothing) when bind / port / root / key_file / state_dir differ from the running
+    // values: those need a restart. Paths in `n` must be resolved the same way as for the constructor.
+    void apply_config(const ServerConfig& n);
 
 private:
 

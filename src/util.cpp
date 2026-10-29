@@ -30,6 +30,7 @@ namespace {
 std::mutex g_log_mu;
 std::atomic<int> g_level{static_cast<int>(LogLevel::Info)};
 std::ofstream g_log_file;
+std::atomic<LogTap> g_log_tap{nullptr};
 
 const char* level_name(LogLevel l) {
     switch (l) {
@@ -55,8 +56,13 @@ void log_set_file(const std::string& utf8_path) {
     }
 }
 
+void log_set_tap(LogTap t) { g_log_tap.store(t); }
+
 void log_write(LogLevel l, const std::string& msg) {
     if (static_cast<int>(l) < g_level.load()) return;
+    if (l >= LogLevel::Warn) {
+        if (LogTap tap = g_log_tap.load()) tap(l, msg);
+    }
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     int ms = static_cast<int>(

@@ -5,6 +5,7 @@
 #include "mysync/config.h"
 
 #include <algorithm>
+#include <cctype>
 #include <climits>
 #include <cstring>
 #include <filesystem>
@@ -630,6 +631,40 @@ void apply_target(const Section& sec, TargetConfig& t) {
     }
 }
 
+// [control] table, shared by the server and the client file.
+template <class C>
+void apply_control(const Section& sec, C& c) {
+    KV kv(sec);
+    get_bool(kv, "enabled", c.control_enabled);
+    get_str(kv, "group", c.control_group);
+    get_str(kv, "name", c.control_name);
+    {
+        const Entry* e = nullptr;
+        for (const auto& x : sec.entries)
+            if (x.key == "allow") e = &x;
+        get_strs(kv, "allow", c.control_allow);
+        if (e)
+            for (const auto& a : c.control_allow) {
+                bool bad = a.empty() || a.size() > 256;
+                for (unsigned char ch : a)
+                    if (ch < 0x20 || ch == 0x7f || ch == '"' || ch == '\'') bad = true;
+                if (bad) fail(e->line, "invalid control allow entry (use a SID like S-1-5-21-... or DOMAIN\\user)");
+            }
+    }
+    {
+        const Entry* e = nullptr;
+        for (const auto& x : sec.entries)
+            if (x.key == "name") e = &x;
+        if (e && !c.control_name.empty()) {
+            bool ok = c.control_name.size() <= 64 && c.control_name[0] != '-' && c.control_name[0] != '.';
+            for (unsigned char ch : c.control_name)
+                if (!(std::isalnum(ch) || ch == '_' || ch == '.' || ch == '-')) ok = false;
+            if (!ok) fail(e->line, "control name must be 1..64 characters of A-Z a-z 0-9 _ . -");
+        }
+    }
+    kv.finish();
+}
+
 std::string path_text(const std::vector<std::string>& p) {
     std::string s;
     for (size_t i = 0; i < p.size(); ++i) s += (i ? "." : "") + p[i];
@@ -652,6 +687,8 @@ ServerConfig parse_server_config_text(const std::string& text) {
     for (const auto& s : secs) {
         if (s.path.empty() || (s.path.size() == 1 && s.path[0] == "server" && !s.is_array)) {
             apply_server(s, c);
+        } else if (s.path.size() == 1 && s.path[0] == "control" && !s.is_array) {
+            apply_control(s, c);
         } else if (s.path.size() == 1 && s.path[0] == "client" && s.is_array) {
             c.clients.emplace_back();
             apply_client_acl(s, c.clients.back());
@@ -681,6 +718,8 @@ ClientConfig parse_client_config_text(const std::string& text) {
     for (const auto& s : secs) {
         if (s.path.empty() || (s.path.size() == 1 && s.path[0] == "client" && !s.is_array)) {
             apply_client(s, c);
+        } else if (s.path.size() == 1 && s.path[0] == "control" && !s.is_array) {
+            apply_control(s, c);
         } else if (s.path.size() == 1 && s.path[0] == "watch" && s.is_array) {
             c.watches.emplace_back();
             filter_seen = false;

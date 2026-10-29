@@ -33,7 +33,15 @@ PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+# /run is read-only under ProtectSystem=strict: systemd makes /run/mysync for the GUI control socket
+RuntimeDirectory=mysync
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
 ReadWritePaths=/srv/mysync /var/lib/mysync /var/log/mysync
 # Cổng < 1024 cần dòng sau (hoặc dùng cổng cao như 5656):
 # AmbientCapabilities=CAP_NET_BIND_SERVICE

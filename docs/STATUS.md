@@ -33,3 +33,21 @@ Bản quyền (C) 2026 META.vn · Tác giả: Nguyễn Đức Sơn · GPL-2.0-or
 - Thư viện bên thứ ba ghim bằng `third_party/CHECKSUMS.sha256` + `third_party/README.md` (tag/commit/giấy phép); kiểm bằng `scripts/verify-third-party.sh|.ps1` hoặc `ctest -R third_party_checksums`.
 - Không còn: cảnh báo email/Yahoo, FTP, NetworkMonitor, GUI WinForms, Bin/Bson/ProtoBuf — theo quyết định người dùng (xem `FEATURES.md`).
 - Rà soát độc lập đợt M1/M3/L6: không còn High/Critical. Còn (chấp nhận): HELLO chậm giữ thẻ chưa-xác-thực tối đa 5 s (hệ quả của M1, M2 giữ nguyên), client chưa truyền cờ stop vào RateLimiter (dừng client có thể trễ ≤ ~0,5 s), `read_hello` còn tạo thư mục/nạp cây trước khi HELLO hợp lệ, `examples/mysync.service` thiếu vài dòng hardening mà `service install` sinh ra.
+
+## Giao diện đồ hoạ `mysync-gui` (wxWidgets 3.2)
+Đã kiểm (đo thật):
+- Windows (MinGW g++ 15, Release): `mysync_tests` **271 passed, 0 failed** (có test IPC, giao thức điều khiển, ConfigEditor, ServiceController, KeyManager, kiểm tin cậy tệp cấu hình, tích hợp mô hình ↔ daemon không cần màn hình, viewmodel GUI). `mysync-gui.exe` dựng được với `-DMYSYNC_BUILD_GUI=ON` (wxWidgets 3.2.9 tải bằng FetchContent, ghim SHA-256).
+- Linux (Docker `gcc:14` + GTK 3.24 + `libwxgtk3.2-dev` của Debian, chạy bằng root): dựng `mysync-gui` thành công và `ctest` "100% tests passed, 0 tests failed out of 2" (khoảng 63 s).
+- Windows: GUI chạy tay và chụp ảnh trên Windows 11 (do agent giao diện báo, tôi không tự kiểm lại bằng mắt).
+Chưa kiểm:
+- **Chạy giao diện thật trên Linux** (chỉ dựng được), khay hệ thống phụ thuộc môi trường desktop.
+- **Nâng quyền thật** (UAC, pkexec) và cài dịch vụ thật chưa chạy; pipe/socket kiểm bằng test trong tiến trình, chưa thử đa tài khoản thật.
+- Lớp wx không có test tự động (chỉ lớp `*_model`).
+Rà soát bảo mật độc lập 3 vòng (agent chỉ đọc). Vòng 1 thấy 1 High (dịch vụ nâng quyền tin cấu hình người dùng thường ghi được) + Medium; vòng 2 thấy High còn lại ở Windows (danh sách đen); vòng 3: **không còn Critical/High**. Medium còn tồn đọng (chưa sửa):
+- M-A: chủ sở hữu tệp/thư mục là thành viên của nhóm tin cậy vẫn bị từ chối (chỉ chấp nhận tài khoản cá nhân liệt kê trong `--trust-writer`); đóng an toàn nhưng gãy luồng "GUI người dùng thường lưu rồi reload" nếu liệt kê theo nhóm.
+- M-B: `mysync run --once` bỏ qua kiểm tin cậy cấu hình (tác vụ lên lịch chạy bằng SYSTEM/root với cấu hình người dùng ghi được).
+- M-C: cấu hình chưa tin cậy đã được phân tích và có tác dụng phụ (tạo thư mục, mở log) trước khi bị từ chối.
+- M-D: `--trust-writer` / `--control-allow` chưa chặn nhóm rộng (Everyone, Users) lúc `service install`.
+- M-E: `mysync service install` bằng CLI chưa kiểm tính tin cậy của chính tệp `mysync` (chỉ khi cài qua GUI).
+- Low: kiểm chỉ tới thư mục cha (không tổ tiên), thư mục sticky được dung thứ ở `state_dir`, tin cậy theo tên phân giải lại mỗi lần, mặc định `C:\ProgramData\<tên>` bị từ chối do ACL kế thừa (cần khoá ACL).
+Bất biến thực sự được cưỡng chế: tệp cấu hình của dịch vụ chỉ được ghi bởi {tài khoản dịch vụ, SYSTEM/root, Administrators} và các principal admin liệt kê lúc `service install --trust-writer`/`--control-allow`; danh sách control allow tương đương quyền ghi cấu hình, tức đặc quyền của dịch vụ.
