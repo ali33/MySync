@@ -21,6 +21,7 @@
 
 #include "fsutil.h"
 #include "mysync/engine_lock.h"
+#include "mysync/linkcheck.h"
 #include "mysync/filter.h"
 #include "mysync/gui/status.h"
 #include "mysync/hash.h"
@@ -145,6 +146,18 @@ public:
         block_msg_ = msg;
         return msg.empty();
     }
+    // Remembers the last root problem (so it is logged once, and shown in the status). Returns true when it was already known.
+    bool note_root_problem(const std::string& msg) {
+        std::lock_guard<std::mutex> lk(block_mu_);
+        bool same = msg == root_problem_;
+        root_problem_ = msg;
+        if (msg.empty()) {
+            if (block_msg_.compare(0, 7, "source ") == 0) block_msg_.clear();
+            return same;
+        }
+        block_msg_ = "source " + msg;
+        return same;
+    }
     bool has_lock() const { return lock_ != nullptr || lock_skipped_; }
     bool blocked() const {
         std::lock_guard<std::mutex> lk(block_mu_);
@@ -170,6 +183,9 @@ public:
     std::shared_ptr<const Snapshot> snapshot(Clock::time_point requested) {
         std::lock_guard<std::mutex> sl(snap_mu_);
         if (snap_ && snap_->taken >= requested) return snap_;
+        // Every full scan: a link anywhere on the way to the root is refused (shown as the error of the target).
+        std::string lr = link_refusal_text(root_);
+        if (!lr.empty()) throw Error("source " + lr);
         auto s = std::make_shared<Snapshot>();
         s->taken = Clock::now();
         {
@@ -269,6 +285,7 @@ private:
     bool lock_skipped_ = false;
     mutable std::mutex block_mu_;
     std::string block_msg_;
+    std::string root_problem_;
 };
 
 // -------------------------------------------------------------------------------------- one (watch, target) pair
@@ -1230,6 +1247,14 @@ bool SyncEngine::idle() const {
 void SyncEngine::start_watchers(bool first) {
     for (auto& w : p_->watches) {
         if (w->watching()) continue;
+        {   // no link on the way to the root, ever; checked at every retry
+            std::string lr = link_refusal_text(w->root());
+            if (!lr.empty()) {
+                if (!w->note_root_problem(lr)) log_error("[" + w->name() + "] source " + lr);
+                continue;
+            }
+            w->note_root_problem({});
+        }
         // One engine per folder. A folder that does not exist yet is not locked (and never created): the watcher
         // reports it as before and the lock is taken on a later retry.
         std::error_code ec;

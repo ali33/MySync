@@ -22,6 +22,7 @@
 #include "mysync/config.h"
 #include "mysync/gui/service_ctl.h"
 #include "mysync/keys.h"
+#include "mysync/simple/service_account.h"
 #include "mysync/simple/user_engine.h"
 #include "mysync/simple/user_paths.h"
 
@@ -98,6 +99,7 @@ struct MigrationSummary {
     std::vector<std::string> destinations;  // folders / machines written to
     std::string key_identity;               // short fingerprint of the key the service would use
     std::string service_account;            // "LocalSystem" / "root"
+    bool account_is_admin = false;          // Windows: the account is an administrator, so the service gets FULL admin rights
     std::vector<std::string> warnings;      // plain-language cautions to show
     std::vector<std::string> problems;      // non-empty = the migration will be refused; first one is shown to the user
     // Local folders outside the user's home that are otherwise acceptable: the GUI lists them, and only when the user
@@ -115,7 +117,7 @@ struct MigrationPlan {
     uint32_t who = 0;      // POSIX: the uid of the user who asked (from resolve_invoking_uid); 0 on Windows
 };
 MigrationPlan plan_migration(const std::string& user_config, const std::string& expect_hash, const std::string& expect_key_hash,
-                             const std::vector<std::string>& allow_roots);
+                             const std::vector<std::string>& allow_roots, bool with_key = true);
 
 MigrationSummary summarize_user_config(const UserPaths& paths, const std::vector<std::string>& allow_roots = {});  // throws Error when the configuration cannot be read
 
@@ -139,6 +141,10 @@ struct PathVerdict {
     bool confirmable = false;  // refused only for being outside the home: an allow root could fix that
     std::string reason;
 };
+// The rule the SERVICE itself applies every time it loads its configuration (start and reload): every watch folder and every
+// local destination must pass service_path_verdict with `allow_roots` (the folders the user confirmed when the service was
+// set up, kept in the service's command line). Relative paths are taken against `config_dir`. "" or the first reason.
+std::string service_config_path_problem(const ClientConfig& cfg, const std::string& config_dir, const std::vector<std::string>& allow_roots);
 std::string canonical_for_policy(const std::string& path);
 PathVerdict service_path_verdict(const std::string& path, const PathPolicy& policy);
 // "" or why `root` cannot be an allow root (drive root, system folder, another profile ...).
@@ -148,15 +154,63 @@ std::string forbidden_service_path_reason(const std::string& path, const PathPol
 
 
 // The real implementation (Supervisor + ServiceController). service_name defaults to "mysync-client".
+// service_name "" = user_service_name(account); account "" = the user running this process. `password` (Windows) is
+// borrowed, must outlive the steps, and is only ever sent through the private channel.
 std::unique_ptr<UpgradeSteps> make_real_upgrade_steps(Supervisor& sup, gui::ServiceController& ctl, const UserPaths& paths,
-                                                      const std::string& service_name = "mysync-client",
-                                                      const std::vector<std::string>& allow_roots = {});
+                                                      const std::string& service_name = "",
+                                                      const std::vector<std::string>& allow_roots = {},
+                                                      const std::string& account = "",
+                                                      const SecretString* password = nullptr);
 
 // The service-side locations used by migration (Windows %ProgramData%\MySync\, Linux /etc/mysync + /var/lib/mysync).
 struct ServiceLocations {
     std::string dir, config, key, state, log;
 };
 ServiceLocations service_locations(const std::string& service_name);
+
+// ---- The Simple-mode service runs AS THE USER (since step 7b)
+//   Linux  : unit `mysync-<user>.service`, User=/Group= of the owner of the data, hardened (NoNewPrivileges, ProtectSystem=strict,
+//            ProtectHome=read-only + ReadWritePaths only for state, log, watch folders and destinations, PrivateTmp, ...),
+//            RuntimeDirectory=mysync-<user> mode 0700 for the control socket. Only the INSTALL (pkexec) runs as root.
+//   Windows: the service logs on with the user's account (ServiceCredential), the password goes through the private
+//            channel (simple/service_account.h), never through a command line, environment, log or file.
+//   Data    : the service's configuration, key, state and log live in a folder OWNED by that user (Windows
+//            %ProgramData%\MySync\<service>\ with an ACL of user + SYSTEM + Administrators; Linux /var/lib/mysync/<service>/
+//            owned by the user, 0700). Why: the daemon is not more powerful than the user, so nothing it reads or writes can
+//            escalate, and the user can still read/edit it with the application; the elevated install step only creates the
+//            folder, copies what the user already owns, and registers the service.
+//   Control : Windows pipe DACL = the daemon's account (the user) + SYSTEM + Administrators; Linux socket in the unit's
+//            RuntimeDirectory, 0600, user (+ root).
+// The name of such a service is `user_service_name(account)`. A service an administrator installs with
+// `mysync service install` (server to server) is a different flavour and is not touched.
+ServiceLocations user_service_locations(const std::string& service_name);
+
+// ---- How the service's folder is protected (since 7c)
+// Windows: a user who is an administrator would give the service a full administrator token, and a configuration that a
+// user-level process can edit would then be a way to SYSTEM. So the folder that holds the service's configuration and key
+// (ServiceTop) is writable only by Administrators and SYSTEM; the service's account gets READ. Only state/ and log/
+// (UserFull) are writable by that account. A configuration change goes through the elevated `mysync service apply-config`
+// (allowlist + hash). Linux: the service is not more powerful than its user, the folder simply belongs to the user.
+enum class ServiceDirKind { Admin, ServiceTop, UserFull };
+// Kind of the service's state/ and log/ folders for this account: UserFull ONLY when the account is positively known to be an
+// ordinary one (the requester itself, not an administrator). An administrator account - or one we cannot judge - gets ServiceTop:
+// the service then has a full administrator token, so a junction planted in a user-writable state/ would be a way to write anywhere.
+// Tests only: -1 = ask the system (default), 0 / 1 = pretend the requester is / is not an administrator in summarize_user_config.
+void set_admin_probe_override_for_tests(int v);
+ServiceDirKind data_dir_kind_for_account(const std::string& user_sid);
+std::string service_dir_sddl(ServiceDirKind kind, const std::string& user_sid);   // pure; Windows SDDL text
+#ifdef _WIN32
+// Creates `dir` (parents as Admin) with that protected DACL, or checks an existing one. Throws Error.
+void create_service_dir(const std::string& dir, ServiceDirKind kind, const std::string& user_sid);
+#else
+// Linux, root: writes the service's folder as described in DESIGN.md "7c": folder made root-owned 0700 through a descriptor,
+// every file created inside it with openat(O_EXCL|O_NOFOLLOW) and given to the user with fchown on the open descriptor, the
+// folder handed over LAST. No chown/chmod by path; nothing the user planted is followed. key_hex may be null (keep the key).
+void install_service_files(const ServiceLocations& loc, uint32_t uid, uint32_t gid, const std::string& config_text,
+                           const std::string* key_hex);
+#endif
+
+
 
 // `mysync service migrate-from-user --user-config <path> [--name n]` (or `--remove --name n` to delete the private copy): runs ELEVATED. Verifies that the source is
 // a regular file owned by the calling (original) user and parses, then writes the copy (config, key) into the trusted

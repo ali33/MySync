@@ -63,10 +63,18 @@ std::atomic<bool>* g_stop_flag = nullptr;
 
 std::string systemd_unit_text(const std::string& name, const std::string& exe, const std::vector<std::string>& args,
                               const std::string& user, const std::vector<std::string>& rw_paths,
-                              const std::string& description) {
+                              const std::string& description, const SystemdOptions& opts) {
     if (!valid_service_name(name)) throw Error("invalid service name (allowed: A-Z a-z 0-9 _ . -)");
     if (exe.empty() || exe[0] != '/' || has_ctl(exe)) throw Error("service executable must be an absolute path");
     if (!user.empty() && !valid_service_name(user)) throw Error("invalid service user name");
+    if (!opts.group.empty() && !valid_service_name(opts.group)) throw Error("invalid service group name");
+    if (!valid_service_name(opts.runtime_dir)) throw Error("invalid runtime directory name");
+    {
+        const std::string& m = opts.runtime_dir_mode;
+        bool ok = m.size() == 4 && m[0] == '0';
+        for (char c : m) ok = ok && c >= '0' && c <= '7';
+        if (!ok) throw Error("invalid runtime directory mode");
+    }
     for (auto& a : args)
         if (has_ctl(a)) throw Error("control characters are not allowed in service arguments");
     if (has_ctl(description)) throw Error("control characters are not allowed in the service description");
@@ -82,6 +90,7 @@ std::string systemd_unit_text(const std::string& name, const std::string& exe, c
     u += "After=network-online.target\nWants=network-online.target\n\n";
     u += "[Service]\nType=simple\n";
     if (!user.empty()) u += "User=" + user + "\n";
+    if (!opts.group.empty()) u += "Group=" + opts.group + "\n";
     u += "ExecStart=" + systemd_quote(exe);
     for (auto& a : args) u += " " + systemd_quote(a);
     u += "\n";
@@ -96,7 +105,10 @@ std::string systemd_unit_text(const std::string& name, const std::string& exe, c
     u += "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX\n";
     u += "SystemCallArchitectures=native\n";
     // /run is read-only under ProtectSystem=strict: systemd creates /run/mysync for the GUI control socket
-    u += "RuntimeDirectory=mysync\nRuntimeDirectoryMode=0750\nRuntimeDirectoryPreserve=yes\n";
+    if (opts.strict_user)
+        u += "CapabilityBoundingSet=\nAmbientCapabilities=\nRestrictNamespaces=yes\nProtectKernelLogs=yes\nProtectClock=yes\nProtectProc=invisible\n"
+             "ProtectHostname=yes\nUMask=0077\n";
+    u += "RuntimeDirectory=" + opts.runtime_dir + "\nRuntimeDirectoryMode=" + opts.runtime_dir_mode + "\nRuntimeDirectoryPreserve=yes\n";
     if (!rw_paths.empty()) {
         u += "ReadWritePaths=";
         for (size_t i = 0; i < rw_paths.size(); ++i) u += (i ? " " : "") + rw_paths[i];
@@ -270,10 +282,13 @@ bool service_install(const ServiceSpec& spec, std::string* err) {
     if (!scm) { set_err(err, win_error("OpenSCManager (administrator rights required)")); return false; }
     std::wstring wname = widen(spec.name);
     std::wstring wdisplay = widen(spec.display.empty() ? spec.name : spec.display);
+    std::wstring wpass = widen(spec.run_as_password);
     ScHandle svc(CreateServiceW(scm.h, wname.c_str(), wdisplay.c_str(), SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
                                 start, SERVICE_ERROR_NORMAL, cmd.c_str(), nullptr, nullptr, nullptr, account.c_str(),
-                                nullptr));
-    if (!svc) { set_err(err, win_error("CreateService")); return false; }
+                                wpass.empty() ? nullptr : wpass.c_str()));
+    DWORD create_err = GetLastError();
+    if (!wpass.empty()) SecureZeroMemory(&wpass[0], wpass.size() * sizeof(wchar_t));
+    if (!svc) { SetLastError(create_err); set_err(err, win_error("CreateService")); return false; }
 
     if (!spec.description.empty()) {
         std::wstring d = widen(spec.description);
@@ -297,6 +312,67 @@ bool service_install(const ServiceSpec& spec, std::string* err) {
         SERVICE_FAILURE_ACTIONS_FLAG flag{TRUE};  // also restart after a non-zero exit, not only a crash
         ChangeServiceConfig2W(svc.h, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &flag);
     }
+    return true;
+}
+
+std::string service_description(const std::string& name) {
+    if (!valid_service_name(name)) return {};
+    ScHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (!scm) return {};
+    ScHandle svc(OpenServiceW(scm.h, widen(name).c_str(), SERVICE_QUERY_CONFIG));
+    if (!svc) return {};
+    DWORD need = 0;
+    QueryServiceConfig2W(svc.h, SERVICE_CONFIG_DESCRIPTION, nullptr, 0, &need);
+    if (!need) return {};
+    std::vector<unsigned char> buf(need);
+    if (!QueryServiceConfig2W(svc.h, SERVICE_CONFIG_DESCRIPTION, buf.data(), need, &need)) return {};
+    auto* d = reinterpret_cast<SERVICE_DESCRIPTIONW*>(buf.data());
+    if (!d->lpDescription) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, d->lpDescription, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return {};
+    std::string out(static_cast<size_t>(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, d->lpDescription, -1, &out[0], n, nullptr, nullptr);
+    return out;
+}
+
+bool service_runs_program(const std::string& name, const std::string& exe_path, std::string* err) {
+    if (!valid_service_name(name)) { set_err(err, "invalid service name"); return false; }
+    ScHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (!scm) { set_err(err, win_error("OpenSCManager")); return false; }
+    ScHandle svc(OpenServiceW(scm.h, widen(name).c_str(), SERVICE_QUERY_CONFIG));
+    if (!svc) { set_err(err, win_error("OpenService")); return false; }
+    DWORD need = 0;
+    QueryServiceConfigW(svc.h, nullptr, 0, &need);
+    if (!need) { set_err(err, win_error("QueryServiceConfig")); return false; }
+    std::vector<unsigned char> buf(need);
+    auto* cfg = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.data());
+    if (!QueryServiceConfigW(svc.h, cfg, need, &need)) { set_err(err, win_error("QueryServiceConfig")); return false; }
+    std::wstring bin = cfg->lpBinaryPathName ? cfg->lpBinaryPathName : L"";
+    std::wstring want = L"\"" + widen(exe_path) + L"\"";
+    auto lower = [](std::wstring w) { for (auto& c : w) c = static_cast<wchar_t>(towlower(c)); return w; };
+    // Exactly the command line our own install builds: "<this exe>" run -c ... --service ... (quoted program, nothing before it)
+    bool ok = lower(bin).compare(0, want.size() + 5, lower(want + L" run ")) == 0;
+    ok = ok && bin.find(L" --service") != std::wstring::npos;
+    if (!ok) set_err(err, "the service '" + name + "' is not a MySync service of this installation");
+    return ok;
+}
+
+bool service_set_password(const std::string& name, const std::string& account, std::string& password, std::string* err) {
+    struct Wipe {
+        std::string& p;
+        ~Wipe() { if (!p.empty()) { SecureZeroMemory(&p[0], p.size()); p.clear(); } }
+    } wipe{password};
+    if (!valid_service_name(name)) { set_err(err, "invalid service name"); return false; }
+    ScHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT));
+    if (!scm) { set_err(err, win_error("OpenSCManager (administrator rights required)")); return false; }
+    ScHandle svc(OpenServiceW(scm.h, widen(name).c_str(), SERVICE_CHANGE_CONFIG));
+    if (!svc) { set_err(err, win_error("OpenService")); return false; }
+    std::wstring wa = widen(account), wp = widen(password);
+    BOOL ok = ChangeServiceConfigW(svc.h, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, nullptr, nullptr, nullptr, nullptr,
+                                   wa.c_str(), wp.c_str(), nullptr);
+    DWORD e = GetLastError();
+    if (!wp.empty()) SecureZeroMemory(&wp[0], wp.size() * sizeof(wchar_t));
+    if (!ok) { SetLastError(e); set_err(err, win_error("ChangeServiceConfig")); return false; }
     return true;
 }
 
@@ -399,8 +475,12 @@ void on_signal(int) {
 bool service_install(const ServiceSpec& spec, std::string* err) {
     std::string text;
     try {
-        text = systemd_unit_text(spec.name, spec.exe_path, spec.args, spec.run_as, spec.read_write_paths,
-                                 spec.display);
+        SystemdOptions so;
+        so.group = spec.run_group;
+        so.runtime_dir = spec.runtime_dir;
+        so.runtime_dir_mode = spec.runtime_dir_mode;
+        so.strict_user = spec.strict_user;
+        text = systemd_unit_text(spec.name, spec.exe_path, spec.args, spec.run_as, spec.read_write_paths, spec.display, so);
     } catch (const std::exception& e) {
         set_err(err, e.what());
         return false;
@@ -449,6 +529,16 @@ bool service_uninstall(const std::string& name, std::string* err) {
 bool service_start(const std::string& name, std::string* err) {
     if (!valid_service_name(name)) { set_err(err, "invalid service name"); return false; }
     return run_cmd({"systemctl", "start", name + ".service"}, err);
+}
+
+std::string service_description(const std::string&) { return {}; }
+bool service_runs_program(const std::string&, const std::string&, std::string*) { return true; }
+
+bool service_set_password(const std::string&, const std::string&, std::string& password, std::string* err) {
+    password.assign(password.size(), 'x');
+    password.clear();
+    set_err(err, "not supported on this platform");
+    return false;
 }
 
 bool service_stop(const std::string& name, std::string* err) {

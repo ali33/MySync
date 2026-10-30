@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
     int limit = 300;
     if (const char* e = std::getenv("MYSYNC_TEST_TIMEOUT_S")) limit = std::max(10, std::atoi(e));
     start_watchdog(limit);
-    int pass = 0, fail = 0;
+    int pass = 0, fail = 0, skipped = 0;
     for (auto& c : mytest::registry()) {
         if (!filter.empty() && std::string(c.name).find(filter) == std::string::npos) continue;
         {
@@ -65,6 +65,9 @@ int main(int argc, char** argv) {
             c.fn();
             ++pass;
             std::cout << "[ OK ] " << c.name << std::endl;
+        } catch (const mytest::Skip& sk) {
+            ++skipped;
+            std::cout << "[SKIP] " << c.name << " : " << sk.reason << std::endl;
         } catch (const mytest::Failure& f) {
             ++fail;
             std::cout << "[FAIL] " << c.name << " : " << f.msg << std::endl;
@@ -75,6 +78,8 @@ int main(int argc, char** argv) {
         std::lock_guard<std::mutex> lk(watch().m);
         watch().running = false;
     }
-    std::cout << pass << " passed, " << fail << " failed\n";
+    std::cout << pass << " passed, " << fail << " failed";
+    if (skipped) std::cout << ", " << skipped << " skipped";
+    std::cout << "\n";
     return fail == 0 ? 0 : 1;
 }

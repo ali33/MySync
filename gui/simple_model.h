@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "mysync/simple/pairing.h"
+#include "mysync/simple/service_account.h"
 #include "mysync/simple/service_upgrade.h"
 #include "mysync/simple/user_engine.h"
 #include "mysync/simple/wizard_model.h"
@@ -138,7 +139,40 @@ std::string friendly_error(const std::string& what);
 
 // Hộp xác nhận TRƯỚC khi xin quyền quản trị để chuyển sang dịch vụ: thư mục nguồn, nơi lưu, danh tính khoá (vân tay
 // ngắn), tài khoản chạy, các cảnh báo của lõi và lời nhắc quyền cao. Chuỗi động giữ nguyên văn.
-std::string service_confirm_text(const simple::MigrationSummary& s);
+std::string service_confirm_text(const simple::MigrationSummary& s, const std::string& account);
+
+// ---- nhập mật khẩu để dịch vụ chạy bằng chính tài khoản người dùng (Windows). Mô hình KHÔNG BAO GIỜ giữ mật khẩu:
+// mật khẩu chỉ nằm trong hộp thoại và một SecretString đi thẳng tới bước cài đặt.
+enum class PwdState { Idle, Asking, Working, NoPassword, Failed, Cancelled, Done };
+enum class PwdErrorKind { None, WrongPassword, NoPassword, Other };
+// Phân loại lỗi nguyên văn của bước cài đặt (dựa trên chính câu của explain_logon_error).
+PwdErrorKind classify_password_error(const std::string& err);
+std::string password_prompt_text(const std::string& account, bool update);
+
+class PasswordFlow {
+public:
+    PwdState state() const { return state_; }
+    const std::string& account() const { return account_; }
+    const std::string& error() const { return error_; }   // nguyên văn / lời thường để hiện trong hộp nhập hoặc băng
+    int attempts() const { return attempts_; }            // số lần nhập sai
+    bool is_update() const { return update_; }
+    void begin(const std::string& default_account, bool update);   // -> Asking
+    // Người dùng bấm OK. Sai tên tài khoản / mật khẩu trống: ở lại Asking kèm lời nhắc, trả false.
+    // `now_ms` (steady clock; -1 = the real one) is only there for tests. Sau 5 lần sai liên tiếp: khoá 30 giây, và việc mở lại
+    // hộp KHÔNG xoá lần đếm (bộ giới hạn sống cùng đối tượng, không bị begin() đặt lại).
+    bool submit(const std::string& account, bool has_password, int64_t now_ms = -1);
+    void cancel();                                                 // đóng hộp / huỷ hộp xin quyền
+    // Kết quả bước cài đặt. Sai mật khẩu -> Asking lần nữa (nhập lại); tài khoản không mật khẩu -> NoPassword.
+    void finish(bool ok, bool cancelled, const std::string& error);
+
+private:
+    PwdState state_ = PwdState::Idle;
+    std::string account_, error_;
+    int attempts_ = 0;
+    bool update_ = false;
+    simple::PasswordAttemptLimiter limiter_;
+    int64_t last_submit_ms_ = 0;
+};
 
 // Phía NHẬN: nhắc tường lửa lời thường (rỗng nếu không cần).
 std::string firewall_hint(uint16_t port);

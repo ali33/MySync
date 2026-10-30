@@ -3,6 +3,7 @@
 // Author: Nguyễn Đức Sơn
 
 #include "mysync/engine_lock.h"
+#include "mysync/linkcheck.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -104,7 +105,7 @@ std::unique_ptr<FileLock> FileLock::try_acquire(const std::string& utf8_path, st
     auto attrs = [](const fs::path& q) { return GetFileAttributesW(q.c_str()); };
     auto is_link_or_not_dir = [&](const fs::path& q) {
         DWORD a = attrs(q);
-        return a != INVALID_FILE_ATTRIBUTES && ((a & FILE_ATTRIBUTE_REPARSE_POINT) || !(a & FILE_ATTRIBUTE_DIRECTORY));
+        return a != INVALID_FILE_ATTRIBUTES && (!(a & FILE_ATTRIBUTE_DIRECTORY) || !link_component(q.u8string()).empty());
     };
     std::error_code ec;
     if (in_sync) {

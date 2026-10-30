@@ -185,7 +185,12 @@ public:
 private:
     void UpdateAutostart();
     void ToServiceClick();
-    void RunUpgrade(bool to_service);
+    void BeginPassword(bool update);
+    void AskPassword();
+    void RunUpgrade(bool to_service, const std::string& account, std::shared_ptr<simple::SecretString> pw);
+    void RunSetPassword(const std::string& account, std::shared_ptr<simple::SecretString> pw);
+    void CheckPasswordNeeded();
+    std::string SvcName() const { return c_.sh->get_setting("svc.name", "mysync-client"); }
     void OnAutostart(bool on);
 
     SimpleCtx& c_;
@@ -210,6 +215,11 @@ private:
     bool updating_auto_ = false;
     bool busy_op_ = false;
     std::function<void()> add_folder_;
+    PasswordFlow pwd_;
+    wxPanel* pwd_panel_ = nullptr;
+    WrapText* pwd_text_ = nullptr;
+    bool pwd_querying_ = false;
+    wxTimer pwd_timer_;
 };
 
 enum class SimplePage { Checking, QuickStart, Wizard, Status };

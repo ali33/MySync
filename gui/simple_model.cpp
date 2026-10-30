@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <set>
 
 #include "form_model.h"
@@ -68,7 +69,10 @@ SimpleStatus compute_simple_status(const SimpleInputs& in) {
     switch (r.tray) {
         case TrayState::Error: {
             r.kind = SimpleKind::Error;
-            r.headline = trf("simple.st.error", {has_err ? le.message : tr("simple.st.error.unknown")});
+            if (has_err && le.message.find("is a link (symbolic link or junction)") != std::string::npos)
+                r.headline = trf("simple.st.link", {le.message});
+            else
+                r.headline = trf("simple.st.error", {has_err ? le.message : tr("simple.st.error.unknown")});
             if (has_err && !le.where.empty()) r.detail = le.where;
             r.error_banner = false;  // câu lớn đã là lỗi nguyên văn
             return r;
@@ -333,7 +337,7 @@ std::string friendly_error(const std::string& what) {
     return tr(key.c_str()) + (detail.empty() ? "" : "\n" + detail);
 }
 
-std::string service_confirm_text(const simple::MigrationSummary& s) {
+std::string service_confirm_text(const simple::MigrationSummary& s, const std::string& account) {
     auto list = [](const std::vector<std::string>& v) {
         std::string o;
         for (const auto& x : v) o += "\n  - " + x;
@@ -342,10 +346,86 @@ std::string service_confirm_text(const simple::MigrationSummary& s) {
     std::string t = tr("simple.svc.confirm.to") + "\n\n" + tr("simple.svc.sum.sources") + list(s.sources) + "\n\n" +
                     tr("simple.svc.sum.dests") + list(s.destinations) + "\n\n" +
                     trf("simple.svc.sum.key", {s.key_identity.empty() ? "?" : s.key_identity}) + "\n" +
-                    trf("simple.svc.sum.account", {s.service_account.empty() ? "?" : s.service_account});
+                    trf("simple.svc.sum.account", {account.empty() ? "?" : account});
     for (const auto& w : s.warnings) t += "\n! " + w;
-    t += "\n\n" + tr("simple.svc.sum.warn");
+    t += "\n\n" + trf(s.account_is_admin ? "simple.svc.sum.warn_admin" : "simple.svc.sum.warn", {account.empty() ? "?" : account});
     return t;
+}
+
+PwdErrorKind classify_password_error(const std::string& err) {
+    if (err.empty()) return PwdErrorKind::None;
+    if (err.find(simple::explain_logon_error(1326)) != std::string::npos) return PwdErrorKind::WrongPassword;
+    if (err.find(simple::explain_logon_error(1327)) != std::string::npos) return PwdErrorKind::NoPassword;
+    return PwdErrorKind::Other;
+}
+
+std::string password_prompt_text(const std::string& account, bool update) {
+    return trf(update ? "simple.pwd.text.update" : "simple.pwd.text", {account});
+}
+
+void PasswordFlow::begin(const std::string& default_account, bool update) {
+    account_ = default_account;
+    update_ = update;
+    error_.clear();
+    attempts_ = 0;
+    state_ = PwdState::Asking;
+}
+
+bool PasswordFlow::submit(const std::string& account, bool has_password, int64_t now_ms) {
+    if (state_ != PwdState::Asking) return false;
+    if (now_ms < 0)
+        now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (!limiter_.allowed(now_ms)) {
+        error_ = trf("simple.pwd.locked", {std::to_string(limiter_.seconds_left(now_ms))});
+        return false;
+    }
+    last_submit_ms_ = now_ms;
+    std::string a = trim(account);
+    account_ = a;
+    if (a.empty() || !simple::valid_account_name(a)) {
+        error_ = tr("simple.pwd.badaccount");
+        return false;
+    }
+    if (!has_password) {
+        error_ = tr("simple.pwd.empty");
+        return false;
+    }
+    error_.clear();
+    state_ = PwdState::Working;
+    return true;
+}
+
+void PasswordFlow::cancel() {
+    if (state_ == PwdState::Asking || state_ == PwdState::Working) state_ = PwdState::Cancelled;
+}
+
+void PasswordFlow::finish(bool ok, bool cancelled, const std::string& error) {
+    if (state_ != PwdState::Working) return;
+    if (ok) {
+        limiter_.succeeded();
+        error_.clear();
+        state_ = PwdState::Done;
+    } else if (cancelled) {
+        error_.clear();
+        state_ = PwdState::Cancelled;
+    } else {
+        switch (classify_password_error(error)) {
+            case PwdErrorKind::WrongPassword:
+                ++attempts_;
+                limiter_.failed(last_submit_ms_);
+                error_ = tr("simple.pwd.wrong") + "\n" + error;
+                state_ = PwdState::Asking;
+                break;
+            case PwdErrorKind::NoPassword:
+                error_ = error;
+                state_ = PwdState::NoPassword;
+                break;
+            default:
+                error_ = error;
+                state_ = PwdState::Failed;
+                break;
+        }
+    }
 }
 
 std::string firewall_hint(uint16_t port) {

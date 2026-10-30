@@ -360,10 +360,86 @@ TEST(simple_service_confirm_text_lists_folders_key_and_warning) {
     m.key_identity = "ab12 cd34";
     m.service_account = "LocalSystem";
     m.warnings = {"canh bao rieng"};
-    auto t = service_confirm_text(m);
-    for (const char* x : {"D:/Tài liệu", "E:/Sao-luu", "ab12 cd34", "LocalSystem", "canh bao rieng", "quyền cao", "Tiếp tục?"})
+    auto t = service_confirm_text(m, "PC\\Lan");
+    for (const char* x : {"D:/Tài liệu", "E:/Sao-luu", "ab12 cd34", "PC\\Lan", "canh bao rieng", "có quyền cao hơn bạn", "Tiếp tục?"})
         CHECK(has(t, x));
     CHECK(!has(t, "{0}"));
+}
+
+TEST(simple_password_flow_states_retry_cancel) {
+    LangGuard g(Lang::Vi);
+    PasswordFlow f;
+    CHECK(f.state() == PwdState::Idle);
+    CHECK(!f.submit("PC\\Lan", true));  // chưa begin
+    f.begin("PC\\Lan", false);
+    CHECK(f.state() == PwdState::Asking);
+    CHECK(has(password_prompt_text("PC\\Lan", false), "PC\\Lan"));
+    CHECK(has(password_prompt_text("PC\\Lan", false), "PIN"));       // dặn không dùng mã PIN
+    // mật khẩu trống / tên tài khoản hỏng: ở lại Asking kèm lời nhắc
+    CHECK(!f.submit("PC\\Lan", false));
+    CHECK(f.state() == PwdState::Asking && !f.error().empty());
+    CHECK(!f.submit("bad\"name", true));
+    CHECK(f.state() == PwdState::Asking);
+    CHECK(f.submit("  PC\\Lan ", true));
+    CHECK(f.state() == PwdState::Working);
+    CHECK_EQ(f.account(), std::string("PC\\Lan"));
+    // sai mật khẩu: nhập lại, đếm lần, lời của lõi còn nguyên văn
+    std::string wrong = "Cannot continue: " + simple::explain_logon_error(1326);
+    f.finish(false, false, wrong);
+    CHECK(f.state() == PwdState::Asking);
+    CHECK_EQ(f.attempts(), 1);
+    CHECK(has(f.error(), "nhập lại"));
+    CHECK(has(f.error(), simple::explain_logon_error(1326)));
+    CHECK(f.submit("PC\\Lan", true));
+    f.finish(true, false, "");
+    CHECK(f.state() == PwdState::Done);
+    CHECK(f.error().empty());
+    // người dùng huỷ hộp xin quyền: không phải lỗi
+    f.begin("PC\\Lan", false);
+    CHECK(f.submit("PC\\Lan", true));
+    f.finish(false, true, "");
+    CHECK(f.state() == PwdState::Cancelled);
+    // huỷ ngay ở hộp nhập
+    f.begin("PC\\Lan", true);
+    CHECK(f.is_update());
+    f.cancel();
+    CHECK(f.state() == PwdState::Cancelled);
+    f.finish(true, false, "");  // trạng thái không đúng: bị bỏ qua
+    CHECK(f.state() == PwdState::Cancelled);
+}
+
+TEST(simple_password_flow_no_password_and_other_errors) {
+    LangGuard g(Lang::Vi);
+    PasswordFlow f;
+    f.begin("PC\\Lan", false);
+    CHECK(f.submit("PC\\Lan", true));
+    f.finish(false, false, simple::explain_logon_error(1327));
+    CHECK(f.state() == PwdState::NoPassword);  // không hỏi lại: khuyên dùng "Tự chạy khi đăng nhập"
+    CHECK(classify_password_error(simple::explain_logon_error(1327)) == PwdErrorKind::NoPassword);
+    CHECK(classify_password_error(simple::explain_logon_error(1326)) == PwdErrorKind::WrongPassword);
+    CHECK(classify_password_error(simple::explain_logon_error(1331)) == PwdErrorKind::Other);
+    CHECK(classify_password_error("") == PwdErrorKind::None);
+    f.begin("PC\\Lan", false);
+    CHECK(f.submit("PC\\Lan", true));
+    f.finish(false, false, "disk full");
+    CHECK(f.state() == PwdState::Failed);
+    CHECK_EQ(f.error(), std::string("disk full"));  // nguyên văn
+    CHECK_EQ(f.attempts(), 0);
+    // mô hình không có chỗ nào giữ mật khẩu: không nhận/ trả mật khẩu, chỉ cờ "đã có mật khẩu"
+    CHECK(f.account().find("secret") == std::string::npos);
+}
+
+TEST(simple_symlink_error_has_plain_headline) {
+    LangGuard g(Lang::Vi);
+    auto in = running();
+    auto t = tgt(TargetState::Error);
+    t.last_error = "'D:/A' is a link (symbolic link or junction); links are not followed, so this folder is refused";
+    t.last_error_unix_ms = in.now_ms - 100;
+    in.snap.targets.push_back(t);
+    auto s = compute_simple_status(in);
+    CHECK(s.kind == SimpleKind::Error);
+    CHECK(has(s.headline, "liên kết"));
+    CHECK(has(s.headline, "is a link (symbolic link or junction)"));  // nguyên văn vẫn còn
 }
 
 // ---- không có thuật ngữ kỹ thuật trong lời của chế độ Đơn giản
@@ -386,4 +462,28 @@ TEST(simple_strings_have_no_jargon) {
         }
     }
     CHECK(checked > 200);
+}
+
+TEST(simple_password_flow_locks_after_repeated_wrong_attempts) {
+    LangGuard g(Lang::Vi);
+    PasswordFlow f;
+    int64_t t = 1000000;
+    f.begin("PC\\Lan", false);
+    for (int i = 0; i < 5; ++i) {
+        CHECK(f.submit("PC\\Lan", true, t));
+        f.finish(false, false, simple::explain_logon_error(1326));
+        CHECK(f.state() == PwdState::Asking);
+        t += 100;
+    }
+    // locked: the 6th attempt is not even sent, and re-opening the dialog does not clear the count
+    CHECK(!f.submit("PC\\Lan", true, t));
+    CHECK(!f.error().empty());
+    f.begin("PC\\Lan", false);
+    CHECK(!f.submit("PC\\Lan", true, t + 1000));
+    // after the wait it works again; a success resets the count
+    CHECK(f.submit("PC\\Lan", true, t + 31000));
+    f.finish(true, false, "");
+    CHECK(f.state() == PwdState::Done);
+    f.begin("PC\\Lan", false);
+    CHECK(f.submit("PC\\Lan", true, t + 31001));
 }

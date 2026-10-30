@@ -700,7 +700,7 @@ TEST(simple_pairing_cancel_and_wrong_server_key) {
 
 // ----------------------------------------------------------------------------------------- misc
 TEST(simple_migrate_from_user_needs_administrator_and_valid_arguments) {
-    if (gui::ServiceController::is_elevated()) return;   // would really write to the service folder
+    if (gui::ServiceController::is_elevated()) SKIP_TEST("running elevated: the admin-only steps would really run");
     ETmp t;
     CHECK_EQ(run_migrate_from_user({}), int(gui::kServiceBadArguments));
     CHECK_EQ(run_migrate_from_user({"--bogus"}), int(gui::kServiceBadArguments));
@@ -840,14 +840,12 @@ TEST(simple_run_checks_trust_before_it_opens_the_log) {
     fs::path cfg = cdir / "config.toml";
     std::ofstream(cfg) << gui::serialize_client_config(cc);
     if (!guitest::make_world_writable(cdir)) {
-        std::cout << "  (skipped: cannot make the folder writable for everyone)" << std::endl;
-        return;
+        SKIP_TEST("cannot make the folder writable for everyone here");
     }
     // --service means "strict": the folder of the configuration is writable by everybody, so the run is refused...
     int rc = run_mysync("run -c \"" + cfg.u8string() + "\" --role client --service", t.p / "out1.txt");
     if (rc == -1) {
-        std::cout << "  (skipped: no mysync binary next to the tests)" << std::endl;
-        return;
+        SKIP_TEST("no mysync binary next to the tests");
     }
     CHECK_EQ(rc, 1);
     std::string out = slurp(t.p / "out1.txt");

@@ -245,12 +245,20 @@ void require_trusted_config(const std::string& config_path, const std::vector<st
         throw Error("refusing to trust the configuration file '" + config_path + "': its folder '" + dir + "' " + r);
 }
 
-void require_trusted_dir(const std::string& dir, const std::string& what, const std::vector<std::string>& trusted) {
+void require_trusted_dir(const std::string& dir, const std::string& what, const std::vector<std::string>& trusted, bool include_self) {
     if (dir.empty()) return;
     std::error_code ec;
     if (!fs::exists(fs::u8path(dir), ec)) return;
-    std::string r = untrusted_writer_reason(dir, trusted);
+    std::string r = untrusted_writer_reason(dir, trusted, include_self);
     if (!r.empty()) throw Error("refusing " + what + " '" + dir + "': it " + r);
+}
+
+void require_trusted_run(const std::string& config_path, const std::string& state_dir, const std::string& log_file,
+                         const std::vector<std::string>& config_trusted, const std::vector<std::string>& dir_trusted, bool include_self) {
+    require_trusted_config(config_path, config_trusted, include_self);
+    require_trusted_dir(state_dir, "state_dir", dir_trusted, include_self);
+    if (!log_file.empty())
+        require_trusted_dir(fs::u8path(log_file).parent_path().u8string(), "the log folder", dir_trusted, include_self);
 }
 
 void require_trusted_run(const std::string& config_path, const std::string& state_dir, const std::string& log_file,

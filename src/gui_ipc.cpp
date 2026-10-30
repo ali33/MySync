@@ -806,6 +806,7 @@ std::vector<std::string> control_endpoint_candidates(const std::string& name, co
         return v;
     }
     v.push_back("/run/mysync/" + name + ".sock");
+    v.push_back("/run/" + name + "/" + name + ".sock");   // a per-user service (RuntimeDirectory=<service name>, 0700)
     const char* x = std::getenv("XDG_RUNTIME_DIR");
     if (x && *x == '/') v.push_back(std::string(x) + "/mysync/" + name + ".sock");
     return v;

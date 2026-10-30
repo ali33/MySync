@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <memory>
 #include <thread>
 
 #ifdef _WIN32
@@ -81,6 +83,8 @@ const char* service_action_name(ServiceAction a) {
     case ServiceAction::Start: return "start";
     case ServiceAction::Stop: return "stop";
     case ServiceAction::MigrateFromUser: return "migrate-from-user";
+    case ServiceAction::SetPassword: return "set-password";
+    case ServiceAction::ApplyConfig: return "apply-config";
     }
     return "?";
 }
@@ -295,7 +299,13 @@ ServiceState ServiceController::query(const std::string& name) const {
         case SERVICE_RUNNING: st.detail = "RUNNING"; st.running = true; break;
         case SERVICE_START_PENDING: st.detail = "START_PENDING"; st.running = true; break;
         case SERVICE_STOP_PENDING: st.detail = "STOP_PENDING"; break;
-        case SERVICE_STOPPED: st.detail = "STOPPED"; break;
+        case SERVICE_STOPPED:
+            st.detail = "STOPPED";
+            if (s.dwWin32ExitCode == ERROR_SERVICE_LOGON_FAILED) {   // 1069: the account's password is no longer right
+                st.needs_password_update = true;
+                st.detail = "STOPPED (logon failure 1069)";
+            }
+            break;
         default: st.detail = "state " + std::to_string(s.dwCurrentState); break;
         }
     }
@@ -305,6 +315,17 @@ ServiceState ServiceController::query(const std::string& name) const {
         std::vector<uint8_t> buf(need);
         auto* cfg = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.data());
         if (QueryServiceConfigW(svc, cfg, need, &need)) st.auto_start = cfg->dwStartType == SERVICE_AUTO_START;
+    }
+    {
+        DWORD dn = 0;
+        QueryServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, nullptr, 0, &dn);
+        if (dn > 0) {
+            std::vector<uint8_t> db(dn);
+            if (QueryServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, db.data(), dn, &dn)) {
+                auto* d = reinterpret_cast<SERVICE_DESCRIPTIONW*>(db.data());
+                if (d->lpDescription) st.description = narrow(d->lpDescription);
+            }
+        }
     }
     CloseServiceHandle(svc);
     CloseServiceHandle(scm);
@@ -461,6 +482,15 @@ ServiceState ServiceController::query(const std::string& name) const {
     std::string en = e.output;
     while (!en.empty() && std::isspace(static_cast<unsigned char>(en.back()))) en.pop_back();
     st.auto_start = en == "enabled";
+    {   // Description= of the unit (the owner label travels there)
+        std::ifstream uf("/etc/systemd/system/" + name + ".service");
+        std::string line;
+        while (std::getline(uf, line))
+            if (line.rfind("Description=", 0) == 0) {
+                st.description = line.substr(12);
+                break;
+            }
+    }
     return st;
 }
 
@@ -527,6 +557,25 @@ ServiceController::ServiceController(std::string exe) : exe_(std::move(exe)) {
 #endif
 }
 
+// The private-channel coordinates (a random pipe name and a 128-bit nonce: neither is the secret itself).
+static void push_pipe_args(std::vector<std::string>& a, const ServiceRequest& rq) {
+    if (rq.password_pipe.empty()) return;
+    auto hex_ok = [](const std::string& h) {
+        if (h.size() != 32) return false;
+        for (char c : h)
+            if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
+        return true;
+    };
+    bool name_ok2 = rq.password_pipe.rfind("mysync-pw-", 0) == 0 && rq.password_pipe.size() <= 64;
+    for (char c : rq.password_pipe)
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '-')) name_ok2 = false;
+    if (!name_ok2 || !hex_ok(rq.password_nonce)) throw Error("invalid private channel coordinates");
+    a.push_back("--password-pipe");
+    a.push_back(rq.password_pipe);
+    a.push_back("--password-nonce");
+    a.push_back(rq.password_nonce);
+}
+
 std::vector<std::string> ServiceController::build_args(ServiceAction act, const ServiceRequest& rq) const {
     if (!name_ok(rq.name)) throw Error("invalid service name (allowed: A-Z a-z 0-9 _ . -, at most 64)");
     std::vector<std::string> a{"service", service_action_name(act)};
@@ -548,6 +597,17 @@ std::vector<std::string> ServiceController::build_args(ServiceAction act, const 
             a.push_back("--user");
             a.push_back(rq.run_as);
         }
+        push_pipe_args(a, rq);
+        if (rq.user_service) {
+            a.push_back("--user-service");
+            // the folders the user confirmed outside the home: the service re-applies the same allowlist whenever it loads its
+            // configuration, so it must be told about them
+            for (const auto& r : rq.allow_roots) {
+                if (r.empty() || !fs::u8path(r).is_absolute() || has_ctl(r) || r[0] == '-') throw Error("an allowed folder must be an absolute path");
+                a.push_back("--allow-root");
+                a.push_back(r);
+            }
+        }
         for (const auto& x : rq.control_allow) {
             if (!allow_ok(x)) throw Error("invalid control allow entry");
             std::string broad = broad_principal_reason(x);
@@ -562,11 +622,22 @@ std::vector<std::string> ServiceController::build_args(ServiceAction act, const 
             a.push_back("--trust-writer");
             a.push_back(x);
         }
-    } else if (act == ServiceAction::MigrateFromUser) {
-        if (!rq.config_path.empty() || !rq.role.empty() || !rq.run_as.empty() || !rq.control_allow.empty() ||
-            !rq.trust_writers.empty())
-            throw Error("migrate-from-user takes only the user configuration and the service name");
-        if (rq.remove_migrated) {
+    } else if (act == ServiceAction::SetPassword) {
+        if (!account_ok(rq.run_as)) throw Error("invalid service account name");
+        a.push_back("--user");
+        a.push_back(rq.run_as);
+        if (rq.password_pipe.empty()) throw Error("set-password needs the private channel");
+        push_pipe_args(a, rq);
+    } else if (act == ServiceAction::MigrateFromUser || act == ServiceAction::ApplyConfig) {
+        const bool apply = act == ServiceAction::ApplyConfig;
+        if (!rq.config_path.empty() || !rq.role.empty() || !rq.control_allow.empty() || !rq.trust_writers.empty())
+            throw Error("migrate-from-user takes only the user configuration, the account and the service name");
+        if (!rq.run_as.empty()) {   // the account the service will run as: the elevated step checks it is the requester
+            if (!account_ok(rq.run_as)) throw Error("invalid service account name");
+            a.push_back("--account");
+            a.push_back(rq.run_as);
+        }
+        if (rq.remove_migrated && !apply) {
             if (!rq.user_config.empty()) throw Error("remove_migrated takes no user configuration");
             a.push_back("--remove");
             a.push_back("--name");
@@ -584,12 +655,14 @@ std::vector<std::string> ServiceController::build_args(ServiceAction act, const 
                 if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
             return true;
         };
-        if (!hex64(rq.expect_config_hash) || !hex64(rq.expect_key_hash))
-            throw Error("migrate-from-user needs the hashes of the configuration and of the key that were shown to the user");
+        if (!hex64(rq.expect_config_hash) || (!apply && !hex64(rq.expect_key_hash)))
+            throw Error("this step needs the hashes of the configuration (and of the key) that were shown to the user");
         a.push_back("--expect-hash");
         a.push_back(rq.expect_config_hash);
-        a.push_back("--expect-key-hash");
-        a.push_back(rq.expect_key_hash);
+        if (!apply) {
+            a.push_back("--expect-key-hash");
+            a.push_back(rq.expect_key_hash);
+        }
         for (const auto& r : rq.allow_roots) {
             if (r.empty() || !fs::u8path(r).is_absolute() || has_ctl(r) || r[0] == '-') throw Error("an allowed folder must be an absolute path");
             a.push_back("--allow-root");
@@ -605,8 +678,44 @@ std::vector<std::string> ServiceController::build_args(ServiceAction act, const 
     return a;
 }
 
-ServiceResult ServiceController::run(ServiceAction act, const ServiceRequest& rq) {
+// Windows: a service that logs on as a user account needs that account's password.
+static bool account_needs_password(const std::string& run_as) {
+#ifdef _WIN32
+    if (run_as.empty()) return false;
+    std::string l = run_as;
+    for (auto& c : l) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return !(l == "localsystem" || l.rfind("nt authority\\", 0) == 0 || l.rfind("nt service\\", 0) == 0);
+#else
+    (void)run_as;
+    return false;
+#endif
+}
+
+ServiceResult ServiceController::run(ServiceAction act, const ServiceRequest& rq0) {
+    ServiceRequest rq = rq0;
+    std::unique_ptr<simple::PasswordChannel> chan;
+    const bool wants_password = (act == ServiceAction::Install || act == ServiceAction::SetPassword) && account_needs_password(rq.run_as);
+    if (wants_password) {
+        if (!rq.password || rq.password->empty()) {
+            ServiceResult r;
+            r.exit_code = kServiceBadArguments;
+            r.message = "Windows needs the password of the account (" + rq.run_as + ") to run the service as that account.";
+            r.state_after = query(rq.name);
+            return r;
+        }
+        try {
+            chan = simple::PasswordChannel::create();
+        } catch (const std::exception& e) {
+            ServiceResult r;
+            r.exit_code = kServiceGenericFailure;
+            r.message = std::string("cannot prepare the private channel for the password: ") + e.what();
+            return r;
+        }
+        rq.password_pipe = chan->pipe_name();
+        rq.password_nonce = chan->nonce_hex();
+    }
     std::vector<std::string> args = build_args(act, rq);
+
     // Nothing is elevated unless the program (and the folder it sits in) can only be changed by administrators.
     std::string why = untrusted_executable_reason(exe_);
     if (!why.empty()) {
@@ -632,7 +741,16 @@ ServiceResult ServiceController::run(ServiceAction act, const ServiceRequest& rq
             return r;
         }
     }
+    std::thread deliverer;
+    std::string deliver_err;
+    bool delivered = false;
+    if (chan) deliverer = std::thread([&] { delivered = chan->deliver(*rq.password, 180000, &deliver_err); });
     ServiceResult res = run_child(exe_, args);
+    if (deliverer.joinable()) {
+        chan->cancel();   // the child is gone: if it never came for the password, stop waiting
+        deliverer.join();
+        if (!res.ok && !delivered && !deliver_err.empty() && deliver_err != "cancelled") res.message += "\n(private channel: " + deliver_err + ")";
+    }
     res.state_after = query(rq.name);
     if (res.ok) {
         bool mismatch = (act == ServiceAction::Install && !res.state_after.installed) ||

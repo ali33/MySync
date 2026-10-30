@@ -37,10 +37,16 @@ std::string untrusted_writer_reason(const std::string& path, const std::vector<s
 void require_trusted_config(const std::string& config_path, const std::vector<std::string>& trusted_writers,
                             bool include_self = true);
 // A directory the daemon writes into (state_dir) or whose child it writes (log_file's parent). A missing one is ignored.
-void require_trusted_dir(const std::string& dir, const std::string& what, const std::vector<std::string>& trusted_writers);
+void require_trusted_dir(const std::string& dir, const std::string& what, const std::vector<std::string>& trusted_writers,
+                         bool include_self = true);
 
 // The one trust check a daemon / one-shot run performs: configuration file + folder, state_dir, folder of log_file.
 // Used by ClientDaemon / ServerDaemon (start and every reload) and by `mysync run --once`.
+// Simple-mode service on Windows: the account the service runs as is the user, so it must NOT count as trusted for the
+// configuration (a user-level process can write what the user can write): `config_trusted` / include_self=false for the
+// configuration folder, and `dir_trusted` (the owner's SID, only if state/log are user-writable) for state and log.
+void require_trusted_run(const std::string& config_path, const std::string& state_dir, const std::string& log_file,
+                         const std::vector<std::string>& config_trusted, const std::vector<std::string>& dir_trusted, bool include_self);
 void require_trusted_run(const std::string& config_path, const std::string& state_dir, const std::string& log_file,
                          const std::vector<std::string>& trusted_writers);
 

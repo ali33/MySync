@@ -220,10 +220,22 @@ std::string trust_state_dir(const ServerConfig& c, const DaemonOptions& o) {
     return effective_server_state_dir(c.state_dir, c.root);
 }
 
+inline void check_config_rules(const ClientConfig& c, const DaemonOptions& o) {
+    if (!o.config_check) return;
+    std::string why = o.config_check(c);
+    if (!why.empty()) throw Error(why);
+}
+inline void check_config_rules(const ServerConfig&, const DaemonOptions&) {}
+
 template <class C>
 void check_trust(const C& c, const DaemonOptions& o) {
+    check_config_rules(c, o);
     if (!o.enforce_config_trust) return;
     // The DEFAULT state folder counts too (state_dir empty): it is where the engine writes its indexes.
+    if (o.exclude_self_from_trust) {
+        require_trusted_run(o.config_path, trust_state_dir(c, o), c.log_file, o.trusted_writers, o.state_writers, /*include_self=*/false);
+        return;
+    }
     require_trusted_run(o.config_path, trust_state_dir(c, o), c.log_file, o.trusted_writers);
 }
 
@@ -703,6 +715,10 @@ struct ServerDaemon::Impl {
             PublicKey k = key;
             if (acl_has_key(c, k)) throw Error("this computer is already paired");
         }
+        for (const ClientAcl& c : peer_list(opts.config_path)) {   // also what is only in peers.d / the file (not yet running)
+            PublicKey k = key;
+            if (acl_has_key(c, k)) throw Error("this computer is already in the allowlist");
+        }
         std::string display = name;
         for (int n = 2; names.count(display) && n < 1000; ++n) display = name + " (" + std::to_string(n) + ")";
         // A folder that already exists may hold another machine's files: never hand it over.
@@ -745,6 +761,10 @@ struct ServerDaemon::Impl {
             } catch (const std::exception& e2) {
                 rb = e2.what();
             }
+            if (!rb.empty()) {
+                std::lock_guard<std::mutex> hl(half_mu);
+                half_added.insert(key_to_hex(key));   // only these may be removed by a later deny
+            }
             throw Error(why + (rb.empty() ? " (the new computer was not added)"
                                           : "; ALSO the new computer could not be taken out again (" + rb +
                                                 "): deny its request to remove it"));
@@ -755,9 +775,15 @@ struct ServerDaemon::Impl {
 
     // Denying a request makes sure its key is not allowed (a half-failed approval may have left it in the file): take it
     // out now and apply, which also cuts that key's open sessions at once (no waiting for the peers.d watcher).
+    std::mutex half_mu;
+    std::set<std::string> half_added;   // keys a failed approval left in the allowlist (rollback failed)
     void pair_revoke(const PubKey& key) {
         std::lock_guard<std::mutex> rl(reload_mu);
         if (opts.config_path.empty()) return;
+        {   // a peer the administrator added meanwhile is NOT ours to remove
+            std::lock_guard<std::mutex> hl(half_mu);
+            if (!half_added.erase(key_to_hex(key))) return;
+        }
         PeerEdit e = peer_remove(opts.config_path, key_to_hex(key), /*revoke=*/false);
         bool running = false;
         for (const ClientAcl& c : cfg.clients) {

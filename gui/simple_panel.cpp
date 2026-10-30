@@ -9,6 +9,7 @@
 
 #include "mysync/gui/service_ctl.h"
 #include "mysync/simple/autostart.h"
+#include "mysync/simple/service_account.h"
 #include "mysync/simple/service_upgrade.h"
 
 namespace mysync::gui {
@@ -111,7 +112,7 @@ QuickStartPage::QuickStartPage(wxWindow* parent, SimpleCtx& c, std::function<voi
 
 // ---------------------------------------------------------------- Trạng thái
 StatusPage::StatusPage(wxWindow* parent, SimpleCtx& c, std::function<void()> add_folder)
-    : wxPanel(parent, wxID_ANY), c_(c), add_folder_(std::move(add_folder)) {
+    : wxPanel(parent, wxID_ANY), c_(c), add_folder_(std::move(add_folder)), pwd_timer_(this) {
     auto* top = new wxBoxSizer(wxVERTICAL);
     busy_ = new BusyIndicator(this);
     top->Add(busy_, 0, wxEXPAND | wxALL, 8);
@@ -167,6 +168,26 @@ StatusPage::StatusPage(wxWindow* parent, SimpleCtx& c, std::function<void()> add
     svc_result_->Hide();
     v->Add(svc_result_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 20);
 
+    pwd_panel_ = new wxPanel(content_, wxID_ANY);
+    pwd_panel_->SetBackgroundColour(wxColour(0xFF, 0xF1, 0xC4));
+    {
+        auto* ph = new wxBoxSizer(wxHORIZONTAL);
+        pwd_text_ = new WrapText(pwd_panel_, L("simple.pwd.banner"));
+        pwd_text_->SetTextColour(wxColour(0x5C, 0x45, 0x00));
+        auto* pb = new wxButton(pwd_panel_, wxID_ANY, L("simple.pwd.update"));
+        ph->Add(pwd_text_, 1, wxALL | wxEXPAND, 8);
+        ph->Add(pb, 0, wxALL | wxALIGN_CENTER_VERTICAL, 8);
+        pwd_panel_->SetSizer(ph);
+        pwd_panel_->Hide();
+        pb->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+            if (!busy_op_) {
+                pwd_.begin(simple::current_account_name(), true);
+                AskPassword();
+            }
+        });
+    }
+    v->Add(pwd_panel_, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 20);
+
     recv_ = new ReceiveBox(content_, c_);
     v->Add(recv_, 0, wxEXPAND | wxALL, 20);
     content_->SetSizer(v);
@@ -182,9 +203,14 @@ StatusPage::StatusPage(wxWindow* parent, SimpleCtx& c, std::function<void()> add
     chk_auto_->Bind(wxEVT_CHECKBOX, [this](wxCommandEvent&) { OnAutostart(chk_auto_->GetValue()); });
     b_svc_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ToServiceClick(); });
     UpdateAutostart();
+    Bind(wxEVT_TIMER, [this](wxTimerEvent&) { CheckPasswordNeeded(); }, pwd_timer_.GetId());
+    pwd_timer_.Start(20000);
 }
 
-StatusPage::~StatusPage() { *alive_ = false; }
+StatusPage::~StatusPage() {
+    pwd_timer_.Stop();
+    *alive_ = false;
+}
 
 void StatusPage::UpdateAutostart() {
     updating_auto_ = true;
@@ -271,7 +297,12 @@ void StatusPage::Refresh2() {
 
     bool svc = c_.service_mode();
     b_svc_->SetLabel(L(svc ? "simple.svc.back" : "simple.svc.to"));
-    b_svc_->Enable(!busy_op_);
+    // An administrator account cannot run the service safely (see DESIGN.md d7e): the button is locked and says why. Going BACK
+    // to the personal mode is always possible.
+    static const bool admin_acct = simple::account_is_administrator(simple::current_user_sid());
+    const bool admin_locked = !svc && admin_acct;
+    b_svc_->Enable(!busy_op_ && !admin_locked);
+    b_svc_->SetToolTip(admin_locked ? L("simple.svc.admin_refused") : wxString());
     b_add_->Enable(!svc && !busy_op_);
     b_add_->SetToolTip(svc ? L("simple.add.svc") : wxString());
     content_->Layout();
@@ -281,14 +312,15 @@ void StatusPage::Refresh2() {
 void StatusPage::ToServiceClick() {
     if (busy_op_) return;
     bool to_service = !c_.service_mode();
+    std::string account = simple::current_account_name();
     if (!to_service) {
         wxMessageDialog q(this, L("simple.svc.confirm.back"), L("app.title"), wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
         q.SetYesNoLabels(L("simple.svc.yes"), L("btn.cancel"));
         if (q.ShowModal() != wxID_YES) return;
-        RunUpgrade(false);
+        RunUpgrade(false, account, nullptr);
         return;
     }
-    // Trước khi xin quyền quản trị: cho người dùng thấy dịch vụ sẽ đụng tới thư mục nào, dùng khoá nào.
+    // Trước khi xin quyền quản trị: cho người dùng thấy dịch vụ sẽ đụng tới thư mục nào, dùng khoá nào, chạy bằng ai.
     busy_op_ = true;
     content_->Enable(false);
     busy_->Start(L("simple.svc.summarizing"));
@@ -296,11 +328,11 @@ void StatusPage::ToServiceClick() {
     SimpleHost* host = c_.host;
     run_async<simple::MigrationSummary>(
         alive_, [host]() { return simple::summarize_user_config(host->paths()); },
-        [this](bool ok, simple::MigrationSummary& s, const std::string& err) {
+        [this, account](bool ok, simple::MigrationSummary& s, const std::string& err) {
             busy_op_ = false;
             content_->Enable(true);
             busy_->Stop();
-            std::string problem = !ok ? err : s.problems.empty() ? std::string() : s.problems.front();
+            std::string problem = !ok ? err : s.account_is_admin ? tr("simple.svc.admin_refused") : s.problems.empty() ? std::string() : s.problems.front();
             if (!problem.empty()) {
                 svc_result_->SetText(W(problem));
                 svc_result_->SetTextColour(kRed);
@@ -309,17 +341,114 @@ void StatusPage::ToServiceClick() {
                 Refresh2();
                 return;
             }
-            wxMessageDialog q(this, W(service_confirm_text(s)), L("app.title"), wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
+            wxMessageDialog q(this, W(service_confirm_text(s, account)), L("app.title"), wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
             q.SetYesNoLabels(L("simple.svc.yes"), L("btn.cancel"));
             if (q.ShowModal() != wxID_YES) {
                 Refresh2();
                 return;
             }
-            RunUpgrade(true);
+            BeginPassword(false);
         });
 }
 
-void StatusPage::RunUpgrade(bool to_service) {
+namespace {
+// Hộp nhập mật khẩu. Mật khẩu chỉ nằm trong ô nhập; TakePassword() chuyển sang SecretString rồi xoá ô ngay.
+class PasswordDialog : public wxDialog {
+public:
+    PasswordDialog(wxWindow* parent, const std::string& account, const std::string& prompt, const std::string& error,
+                   bool update)
+        : wxDialog(parent, wxID_ANY, L(update ? "simple.pwd.update" : "simple.pwd.title"), wxDefaultPosition, wxDefaultSize,
+                   wxDEFAULT_DIALOG_STYLE) {
+        auto* v = new wxBoxSizer(wxVERTICAL);
+        if (!error.empty()) {
+            auto* e = new WrapText(this, W(error));
+            e->SetTextColour(wxColour(0xA0, 0x10, 0x10));
+            e->SetMinSize(wxSize(460, -1));
+            v->Add(e, 0, wxEXPAND | wxALL, 12);
+        }
+        auto* t = new WrapText(this, W(prompt));
+        t->SetMinSize(wxSize(460, -1));
+        v->Add(t, 0, wxEXPAND | wxALL, 12);
+        auto* g = new wxFlexGridSizer(2, 6, 8);
+        g->AddGrowableCol(1, 1);
+        g->Add(new wxStaticText(this, wxID_ANY, L("simple.pwd.account")), 0, wxALIGN_CENTER_VERTICAL);
+        acct_ = new wxTextCtrl(this, wxID_ANY, W(account));
+        g->Add(acct_, 1, wxEXPAND);
+        g->Add(new wxStaticText(this, wxID_ANY, L("simple.pwd.password")), 0, wxALIGN_CENTER_VERTICAL);
+        pw_ = new wxTextCtrl(this, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_PASSWORD | wxTE_PROCESS_ENTER);
+        g->Add(pw_, 1, wxEXPAND);
+        v->Add(g, 0, wxEXPAND | wxLEFT | wxRIGHT, 12);
+        auto* bs = new wxStdDialogButtonSizer;
+        auto* ok = new wxButton(this, wxID_OK, L("simple.pwd.ok"));
+        bs->AddButton(ok);
+        bs->AddButton(new wxButton(this, wxID_CANCEL, L("btn.cancel")));
+        bs->Realize();
+        v->Add(bs, 0, wxEXPAND | wxALL, 12);
+        SetSizerAndFit(v);
+        pw_->SetFocus();
+        ok->SetDefault();
+        pw_->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent&) { EndModal(wxID_OK); });
+        CentreOnParent();
+    }
+    ~PasswordDialog() override { Wipe(); }
+    std::string Account() const { return S(acct_->GetValue()); }
+    bool HasPassword() const { return !pw_->IsEmpty(); }
+    simple::SecretString TakePassword() {
+        std::string u8 = S(pw_->GetValue());
+        simple::SecretString sec;
+        sec.assign(u8.data(), u8.size());
+        if (!u8.empty()) secure_wipe(&u8[0], u8.size());
+        Wipe();
+        return sec;
+    }
+
+private:
+    void Wipe() {
+        if (pw_) {
+            pw_->SetValue(wxString(wxUniChar('*'), pw_->GetLastPosition() + 1));  // ghi đè rồi mới xoá
+            pw_->Clear();
+        }
+    }
+    wxTextCtrl *acct_ = nullptr, *pw_ = nullptr;
+};
+}  // namespace
+
+// Hỏi mật khẩu MỘT lần cho mỗi lần cài (hoặc cập nhật); sai mật khẩu thì hỏi lại. Linux: không có mật khẩu.
+void StatusPage::BeginPassword(bool update) {
+    std::string account = simple::current_account_name();
+#ifdef _WIN32
+    pwd_.begin(account, update);
+    AskPassword();
+#else
+    (void)update;
+    RunUpgrade(true, account, nullptr);
+#endif
+}
+
+void StatusPage::AskPassword() {
+    if (pwd_.state() != PwdState::Asking) return;
+    PasswordDialog dlg(this, pwd_.account(), password_prompt_text(pwd_.account(), pwd_.is_update()), pwd_.error(),
+                       pwd_.is_update());
+    if (dlg.ShowModal() != wxID_OK) {
+        pwd_.cancel();
+        svc_result_->SetText(L("simple.pwd.cancelled"));
+        svc_result_->SetTextColour(kAmber);
+        svc_result_->Show();
+        Refresh2();
+        return;
+    }
+    std::string account = dlg.Account();
+    auto secret = std::make_shared<simple::SecretString>(dlg.TakePassword());
+    if (!pwd_.submit(account, !secret->empty())) {
+        secret->clear();
+        CallAfter([this] { AskPassword(); });  // lời nhắc nằm trong pwd_.error()
+        return;
+    }
+    if (pwd_.is_update()) RunSetPassword(pwd_.account(), secret);
+    else RunUpgrade(true, pwd_.account(), secret);
+}
+
+void StatusPage::RunUpgrade(bool to_service, const std::string& account, std::shared_ptr<simple::SecretString> pw) {
     busy_op_ = true;
     content_->Enable(false);
     busy_->Start(L("simple.svc.busy"));
@@ -328,11 +457,11 @@ void StatusPage::RunUpgrade(bool to_service) {
     AliveFlag alive = alive_;
     run_async<simple::UpgradeResult>(
         alive_,
-        [this, host, to_service, alive]() {
+        [this, host, to_service, alive, account, pw]() {
             simple::Supervisor* sup = host->sup();
             if (!sup) throw Error(tr("simple.svc.nosup"));
-            ServiceController ctl;
-            auto steps = simple::make_real_upgrade_steps(*sup, ctl, host->paths());
+            gui::ServiceController ctl;
+            auto steps = simple::make_real_upgrade_steps(*sup, ctl, host->paths(), "", {}, account, pw.get());
             // Gọi từ luồng nền: chỉ đẩy việc về luồng UI (CallAfter), không chạm cửa sổ ở đây.
             std::function<void(simple::UpgradeStep)> cb = [this, alive](simple::UpgradeStep s) {
                 if (!wxTheApp) return;
@@ -342,10 +471,17 @@ void StatusPage::RunUpgrade(bool to_service) {
             };
             return to_service ? simple::upgrade_to_service(*steps, cb) : simple::downgrade_to_user(*steps, cb);
         },
-        [this, to_service](bool ok, simple::UpgradeResult& r, const std::string& err) {
+        [this, to_service, account, pw](bool ok, simple::UpgradeResult& r, const std::string& err) {
+            if (pw) pw->clear();  // mật khẩu hết nhiệm vụ: xoá ngay
             busy_op_ = false;
             content_->Enable(true);
             busy_->Stop();
+            if (to_service) pwd_.finish(ok && r.ok, ok && r.cancelled, ok ? r.error : err);
+            if (to_service && pwd_.state() == PwdState::Asking) {  // sai mật khẩu: bước cài đã tự trả về như cũ, cho nhập lại
+                Refresh2();
+                CallAfter([this] { AskPassword(); });
+                return;
+            }
             std::string txt;
             wxColour col = kRed;
             if (!ok) {
@@ -353,9 +489,13 @@ void StatusPage::RunUpgrade(bool to_service) {
             } else if (r.ok) {
                 txt = tr(to_service ? "simple.svc.done.to" : "simple.svc.done.back");
                 col = kGreen;
+                c_.sh->set_setting("svc.name", simple::user_service_name(account));
                 if (c_.set_service_mode) c_.set_service_mode(to_service);
             } else if (r.cancelled) {
                 txt = tr("simple.svc.cancelled");
+                col = kAmber;
+            } else if (to_service && pwd_.state() == PwdState::NoPassword) {
+                txt = tr("simple.pwd.nopassword");
                 col = kAmber;
             } else {
                 txt = trf("simple.svc.fail", {tr(step_key(r.failed_step)), r.error});
@@ -365,11 +505,110 @@ void StatusPage::RunUpgrade(bool to_service) {
             svc_result_->SetText(W(txt));
             svc_result_->SetTextColour(col);
             svc_result_->Show();
-            if (!ok || (!r.ok && !r.cancelled)) c_.sh->report(BannerLevel::Error, "simple.svc", txt);
+            bool nopw = to_service && pwd_.state() == PwdState::NoPassword;
+            if (!nopw && (!ok || (!r.ok && !r.cancelled))) c_.sh->report(BannerLevel::Error, "simple.svc", txt);
             else c_.sh->clear_report("simple.svc");
             Refresh2();
             if (c_.sh->poll_now) c_.sh->poll_now();
+            if (nopw) {
+                // Tài khoản không có mật khẩu: nói rõ và đưa thẳng sang lựa chọn "Tự chạy khi tôi đăng nhập".
+                wxMessageDialog q(this, L("simple.pwd.nopassword"), L("app.title"), wxYES_NO | wxYES_DEFAULT | wxICON_INFORMATION);
+                q.SetYesNoLabels(L("simple.pwd.nopassword.yes"), L("btn.cancel"));
+                if (q.ShowModal() == wxID_YES) {
+                    chk_auto_->SetValue(true);
+                    OnAutostart(true);
+                    UpdateAutostart();
+                    if (chk_auto_->GetValue()) {
+                        svc_result_->SetText(L("simple.pwd.autostart.on"));
+                        svc_result_->SetTextColour(kGreen);
+                    }
+                }
+            }
         });
+}
+
+void StatusPage::RunSetPassword(const std::string& account, std::shared_ptr<simple::SecretString> pw) {
+    busy_op_ = true;
+    content_->Enable(false);
+    busy_->Start(L("simple.pwd.busy.update"));
+    svc_result_->Hide();
+    std::string name = SvcName();
+    run_async<gui::ServiceResult>(
+        alive_,
+        [name, account, pw]() {
+            gui::ServiceController ctl;
+            gui::ServiceRequest rq;
+            rq.name = name;
+            rq.run_as = account;
+            rq.password = pw.get();
+            return ctl.run(gui::ServiceAction::SetPassword, rq);
+        },
+        [this, pw](bool ok, gui::ServiceResult& r, const std::string& err) {
+            pw->clear();
+            busy_op_ = false;
+            content_->Enable(true);
+            busy_->Stop();
+            std::string text = ok ? r.message : err;
+            pwd_.finish(ok && r.ok, ok && r.cancelled, text);
+            if (pwd_.state() == PwdState::Asking) {
+                Refresh2();
+                CallAfter([this] { AskPassword(); });
+                return;
+            }
+            wxColour col = kRed;
+            if (ok && r.ok) {
+                text = tr("simple.pwd.updated");
+                col = kGreen;
+                pwd_panel_->Hide();
+                c_.sh->clear_report("simple.svc");
+            } else if (ok && r.cancelled) {
+                text = tr("simple.svc.cancelled");
+                col = kAmber;
+            } else {
+                c_.sh->report(BannerLevel::Error, "simple.svc", text);
+            }
+            svc_result_->SetText(W(text));
+            svc_result_->SetTextColour(col);
+            svc_result_->Show();
+            Refresh2();
+            if (c_.sh->poll_now) c_.sh->poll_now();
+        });
+}
+
+// Windows: mật khẩu tài khoản đổi -> dịch vụ dừng với lỗi đăng nhập (1069): hiện băng và nút cập nhật.
+void StatusPage::CheckPasswordNeeded() {
+#ifdef _WIN32
+    bool svc = c_.service_mode();
+    if (!svc) {
+        if (pwd_panel_->IsShown()) {
+            pwd_panel_->Hide();
+            content_->Layout();
+        }
+        return;
+    }
+    if (pwd_querying_ || busy_op_) return;
+    pwd_querying_ = true;
+    std::string name = SvcName();
+    run_async<bool>(
+        alive_,
+        [name]() {
+            gui::ServiceController ctl;
+            return ctl.query(name).needs_password_update;
+        },
+        [this](bool ok, bool& need, const std::string& err) {
+            pwd_querying_ = false;
+            if (!ok) {
+                c_.sh->report(BannerLevel::Warning, "simple.svc.query", err);
+                return;
+            }
+            c_.sh->clear_report("simple.svc.query");
+            if (pwd_panel_->IsShown() != need) {
+                pwd_panel_->Show(need);
+                content_->Layout();
+                Layout();
+            }
+        });
+#endif
 }
 
 // ---------------------------------------------------------------- khung chứa

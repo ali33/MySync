@@ -25,6 +25,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <pwd.h>
 #include <unistd.h>
 #endif
 
@@ -39,6 +40,7 @@
 #include "mysync/keys.h"
 #include "mysync/server.h"
 #include "mysync/service.h"
+#include "mysync/simple/service_account.h"
 #include "mysync/simple/service_upgrade.h"
 #include "mysync/util.h"
 
@@ -175,6 +177,10 @@ struct Opts {
     bool service = false;
     bool exit_on_stdin_eof = false;  // parent (GUI supervisor) closes our stdin => stop cleanly
     std::string expect_hash, expect_key_hash;
+    std::string password_pipe, password_nonce, account;
+    std::vector<std::string> state_writers;   // run: SIDs trusted for state/ and log/ only (Windows Simple-mode service)
+    bool enforce_paths = false;   // run: apply the Simple-mode path allowlist to every configuration load
+    bool user_service = false;   // service install: the Simple-mode flavour (runs as the user, own runtime folder)
     std::vector<std::string> allow_roots;
     bool remove_copy = false;        // service migrate-from-user --remove
     bool user_mode = false;          // engine of a plain user started by the GUI: control channel for that user only
@@ -207,6 +213,12 @@ Opts parse_opts(const std::vector<std::string>& a, size_t from) {
         else if (s == "--user-mode") o.user_mode = true;
         else if (s == "--remove") o.remove_copy = true;
         else if (s == "--expect-hash") o.expect_hash = val();
+        else if (s == "--password-pipe") o.password_pipe = val();
+        else if (s == "--password-nonce") o.password_nonce = val();
+        else if (s == "--account") o.account = val();
+        else if (s == "--user-service") o.user_service = true;
+        else if (s == "--enforce-paths") o.enforce_paths = true;
+        else if (s == "--state-writer") o.state_writers.push_back(val());
         else if (s == "--expect-key-hash") o.expect_key_hash = val();
         else if (s == "--allow-root") o.allow_roots.push_back(val());
         else if (s == "--user-config") o.user_config = val();
@@ -311,6 +323,12 @@ int cmd_status(const Opts& o) {
 
 std::string default_service_name(Role r) { return r == Role::Server ? "mysync-server" : "mysync-client"; }
 
+#ifdef _WIN32
+constexpr bool kWindowsHost = true;
+#else
+constexpr bool kWindowsHost = false;
+#endif
+
 int cmd_run(const Opts& o) {
     Loaded l = load_config(o);
     // Trust comes FIRST: before the log file is opened or anything is created from this configuration. With high
@@ -327,6 +345,9 @@ int cmd_run(const Opts& o) {
             if (l.role == Role::Server)
                 gui::require_trusted_run(l.path, gui::effective_server_state_dir(l.server.state_dir, l.server.root),
                                          l.server.log_file, o.trust_writers);
+            else if (o.enforce_paths && kWindowsHost)   // the Simple-mode service: the user's own account is NOT trusted for the configuration
+                gui::require_trusted_run(l.path, gui::effective_client_state_dir(l.client.state_dir, l.path), l.client.log_file,
+                                         o.trust_writers, o.state_writers, /*include_self=*/false);
             else
                 gui::require_trusted_run(l.path, gui::effective_client_state_dir(l.client.state_dir, l.path),
                                          l.client.log_file, o.trust_writers);
@@ -368,6 +389,20 @@ int cmd_run(const Opts& o) {
         dopt.enforce_config_trust = gui::need_strict_trust(gui::ServiceController::is_elevated(), o.service);
         dopt.trusted_writers = o.trust_writers;
         dopt.control_user_only = o.user_mode;
+        if (o.enforce_paths) {
+            std::vector<std::string> roots = o.allow_roots;
+            std::string cdir = dir;
+            dopt.config_check = [roots, cdir](const ClientConfig& c) { return simple::service_config_path_problem(c, cdir, roots); };
+            if (kWindowsHost) {
+                dopt.exclude_self_from_trust = true;
+                dopt.state_writers = o.state_writers;
+            }
+            std::string why = dopt.config_check(cc);
+            if (!why.empty()) {
+                std::cerr << "mysync: refusing the configuration: " << why << "\n";
+                return 1;
+            }
+        }
         body = [cc, dir, once, prc, dopt](std::atomic<bool>& stop) {
             log_info("MySync client " + std::string(kVersion) + (once ? ": one sync pass" : ": watching"));
             if (once) {
@@ -431,11 +466,13 @@ int cmd_service(const Opts& o) {
 }
 
 int cmd_service_impl(const Opts& o) {
-    if (o.pos.size() == 1 && o.pos[0] == "migrate-from-user") {  // elevated helper of the GUI (simple mode)
+    if (o.pos.size() == 1 && (o.pos[0] == "migrate-from-user" || o.pos[0] == "apply-config")) {  // elevated helper of the GUI (simple mode)
         if (o.user_config.empty() && !o.remove_copy) usage("service migrate-from-user needs --user-config <file>");
         std::vector<std::string> a;
         if (!o.user_config.empty()) { a.push_back("--user-config"); a.push_back(o.user_config); }
         if (o.remove_copy) a.push_back("--remove");
+        if (o.pos[0] == "apply-config") a.push_back("--config-only");   // a new configuration for the service, same key
+        if (!o.account.empty()) { a.push_back("--account"); a.push_back(o.account); }
         if (!o.expect_hash.empty()) { a.push_back("--expect-hash"); a.push_back(o.expect_hash); }
         if (!o.expect_key_hash.empty()) { a.push_back("--expect-key-hash"); a.push_back(o.expect_key_hash); }
         for (const auto& r : o.allow_roots) { a.push_back("--allow-root"); a.push_back(r); }
@@ -444,7 +481,8 @@ int cmd_service_impl(const Opts& o) {
     }
     if (o.pos.size() != 1) usage("usage: mysync service install|uninstall|start|stop [options]");
     const std::string& act = o.pos[0];
-    if (act != "install" && act != "uninstall" && act != "start" && act != "stop") usage("unknown service action " + act);
+    if (act != "install" && act != "uninstall" && act != "start" && act != "stop" && act != "set-password")
+        usage("unknown service action " + act);
     Role role = Role::None;
     Loaded l;
     if (!o.config.empty()) {
@@ -455,6 +493,54 @@ int cmd_service_impl(const Opts& o) {
     }
     std::string name = o.name.empty() ? (role == Role::None ? "" : default_service_name(role)) : o.name;
     if (name.empty()) usage("give -c <config> or --name <service name>");
+    if (act == "set-password") {
+        // Windows: the user changed the password of the account the service runs as. The new password arrives through the
+        // private channel (never on a command line); it is checked with a logon first.
+        if (o.user.empty() || o.password_pipe.empty()) usage("service set-password needs --user <account> and --password-pipe/--password-nonce");
+#ifdef _WIN32
+        {   // only for the account of the user who asks, and only on a MySync service of this installation
+            if (simple::account_sid(o.user) != simple::current_user_sid()) {
+                std::cerr << "mysync: the password can only be changed for your own account\n";
+                return gui::kServiceAccessDenied;
+            }
+            // the service must carry THIS user's owner label (and name), not just be a MySync service
+            if (!simple::user_service_name_matches_owner(name, simple::current_owner_id()) ||
+                service_description(name).find(simple::owner_label(simple::current_owner_id())) == std::string::npos) {
+                std::cerr << "mysync: the service '" << name << "' was not installed for you\n";
+                return gui::kServiceAccessDenied;
+            }
+            std::string serr;
+            if (!service_runs_program(name, self_exe(), &serr)) {
+                std::cerr << "mysync: " << serr << "\n";
+                return gui::kServiceConfigError;
+            }
+        }
+#endif
+        simple::SecretString pw;
+        std::string perr;
+        if (!simple::receive_password(o.password_pipe, o.password_nonce, &pw, &perr)) {
+            std::cerr << "mysync: " << perr << "\n";
+            return gui::kServiceGenericFailure;
+        }
+        simple::AccountCheck chk = simple::check_service_account(o.user, pw);
+        if (!chk.ok) {
+            std::cerr << "mysync: " << chk.error << "\n";
+            return gui::kServiceConfigError;
+        }
+        std::string pws = pw.reveal();
+        pw.clear();
+        std::string err;
+        std::string canon = simple::account_name_from_sid(chk.sid);   // the canonical DOMAIN\name, not what was typed
+        bool ok = service_set_password(name, canon.empty() ? o.user : canon, pws, &err);   // wipes pws
+        if (!pws.empty()) secure_wipe(&pws[0], pws.size());       // whatever is left (a failure path)
+        pws.clear();
+        if (!ok) {
+            std::cerr << "mysync: service set-password failed: " << err << "\n";
+            return gui::service_exit_code_for_error(err);
+        }
+        std::cout << "service " << name << ": password updated\n";
+        return 0;
+    }
     std::string err;
     bool ok = false;
     if (act == "install") {
@@ -479,6 +565,93 @@ int cmd_service_impl(const Opts& o) {
         sp.exe_path = exe;
         sp.args = {"run", "-c", l.path, "--role", role == Role::Server ? "server" : "client", "--service", "--name", name};
         sp.run_as = o.user;
+        if (o.user_service) {   // the service re-applies the path allowlist whenever it loads its configuration
+            sp.args.push_back("--enforce-paths");
+            for (const auto& r : o.allow_roots) {
+                sp.args.push_back("--allow-root");
+                sp.args.push_back(r);
+            }
+        }
+        std::string owner_id;
+        bool right_added = false;
+        std::string right_sid;
+        // The right to log on as a service, once granted by us, is taken away again on EVERY way out that does not end with a
+        // working service and its marker (an early return, an exception from the install, a failed --control-allow ...).
+        simple::LogonRightGuard right_guard;
+        if (o.user_service) {   // the Simple-mode flavour: never root / SYSTEM, and labelled with its owner
+#ifndef _WIN32
+            struct passwd pw{}, *pres = nullptr;
+            char pbuf[4096];
+            if (o.user.empty() || ::getpwnam_r(o.user.c_str(), &pw, pbuf, sizeof pbuf, &pres) != 0 || !pres)
+                throw Error("--user-service needs --user <an existing account>");
+            if (pw.pw_uid == 0 || pw.pw_uid < simple::min_login_uid() || pw.pw_uid == 65534)
+                throw Error("a user service must not run as root, as a system account or as 'nobody'");
+            // The account must be the one who asked (pkexec / sudo name them), never an arbitrary other user.
+            {
+                const char* inv = std::getenv("PKEXEC_UID");
+                if (!inv || !*inv) inv = std::getenv("SUDO_UID");
+                if (!inv || std::to_string(static_cast<unsigned long>(pw.pw_uid)) != inv)
+                    throw Error("a user service can only be installed for the account that asks for it");
+            }
+            owner_id = std::to_string(static_cast<unsigned long>(pw.pw_uid));
+            sp.display += " " + simple::owner_label(owner_id);   // the unit's Description=
+#else
+            owner_id = simple::current_user_sid();
+            // The account's password must come through the private channel, and the account must be the requester's own,
+            // whatever else the arguments say.
+            if (o.password_pipe.empty()) throw Error("--user-service needs the private password channel (--password-pipe)");
+            if (simple::account_sid(o.user) != owner_id) throw Error("the service must run as the account of the user who asks (" + o.user + " is not you)");
+#endif
+            if (!simple::user_service_name_matches_owner(name, owner_id))
+                throw Error("a user service must be named mysync-<account>-<owner code>; '" + name + "' is not");
+            sp.description += " " + simple::owner_label(owner_id);
+        }
+        if (!o.password_pipe.empty()) {
+            // The account's password, from the private channel. Checked BEFORE anything is installed, so a wrong password is
+            // reported at once; the right to log on as a service is granted to exactly this account, only if it lacks it.
+            simple::SecretString pw;
+            std::string perr;
+            if (!simple::receive_password(o.password_pipe, o.password_nonce, &pw, &perr)) {
+                std::cerr << "mysync: " << perr << "\n";
+                return gui::kServiceGenericFailure;
+            }
+            simple::AccountCheck chk = simple::check_service_account(o.user, pw);
+            if (!chk.ok) {
+                std::cerr << "mysync: " << chk.error << "\n";
+                return gui::kServiceConfigError;
+            }
+            if (o.user_service && chk.sid != simple::current_user_sid()) {
+                std::cerr << "mysync: the service must run as the account of the user who asks (" << o.user << " is not you)\n";
+                return gui::kServiceAccessDenied;
+            }
+            if (o.user_service && simple::account_is_administrator(chk.sid)) {
+                std::cerr << "mysync: " << simple::admin_account_refusal(true) << "\n";
+                return gui::kServiceAccessDenied;
+            }
+            std::string gerr = simple::grant_service_logon_right(chk.sid, &right_added);
+            right_sid = chk.sid;
+            if (right_added) right_guard.granted(chk.sid);
+            if (o.user_service && !simple::account_is_administrator(chk.sid))
+                sp.args.insert(sp.args.end(), {"--state-writer", chk.sid});   // ordinary account: its state/ and log/ are its own
+            if (!gerr.empty()) {
+                std::cerr << "mysync: " << gerr << "\n";
+                return gui::kServiceAccessDenied;
+            }
+            {
+                std::string canon = simple::account_name_from_sid(chk.sid);   // DOMAIN\name from the SID, not the typed string
+                if (!canon.empty()) sp.run_as = canon;
+            }
+            sp.run_as_password = pw.reveal();
+            pw.clear();
+        }
+        if (o.user_service && !o.user.empty()) {
+#ifndef _WIN32
+            sp.run_group = simple::primary_group_of_user(o.user);
+            sp.runtime_dir = name;          // /run/<service>/ owned by the user, mode 0700: the control socket is theirs alone
+            sp.runtime_dir_mode = "0700";
+            sp.strict_user = true;
+#endif
+        }
         for (const auto& t : trusted) {
             sp.args.push_back("--trust-writer");
             sp.args.push_back(t);
@@ -493,11 +666,33 @@ int cmd_service_impl(const Opts& o) {
         } else {
             add(l.client.state_dir.empty() ? resolve(l.dir, "state") : l.client.state_dir);
             if (!l.client.log_file.empty()) add(dir_of(l.client.log_file));
-            for (const auto& w : l.client.watches)
+            for (const auto& w : l.client.watches) {
+                if (o.user_service) add(resolve(l.dir, w.path));   // the engine keeps its lock file in <folder>/__sync
                 for (const auto& t : w.targets)
                     if (t.is_local()) add(resolve(l.dir, t.path));
+            }
         }
         ok = service_install(sp, &err);
+        if (!sp.run_as_password.empty()) {
+            secure_wipe(&sp.run_as_password[0], sp.run_as_password.size());
+            sp.run_as_password.clear();
+        }
+        if (right_added && ok) {   // remembered, so that removing the service takes it away again
+            std::string marker = simple::user_service_locations(name).dir + "/.logon-right-added";
+            bool written = false;
+            {
+                std::ofstream mo(marker, std::ios::binary | std::ios::trunc);
+                mo << right_sid;
+                mo.flush();
+                written = static_cast<bool>(mo);
+            }
+            if (!written) {   // without the marker the right could never be taken away: undo the installation instead
+                std::string ignore;
+                service_uninstall(name, &ignore);
+                err = "the service could not be recorded (" + marker + "); the installation was rolled back";
+                ok = false;
+            }
+        }
         if (ok && !o.control_allow.empty()) {
             // Written only now that the service exists; if that fails the installation is undone.
             try {
@@ -514,8 +709,21 @@ int cmd_service_impl(const Opts& o) {
                 ok = false;
             }
         }
+        if (ok) right_guard.release();   // a working service owns the right now (its marker is on disk)
     } else if (act == "uninstall") {
         ok = service_uninstall(name, &err);
+        if (ok) {   // the right we added when the service was installed is taken away with it (never one we did not add)
+            std::string marker = simple::user_service_locations(name).dir + "/.logon-right-added";
+            std::ifstream mf(marker);
+            std::string sid;
+            if (mf >> sid) {
+                std::string rerr = simple::revoke_service_logon_right(sid);
+                if (!rerr.empty()) std::cerr << "mysync: warning: " << rerr << "\n";
+                mf.close();
+                std::error_code mec;
+                fs::remove(fs::u8path(marker), mec);
+            }
+        }
     } else if (act == "start") {
         ok = service_start(name, &err);
     } else {

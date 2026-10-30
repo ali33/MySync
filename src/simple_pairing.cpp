@@ -409,7 +409,10 @@ void PairingManager::deny(uint32_t id) {
         try {
             revoke(key);
         } catch (const std::exception& e) {
+            // The request IS denied (and the key blocked), but the cleanup failed: say so to the operator, with the manual way.
             log_error(std::string("could not make sure a denied computer is not in the allowlist: ") + e.what());
+            throw Error(std::string("the request was denied, but taking the computer out of the allowlist failed (") + e.what() +
+                        "). Remove it by hand: mysync peer remove " + key_to_hex(key));
         }
     }
 }

@@ -113,3 +113,15 @@ Không phụ thuộc wx; cài đặt ở `src/simple_*.cpp` và `src/engine_lock
 
 ## Đợt 7 (chế độ Đơn giản)
 Xem `docs/DESIGN.md`, mục "Đợt 7": danh sách cho phép đường dẫn khi chuyển sang dịch vụ (`--allow-root`), băm đã duyệt (`--expect-hash`), duyệt ghép nguyên tử, và **vì sao không kiểm tiến trình cha của `pkexec`** (`pkexec` exec thẳng chương trình đích; `PKEXEC_UID` chỉ được tin trong tiến trình root, có kiểm chéo — xem `resolve_invoking_uid`).
+
+## Đợt 7b: dịch vụ chạy bằng tài khoản người dùng
+API: `include/mysync/simple/service_account.h` (`SecretString`, `ServiceCredential`, `PasswordChannel`, `receive_password`, `check_service_account`, `grant_service_logon_right`, `user_service_name`), `service_upgrade.h` (`user_service_locations`, `make_real_upgrade_steps(..., account, password)`), `gui/service_ctl.h` (`ServiceRequest::password`, `user_service`, `ServiceAction::SetPassword`, `ServiceState::needs_password_update`), `linkcheck.h`. Mô hình tin cậy, kênh mật khẩu, hai kiểu cài dịch vụ và giới hạn: `docs/DESIGN.md`, mục "Đợt 7b". Dòng lệnh mới: `mysync service install ... --user-service --password-pipe <tên> --password-nonce <hex>`, `mysync service set-password --name N --user ACCT --password-pipe .. --password-nonce ..`, `mysync service migrate-from-user ... --account ACCT`.
+
+## Đợt 7c
+Xem `docs/DESIGN.md`, mục "Đợt 7c". API mới: `ServiceAction::ApplyConfig` (`mysync service apply-config`), `ServiceState::description`, `service_dir_sddl` / `create_service_dir` (Windows) / `install_service_files` (Linux, root), `service_config_path_problem` + `DaemonOptions::config_check` (`mysync run --enforce-paths --allow-root`), `user_service_name(account, owner_id)`, `owner_label`, `current_owner_id`, `account_is_administrator`, `PasswordAttemptLimiter`, `revoke_service_logon_right`, `service_runs_program`, `link_component` (cờ doubt-refuses).
+
+## Đợt 7d
+Xem `docs/DESIGN.md`, mục "Đợt 7d". API mới: `MigrationSummary::account_is_admin`, `data_dir_kind_for_account`, `user_service_name_matches_owner`, `min_login_uid`, `LogonRightGuard`, `PasswordFlow::submit(account, has_password, now_ms)` (giới hạn 5 lần sai / 30 giây, bộ đếm sống qua `begin()`), `DaemonOptions::exclude_self_from_trust` + `state_writers`, `mysync run --state-writer <SID>`, `require_trusted_dir/require_trusted_run(..., include_self)`; khoá chuỗi mới `simple.svc.sum.warn_admin`, `simple.pwd.locked`. `service_config_path_problem` giờ kiểm cả `state_dir` / `log_file` / `key_file` (phải nằm trong thư mục dịch vụ).
+
+## Đợt 7e
+Xem `docs/DESIGN.md`, mục "Đợt 7e". API mới: `admin_account_refusal(bool)`, `account_name_from_sid`, `service_description`; `MigrationSummary::account_is_admin` nay làm `summarize_user_config` trả lời từ chối đầu tiên trong `problems`. GUI: nút chuyển sang dịch vụ bị khoá (kèm tooltip `simple.svc.admin_refused`) với tài khoản quản trị Windows; quay về chế độ cá nhân luôn được. Giới hạn: chưa có engine chạy bằng restricted token.

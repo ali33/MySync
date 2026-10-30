@@ -123,7 +123,7 @@ MainFrame::MainFrame(const std::string& daemon_arg, const std::string& lang_arg,
         else if (host_.has_config()) mode_ = Mode::Simple;
         else mode_ = Mode::Pending;
         if (mode_ == Mode::Simple) {
-            sh_.daemon_name = svc_mode_ ? "mysync-client" : host_.paths().client_control_name;
+            sh_.daemon_name = svc_mode_ ? sh_.get_setting("svc.name", "mysync-client") : host_.paths().client_control_name;
             sh_.cfg_path = host_.paths().client_config;
         }
     }
@@ -253,7 +253,7 @@ void MainFrame::LayoutModes() {
 void MainFrame::EnterSimple() {
     mode_ = Mode::Simple;
     sh_.set_setting("mode", "simple");
-    sh_.daemon_name = svc_mode_ ? "mysync-client" : host_.paths().client_control_name;
+    sh_.daemon_name = svc_mode_ ? sh_.get_setting("svc.name", "mysync-client") : host_.paths().client_control_name;
     if (host_.has_config()) sh_.cfg_path = host_.paths().client_config;
     if (poller_) poller_->SetDaemon(sh_.daemon_name);
     if (t_svc_) t_svc_->OnConfigChanged();
@@ -321,7 +321,7 @@ void MainFrame::EnginesChanged() {
 void MainFrame::SetServiceMode(bool on) {
     svc_mode_ = on;
     sh_.set_setting("svc.mode", on ? "1" : "0");
-    sh_.daemon_name = on ? "mysync-client" : host_.paths().client_control_name;
+    sh_.daemon_name = on ? sh_.get_setting("svc.name", "mysync-client") : host_.paths().client_control_name;
     if (poller_) poller_->SetDaemon(sh_.daemon_name);
     if (t_svc_) t_svc_->OnConfigChanged();
     UpdateTray();

@@ -13,6 +13,7 @@
 
 #include "fileio.h"
 #include "fsutil.h"
+#include "mysync/linkcheck.h"
 #include "mysync/filter.h"
 #include "mysync/hash.h"
 #include "mysync/index.h"
@@ -71,6 +72,9 @@ class LocalTarget : public ITarget {
 public:
     LocalTarget(const TargetConfig& cfg, std::shared_ptr<RateLimiter> lim, const std::string& state_dir)
         : cfg_(cfg), limiter_(std::move(lim)), state_dir_(state_dir) {
+        // Links in any component of the destination root are not followed (checked at every connection of this target).
+        std::string lr = link_refusal_text(cfg_.path);
+        if (!lr.empty()) throw Error("destination " + lr);
         base_ = cfg_.path;
         if (!cfg_.remote_prefix.empty()) base_ = safe_join(cfg_.path, cfg_.remote_prefix).u8string();
         state_ = get_state(base_, state_dir_);

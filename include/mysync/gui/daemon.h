@@ -60,6 +60,14 @@ struct DaemonOptions {
     // Simple mode (`mysync run --user-mode`): the control channel is reachable by the current user only (see
     // IpcServerOptions::user_only).
     bool control_user_only = false;
+    // Client only: extra rule applied every time a configuration is loaded (start and every reload); returns "" or the reason
+    // it is refused. The Simple-mode service uses it for the path allowlist (`mysync run --enforce-paths`).
+    std::function<std::string(const ClientConfig&)> config_check;
+    // Windows Simple-mode service (`--enforce-paths`): the daemon's own account does NOT count as trusted for the configuration
+    // (it is the user; a user-level process could edit what the user can), and `state_writers` (the owner's SID, only when
+    // state/ and log/ are user-writable) are trusted for the state and log folders only.
+    bool exclude_self_from_trust = false;
+    std::vector<std::string> state_writers;
     // Tests only: called at named points of the pairing approval ("after_peer_add", "rollback"); an exception thrown
     // from it simulates a failure there.
     std::function<void(const char* stage)> pair_test_hook;

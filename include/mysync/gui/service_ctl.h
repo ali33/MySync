@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "mysync/simple/service_account.h"
 #include "mysync/util.h"
 
 namespace mysync::gui {
@@ -29,7 +30,12 @@ bool valid_control_allow_entry(const std::string& entry);
 
 // MigrateFromUser: `mysync service migrate-from-user` - copies a per-user configuration (and its key) into the trusted
 // service location (simple mode, see simple/service_upgrade.h). It needs ServiceRequest::user_config and name.
-enum class ServiceAction { Install, Uninstall, Start, Stop, MigrateFromUser };
+// SetPassword (Windows): gives the service a new password for its account after the user changed theirs; the password
+// goes through the private channel of simple/service_account.h, like at install.
+// ApplyConfig: a new configuration for a Windows service that runs as an administrator-capable account. Its folder is
+// writable only by administrators, so a changed configuration is checked (allowlist, hash) and installed by the elevated step
+// (`mysync service apply-config`), exactly like migrate-from-user but keeping the key.
+enum class ServiceAction { Install, Uninstall, Start, Stop, MigrateFromUser, SetPassword, ApplyConfig };
 const char* service_action_name(ServiceAction);  // "install" ...
 
 // Exit codes of `mysync service <action>` (0 = success). Stable: the GUI maps them to messages.
@@ -53,6 +59,10 @@ struct ServiceState {
     bool installed = false;
     bool running = false;
     bool auto_start = false;     // starts at boot
+    std::string description;     // Windows service description / Linux unit Description= (carries the owner label)
+    // Windows: the service stopped with "logon failure" (1069): the account's password changed. The GUI shows how to fix
+    // it and calls run(ServiceAction::SetPassword, ...) with the new password.
+    bool needs_password_update = false;
     std::string detail;          // raw one-liner, e.g. "RUNNING" / "active" ("" when unknown)
     std::string error;           // set when the state could not be determined
 };
@@ -68,6 +78,13 @@ struct ServiceRequest {
     std::string config_path;                  // install: absolute path of the config file
     std::string role;                         // install: "server" | "client" | "" (auto from the config)
     std::string run_as;                       // install: Windows account / Linux user ("" = default)
+    // Windows, Install / SetPassword for a user account: the password (borrowed, not copied; the caller wipes it). It is
+    // NEVER put on a command line: run() hands it to the elevated step through a private pipe.
+    const simple::SecretString* password = nullptr;
+    // Install: the Simple-mode flavour (a service that runs as the user, with its own runtime folder). The system-wide
+    // flavour installed by an administrator with `mysync service install` is not touched by this.
+    bool user_service = false;
+    std::string password_pipe, password_nonce;   // set by run() itself (public so build_args can be tested)
     std::vector<std::string> control_allow;   // install: SIDs / accounts to add to [control] allow (and to the trusted writers)
     std::vector<std::string> trust_writers;   // install: further accounts allowed to change the configuration (--trust-writer)
 };
