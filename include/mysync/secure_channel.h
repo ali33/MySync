@@ -11,12 +11,20 @@
 // then Split() gives one key per direction for the record layer (counter nonce, frames <= 1 MiB).
 // Not thread-safe per direction: at most one sender thread and one receiver thread (state is disjoint).
 #include <functional>
+#include <vector>
 
 #include "mysync/keys.h"
 #include "mysync/net.h"
 #include "mysync/util.h"
 
 namespace mysync {
+
+// The handshake failed because the peer does not answer to the key we pinned / does not allow us (a tag did not verify, or
+// the peer closed the connection at once). Other failures (refused connection, timeout, reset) are plain Error. Both carry
+// the text "authentication failed".
+struct AuthError : Error {
+    using Error::Error;
+};
 
 class SecureChannel {
 public:
@@ -37,6 +45,13 @@ public:
     static SecureChannel server(net::Socket&& s, const KeyPair& self,
                                 const std::function<bool(const PubKey& client_pub)>& is_allowed,
                                 int handshake_timeout_ms = kHandshakeTimeoutMs);
+
+    // Responder holding SEVERAL static keys (server key rotation): the initiator encrypted to one of their public
+    // keys; each is tried with equal work (no early exit), the first that authenticates is used. *matched_key (when
+    // given) receives its index. A client that pinned none of them is refused like any unknown client.
+    static SecureChannel server(net::Socket&& s, const std::vector<const KeyPair*>& selves,
+                                const std::function<bool(const PubKey& client_pub)>& is_allowed,
+                                int handshake_timeout_ms, size_t* matched_key);
 
     SecureChannel() = default;
     ~SecureChannel();

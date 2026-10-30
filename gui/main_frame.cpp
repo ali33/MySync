@@ -4,13 +4,21 @@
 #include "main_frame.h"
 
 #include <wx/aboutdlg.h>
+#include <wx/dnd.h>
+#include <wx/dcclient.h>
+#include <wx/dcmemory.h>
+#include <wx/dcscreen.h>
 
 #include <chrono>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace mysync::gui {
 
 namespace {
-enum { ID_LANG_VI = 3001, ID_LANG_EN, ID_TRAY_OPEN, ID_TRAY_TOGGLE, ID_TRAY_EXIT, ID_SAVE };
+enum { ID_LANG_VI = 3001, ID_LANG_EN, ID_TRAY_OPEN, ID_TRAY_TOGGLE, ID_TRAY_EXIT, ID_SAVE, ID_MODE };
 }
 
 // ---------------------------------------------------------------- khay
@@ -18,9 +26,9 @@ wxMenu* TrayIcon::CreatePopupMenu() {
     auto* m = new wxMenu;
     m->Append(ID_TRAY_OPEN, L("tray.menu.open"));
     bool conn = frame_->IsConnected();
-    m->Append(ID_TRAY_TOGGLE, L(conn ? "tray.menu.pause" : "tray.menu.start"));
+    if (!frame_->SimpleActive()) m->Append(ID_TRAY_TOGGLE, L(conn ? "tray.menu.pause" : "tray.menu.start"));
     m->AppendSeparator();
-    m->Append(ID_TRAY_EXIT, L("tray.menu.exit"));
+    m->Append(ID_TRAY_EXIT, L(frame_->SimpleActive() ? "simple.tray.quit" : "tray.menu.exit"));
     m->Bind(wxEVT_MENU, [this](wxCommandEvent&) { frame_->ShowAndRaise(); }, ID_TRAY_OPEN);
     m->Bind(wxEVT_MENU, [this](wxCommandEvent&) { frame_->ToggleService(); }, ID_TRAY_TOGGLE);
     m->Bind(wxEVT_MENU, [this](wxCommandEvent&) { frame_->Quit(); }, ID_TRAY_EXIT);
@@ -31,8 +39,23 @@ void TrayIcon::SetState(TrayState st, const std::string& tip, int frame) {
     SetIcon(make_state_icon(st, frame, 32), W(tip));
 }
 
+namespace {
+class FolderDrop : public wxFileDropTarget {
+public:
+    explicit FolderDrop(MainFrame* f) : f_(f) {}
+    bool OnDropFiles(wxCoord, wxCoord, const wxArrayString& files) override {
+        f_->DropFolders(files);
+        return true;
+    }
+
+private:
+    MainFrame* f_;
+};
+}  // namespace
+
 // ---------------------------------------------------------------- khung chính
-MainFrame::MainFrame(const std::string& daemon_arg, const std::string& lang_arg)
+MainFrame::MainFrame(const std::string& daemon_arg, const std::string& lang_arg, bool force_advanced,
+                     const std::string& user_dir)
     : wxFrame(nullptr, wxID_ANY, "MySync", wxDefaultPosition, wxSize(1020, 760)), anim_(this) {
     cfg_ = std::make_unique<wxConfig>("MySync-GUI");
     {
@@ -78,6 +101,33 @@ MainFrame::MainFrame(const std::string& daemon_arg, const std::string& lang_arg)
         if (t_keys_) t_keys_->OnConfigChanged();
     };
 
+    {
+        std::string herr;
+        host_ok_ = host_.init(user_dir, &herr);
+        if (!host_ok_) CallAfter([this, herr] { ReportError(BannerLevel::Warning, "simple.init", herr); });
+        svc_mode_ = sh_.get_setting("svc.mode", "0") == "1";
+        sctx_.sh = &sh_;
+        sctx_.host = &host_;
+        sctx_.alive = alive_;
+        sctx_.go_advanced = [this] { EnterAdvanced(true); };
+        sctx_.show_advanced = [this](bool show) {
+            adv_shown_ = show;
+            LayoutModes();
+        };
+        sctx_.engines_changed = [this] { EnginesChanged(); };
+        sctx_.set_service_mode = [this](bool on) { SetServiceMode(on); };
+        sctx_.service_mode = [this] { return svc_mode_; };
+        sctx_.attention = [this] { ShowAndRaise(); };
+        sctx_.quit_all = [this] { QuitAll(); };
+        if (force_advanced || !host_ok_ || sh_.get_setting("mode", "") == "advanced") mode_ = Mode::Advanced;
+        else if (host_.has_config()) mode_ = Mode::Simple;
+        else mode_ = Mode::Pending;
+        if (mode_ == Mode::Simple) {
+            sh_.daemon_name = svc_mode_ ? "mysync-client" : host_.paths().client_control_name;
+            sh_.cfg_path = host_.paths().client_config;
+        }
+    }
+
     SetIcon(make_state_icon(TrayState::Idle, 0, 32));
     BuildMenu();
     root_ = new wxBoxSizer(wxVERTICAL);
@@ -103,7 +153,8 @@ MainFrame::MainFrame(const std::string& daemon_arg, const std::string& lang_arg)
 
     poller_ = std::make_unique<Poller>(this);
     poller_->Start(sh_.daemon_name, 1000);
-
+    SetDropTarget(new FolderDrop(this));
+    if (mode_ == Mode::Simple) StartEngines();
 }
 
 void MainFrame::AutoOpenLast() {
@@ -131,6 +182,7 @@ void MainFrame::BuildMenu() {
     lang->AppendRadioItem(ID_LANG_EN, "English");
     (mysync::gui::lang() == Lang::Vi ? lang->FindItem(ID_LANG_VI) : lang->FindItem(ID_LANG_EN))->Check();
     set->AppendSubMenu(lang, L("menu.language"));
+    mode_item_ = set->Append(ID_MODE, L(mode_ == Mode::Advanced ? "simple.menu.tosimple" : "simple.menu.advanced"));
     auto* help = new wxMenu;
     help->Append(wxID_ABOUT, L("menu.about"));
     mb->Append(file, L("menu.file"));
@@ -140,6 +192,7 @@ void MainFrame::BuildMenu() {
     Bind(wxEVT_MENU, [this](wxCommandEvent&) { SetLanguage(Lang::Vi); }, ID_LANG_VI);
     Bind(wxEVT_MENU, [this](wxCommandEvent&) { SetLanguage(Lang::En); }, ID_LANG_EN);
     Bind(wxEVT_MENU, [this](wxCommandEvent&) { Quit(); }, ID_TRAY_EXIT);
+    Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnModeMenu(); }, ID_MODE);
     Bind(wxEVT_MENU, [this](wxCommandEvent&) { ShowAbout(); }, wxID_ABOUT);
 }
 
@@ -166,8 +219,141 @@ void MainFrame::BuildUi() {
     nb_->AddPage(t_keys_, L("tab.keys"));
     // Mỗi tab một màu nhấn nhẹ ở tiêu đề tab không có trong wxNotebook; giữ nguyên giao diện hệ thống.
     nb_->SetSelection(sel);
+    BuildSimple();
     root_->Add(nb_, 1, wxEXPAND);
+    LayoutModes();
+}
+
+void MainFrame::BuildSimple() {
+    SimplePage keep = SimplePage::Checking;
+    bool had = simple_ != nullptr;
+    if (simple_) {
+        keep = simple_->Page();
+        root_->Detach(simple_);
+        simple_->Destroy();
+        simple_ = nullptr;
+    }
+    simple_ = new SimplePanel(this, sctx_);
+    root_->Insert(1, simple_, 1, wxEXPAND);
+    if (had) {
+        simple_->ShowPage(keep == SimplePage::Wizard ? SimplePage::Status : keep);
+    } else if (mode_ == Mode::Simple) {
+        simple_->ShowPage(host_.has_config() ? SimplePage::Status : SimplePage::QuickStart);
+    }
+}
+
+void MainFrame::LayoutModes() {
+    bool simple = mode_ != Mode::Advanced && simple_;
+    if (simple_) simple_->Show(simple);
+    if (nb_) nb_->Show(!simple || adv_shown_);
+    if (simple_ && simple_->status()) simple_->status()->SetAdvancedShown(adv_shown_);
     Layout();
+}
+
+void MainFrame::EnterSimple() {
+    mode_ = Mode::Simple;
+    sh_.set_setting("mode", "simple");
+    sh_.daemon_name = svc_mode_ ? "mysync-client" : host_.paths().client_control_name;
+    if (host_.has_config()) sh_.cfg_path = host_.paths().client_config;
+    if (poller_) poller_->SetDaemon(sh_.daemon_name);
+    if (t_svc_) t_svc_->OnConfigChanged();
+    if (simple_) simple_->ShowPage(host_.has_config() ? SimplePage::Status : SimplePage::QuickStart);
+    if (mode_item_) mode_item_->SetItemLabel(L("simple.menu.advanced"));
+    if (host_.has_config() && !svc_mode_) StartEngines();
+    LayoutModes();
+    UpdateTray();
+    RunAutoDrive();
+}
+
+void MainFrame::EnterAdvanced(bool remember) {
+    mode_ = Mode::Advanced;
+    if (remember) sh_.set_setting("mode", "advanced");
+    sh_.daemon_name = sh_.get_setting("daemon", "mysync-client");
+    if (poller_) poller_->SetDaemon(sh_.daemon_name);
+    if (mode_item_) mode_item_->SetItemLabel(L("simple.menu.tosimple"));
+    LayoutModes();
+    UpdateTray();
+}
+
+void MainFrame::OnModeMenu() {
+    if (mode_ == Mode::Advanced) {
+        EnterSimple();
+    } else {
+        adv_shown_ = !adv_shown_;
+        LayoutModes();
+    }
+}
+
+void MainFrame::StartEngines() {
+    if (!host_ok_ || svc_mode_ || host_.supervisor_ready()) return;
+    bool recv = sh_.get_setting("recv.on", "0") == "1";
+    SimpleHost* h = &host_;
+    run_async<int>(
+        alive_,
+        [h, recv]() {
+            h->start_supervisor(true, recv);
+            return 0;
+        },
+        [this](bool ok, int&, const std::string& err) {
+            if (!ok) ReportError(BannerLevel::Error, "simple.engine.start", err);
+            else banner_->ClearSource("simple.engine.start");
+            if (poller_) poller_->PollNow();
+            if (simple_ && simple_->status()) simple_->status()->RestoreReceiver();
+        });
+}
+
+void MainFrame::EnginesChanged() {
+    // Sau trình hướng dẫn: cấu hình người dùng đã có, engine client chạy; hướng bộ hỏi trạng thái vào nó.
+    mode_ = Mode::Simple;
+    sh_.set_setting("mode", "simple");
+    svc_mode_ = false;
+    sh_.set_setting("svc.mode", "0");
+    sh_.daemon_name = host_.paths().client_control_name;
+    sh_.cfg_path = host_.paths().client_config;
+    if (poller_) poller_->SetDaemon(sh_.daemon_name);
+    if (sh_.config_changed) sh_.config_changed();
+    if (t_svc_) t_svc_->OnConfigChanged();
+    if (mode_item_) mode_item_->SetItemLabel(L("simple.menu.advanced"));
+    LayoutModes();
+    UpdateTray();
+}
+
+void MainFrame::SetServiceMode(bool on) {
+    svc_mode_ = on;
+    sh_.set_setting("svc.mode", on ? "1" : "0");
+    sh_.daemon_name = on ? "mysync-client" : host_.paths().client_control_name;
+    if (poller_) poller_->SetDaemon(sh_.daemon_name);
+    if (t_svc_) t_svc_->OnConfigChanged();
+    UpdateTray();
+}
+
+void MainFrame::DropFolders(const wxArrayString& files) {
+    if (mode_ != Mode::Simple || !simple_) return;
+    for (const auto& f : files) {
+        if (wxDirExists(f)) {
+            ShowAndRaise();
+            simple_->DropFolder(S(f));
+            return;
+        }
+    }
+    ReportError(BannerLevel::Warning, "simple.drop", tr("simple.drop.notfolder"));
+}
+
+void MainFrame::Screenshot(const std::string& png) {
+    // Chỉ vẽ lại CHÍNH cửa sổ này (không chụp màn hình): cửa sổ khác đè lên không lọt vào ảnh.
+    wxSize sz = GetSize();
+    wxBitmap bmp(sz.x, sz.y);
+    wxMemoryDC mem(bmp);
+    mem.SetBackground(*wxWHITE_BRUSH);
+    mem.Clear();
+#ifdef _WIN32
+    PrintWindow(reinterpret_cast<HWND>(GetHWND()), reinterpret_cast<HDC>(mem.GetHDC()), 0x2 /*PW_RENDERFULLCONTENT*/);
+#else
+    wxClientDC dc(this);
+    mem.Blit(0, 0, sz.x, sz.y, &dc, 0, 0);
+#endif
+    mem.SelectObject(wxNullBitmap);
+    if (!bmp.SaveFile(W(png), wxBITMAP_TYPE_PNG)) ReportError(BannerLevel::Warning, "shot", "cannot write " + png);
 }
 
 void MainFrame::SetLanguage(Lang l) {
@@ -215,7 +401,45 @@ void MainFrame::OnClose(wxCloseEvent& e) {
     Destroy();
 }
 
+void MainFrame::QuitAll() {
+    if (quitting_) return;
+    if (simple_ && simple_->IsSyncing()) {
+        ShowAndRaise();
+        wxMessageDialog q(this, L("simple.quit.confirm"), L("app.title"), wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
+        q.SetYesNoLabels(L("simple.quit.yes"), L("simple.quit.no"));
+        if (q.ShowModal() != wxID_YES) return;
+    }
+    if (t_cfg_ && t_cfg_->HasUnsaved()) {
+        ShowAndRaise();
+        wxMessageDialog q(this, L("cfg.quit.confirm"), L("app.title"), wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
+        if (q.ShowModal() != wxID_YES) return;
+    }
+    if (!host_.supervisor_ready()) {
+        quitting_ = true;
+        Close(true);
+        return;
+    }
+    ShowAndRaise();
+    quitting_ = true;
+    if (simple_ && simple_->status()) simple_->status()->SetQuitting(true);
+    SimpleHost* h = &host_;
+    run_async<int>(
+        alive_,
+        [h]() {
+            h->stop_all();
+            return 0;
+        },
+        [this](bool ok, int&, const std::string& err) {
+            if (!ok) ReportError(BannerLevel::Warning, "simple.quit", err);
+            Close(true);
+        });
+}
+
 void MainFrame::Quit() {
+    if (mode_ == Mode::Simple) {
+        QuitAll();
+        return;
+    }
     if (t_cfg_ && t_cfg_->HasUnsaved()) {
         ShowAndRaise();
         wxMessageDialog q(this, L("cfg.quit.confirm"), L("app.title"), wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
@@ -255,6 +479,26 @@ void MainFrame::OnPoll(wxThreadEvent& e) {
     if (r.daemon != sh_.daemon_name) return;  // kết quả của daemon cũ (vừa đổi): bỏ
     sh_.last = r;
     sh_.have_poll = true;
+    if (mode_ == Mode::Pending) {
+        // Lần mở đầu tiên chưa có cấu hình riêng: nếu đã có dịch vụ nối được thì vào thẳng nâng cao, không thì Bắt đầu nhanh.
+        if (r.connected) EnterAdvanced(false);
+        else EnterSimple();
+        if (mode_ == Mode::Simple) return;  // đổi daemon hỏi: đợi kết quả của daemon mới
+    }
+    if (mode_ == Mode::Simple && simple_) {
+        simple_->OnPoll(r);
+        SimpleStatus cur = simple_->status()->Current();
+        if (cur.error_banner) ReportError(BannerLevel::Error, "simple.engine", cur.headline + (cur.detail.empty() ? "" : "\n" + cur.detail));
+        else banner_->ClearSource("simple.engine");
+        if (r.connected && !r.snap.config_error.empty())
+            banner_->Report(BannerLevel::Warning, "daemon.cfgerr", S(L("status.cfgerr")) + " " + r.snap.config_error);
+        else
+            banner_->ClearSource("daemon.cfgerr");
+        banner_->ClearSource("poll");
+        if (t_status_) t_status_->OnPoll(r);
+        UpdateTray();
+        return;
+    }
     if (r.connected) {
         banner_->ClearSource("poll");
         if (!r.snap.config_error.empty())
@@ -271,6 +515,12 @@ void MainFrame::OnPoll(wxThreadEvent& e) {
 void MainFrame::UpdateTray() {
     TrayState st = compute_tray_state(sh_.have_poll && sh_.last.connected, sh_.last.snap,
                                       sh_.have_poll ? sh_.last.now_ms : 0);
+    std::string simple_tip;
+    if (mode_ == Mode::Simple && simple_ && simple_->Page() == SimplePage::Status && simple_->status()) {
+        SimpleStatus cur = simple_->status()->Current();
+        st = cur.tray;
+        simple_tip = "MySync - " + cur.headline;
+    }
     if (svc_busy_) st = TrayState::Syncing;  // đang chờ thao tác dịch vụ (có thể là hộp thoại xin quyền): icon xoay
     bool changed = st != tray_state_;
     tray_state_ = st;
@@ -282,6 +532,7 @@ void MainFrame::UpdateTray() {
         anim_frame_ = 0;
     }
     std::string tip = svc_busy_ ? "MySync - " + tr("busy.service")
+                                : !simple_tip.empty() ? simple_tip
                                 : tray_tooltip(sh_.have_poll && sh_.last.connected, sh_.last.snap, st);
     if (tray_ && (changed || tip != tray_tip_)) {
         tray_tip_ = tip;

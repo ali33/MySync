@@ -70,8 +70,31 @@ public:
     void open() override {
         close();
         net::init();
-        net::Socket s = net::Socket::connect(tc_.host, tc_.port, 10000);
-        ch_.emplace(SecureChannel::client(std::move(s), self_, tc_.server_key));
+        // Server key rotation: the pinned key first, then `server_key_next` (the order is swapped once the second one
+        // has worked, so a finished rotation costs no refused handshake per connection). Only keys written in the
+        // configuration are ever tried.
+        std::vector<PubKey> keys{tc_.server_key};
+        if (tc_.has_server_key_next) keys.push_back(tc_.server_key_next);
+        if (next_first_ && keys.size() == 2) std::swap(keys[0], keys[1]);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            net::Socket s = net::Socket::connect(tc_.host, tc_.port, 10000);
+            try {
+                ch_.emplace(SecureChannel::client(std::move(s), self_, keys[i]));
+            } catch (const AuthError&) {
+                if (i + 1 == keys.size()) throw;
+                // the server does not answer to this key: try the other pinned one (never after a mere connection failure)
+                log_warn("server " + tc_.host + ":" + std::to_string(tc_.port) + " refused " +
+                         (next_first_ == (i == 0) ? "server_key_next" : "server_key") + ", trying the other pinned key");
+                continue;
+            }
+            bool is_next = tc_.has_server_key_next && keys[i] == tc_.server_key_next;
+            if (is_next != next_first_) {
+                log_info("server " + tc_.host + ":" + std::to_string(tc_.port) + " accepted " +
+                         (is_next ? "server_key_next" : "server_key"));
+            }
+            next_first_ = is_next;
+            break;
+        }
         try {
             ch_->socket().set_timeouts(120000, 120000);
             Hello h;
@@ -183,6 +206,7 @@ private:
     std::shared_ptr<RateLimiter> lim_;
     std::vector<std::string> skip_ext_;
     std::optional<SecureChannel> ch_;
+    bool next_first_ = false;  // server_key_next answered last time: try it first
     uint32_t caps_ = 0;
     uint32_t max_chunk_ = kDefaultMaxChunk;
     std::chrono::steady_clock::time_point last_use_{};

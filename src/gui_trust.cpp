@@ -28,6 +28,19 @@
 namespace fs = std::filesystem;
 
 namespace mysync::gui {
+namespace detail {
+bool parse_numeric_id(const std::string& s, uint32_t& out) {
+    if (s.empty() || s.size() > 10) return false;
+    for (char c : s)
+        if (c < '0' || c > '9') return false;
+    if (s.size() > 1 && s[0] == '0') return false;
+    unsigned long long v = 0;
+    for (char c : s) v = v * 10 + static_cast<unsigned>(c - '0');
+    if (v > 0xFFFFFFFFull) return false;
+    out = static_cast<uint32_t>(v);
+    return true;
+}
+}  // namespace detail
 namespace {
 
 std::string fix_hint(const std::string& path) {
@@ -161,9 +174,11 @@ Trusted parse_trusted(const std::vector<std::string>& entries, bool include_self
     for (const auto& e : entries) {
         try {
             if (e.rfind("uid:", 0) == 0) {
-                t.uids.insert(static_cast<uid_t>(std::stoul(e.substr(4))));
+                uint32_t id = 0;
+                if (detail::parse_numeric_id(e.substr(4), id)) t.uids.insert(static_cast<uid_t>(id));
             } else if (e.rfind("gid:", 0) == 0) {
-                t.gids.insert(static_cast<gid_t>(std::stoul(e.substr(4))));
+                uint32_t id = 0;
+                if (detail::parse_numeric_id(e.substr(4), id)) t.gids.insert(static_cast<gid_t>(id));
             } else if (!e.empty() && e[0] == '@') {
                 struct group gr{}, *res = nullptr;
                 char buf[4096];
@@ -246,6 +261,17 @@ void require_trusted_run(const std::string& config_path, const std::string& stat
         require_trusted_dir(fs::u8path(log_file).parent_path().u8string(), "the log folder", trusted);
 }
 
+std::string effective_client_state_dir(const std::string& state_dir, const std::string& config_path) {
+    if (!state_dir.empty()) return state_dir;
+    return (fs::u8path(config_path).parent_path() / "state").u8string();
+}
+
+std::string effective_server_state_dir(const std::string& state_dir, const std::string& root) {
+    if (!state_dir.empty()) return state_dir;
+    if (root.empty()) return {};
+    return (fs::u8path(root) / "__sync" / "__meta").u8string();
+}
+
 bool need_strict_trust(bool elevated, bool service) { return elevated || service; }
 
 // ------------------------------------------------------------------------------------------ broad principals
@@ -263,6 +289,7 @@ bool broad_name(const std::string& entry) {
         "*", "everyone", "world", "all", "users", "user", "other", "others", "authenticated users", "interactive",
         "network", "anonymous", "anonymous logon", "guests", "guest", "domain users", "domain guests",
         "domain computers", "local", "power users", "console logon", "this organization", "local account",
+        "nogroup", "nobody", "staff",
     };
     for (const char* k : kNames)
         if (n == k) return true;
@@ -289,6 +316,10 @@ bool is_broad_sid(const std::string& sid) {
         "S-1-5-14",      // Remote interactive logon
         "S-1-5-15",      // This organization
         "S-1-5-113",     // Local account
+        "S-1-5-13",      // Terminal Server users
+        "S-1-5-32-555",  // Remote Desktop Users
+        "S-1-5-3",       // Batch
+        "S-1-5-6",       // Service
     };
     for (const char* k : kBroad)
         if (sid == k) return true;
@@ -319,12 +350,20 @@ std::string broad_principal_reason(const std::string& entry) {
     }
 #else
     if (!broad) {
-        if (entry == "gid:100") {
-            broad = true;
+        auto broad_gid = [](uint32_t g) { return g == 100 || g == 65534 || g == 50; };  // users, nogroup, staff
+        if (entry.rfind("gid:", 0) == 0 || entry.rfind("uid:", 0) == 0) {
+            uint32_t id = 0;
+            if (!detail::parse_numeric_id(entry.substr(4), id))
+                return "'" + entry + "' is not a valid numeric id (digits only, no sign, no leading zeros, at most 4294967295)";
+            broad = entry[0] == 'g' ? broad_gid(id) : id == 65534;
         } else if (entry.size() > 1 && entry[0] == '@') {
             struct group gr{}, *res = nullptr;
             char buf[4096];
-            if (::getgrnam_r(entry.c_str() + 1, &gr, buf, sizeof buf, &res) == 0 && res && gr.gr_gid == 100) broad = true;
+            if (::getgrnam_r(entry.c_str() + 1, &gr, buf, sizeof buf, &res) == 0 && res && broad_gid(gr.gr_gid)) broad = true;
+        } else {
+            struct passwd pw{}, *res = nullptr;
+            char buf[4096];
+            if (::getpwnam_r(entry.c_str(), &pw, buf, sizeof buf, &res) == 0 && res && pw.pw_uid == 65534) broad = true;
         }
     }
 #endif
@@ -344,6 +383,10 @@ std::string validate_install_inputs(const std::string& exe, const std::string& c
             std::string r = broad_principal_reason(e);
             if (!r.empty()) return "refusing to install: " + r;
         }
+    if (!run_as.empty()) {
+        std::string r = broad_principal_reason(run_as);
+        if (!r.empty()) return "refusing to install: the service account " + r;
+    }
     // Who may edit the configuration, as the SERVICE will judge it: built-ins, the named entries and its own account.
     // The installing administrator counts only when named (include_self=false).
     std::vector<std::string> trusted = trust_writers;

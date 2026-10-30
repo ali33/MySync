@@ -28,6 +28,7 @@
 #include "mysync/config.h"
 #include "mysync/gui/ipc.h"
 #include "mysync/gui/status.h"
+#include "mysync/peers.h"
 #include "mysync/server.h"
 
 namespace mysync::gui {
@@ -51,11 +52,23 @@ struct DaemonOptions {
     std::vector<std::string> trusted_writers;
     // Two real reloads must be at least this far apart (a no-op reload is free).
     int reload_min_interval_ms = 2000;
+    // Server: how often the peers folder is looked at for changes (a change triggers a reload). 0 = never.
+    int peers_poll_ms = 5000;
+    // Receiver only (`mysync run --allow-pairing`): enables the PAIR_* control ops and the pairing mode of the server
+    // (simple/pairing.h). Approvals edit `config_path` through ConfigEditor and apply it live.
+    bool allow_pairing = false;
+    // Simple mode (`mysync run --user-mode`): the control channel is reachable by the current user only (see
+    // IpcServerOptions::user_only).
+    bool control_user_only = false;
 };
 
 // Same path resolution `mysync run` applies after loading the file (relative key_file / state_dir / log_file /
 // root are made absolute against the config directory).
-ServerConfig load_server_config_resolved(const std::string& path);
+// Server: also merges the peers directory (peers.d, see peers.h) and applies the revocation list. `report` receives
+// what was skipped and why. `trust_writers` non-null = the strict daemon check: the peers directory itself must be
+// writable only by the trusted set (else Error, the whole load is refused) and a peer file that is not is skipped.
+ServerConfig load_server_config_resolved(const std::string& path, PeerLoad* report = nullptr,
+                                         const std::vector<std::string>* trust_writers = nullptr);
 ClientConfig load_client_config_resolved(const std::string& path);
 
 // Owns the IPC server and the dispatch of requests onto status / reload callbacks.
@@ -65,6 +78,10 @@ public:
     using ReloadFn = std::function<ReloadResult()>;
     ControlHost(Role role, DaemonOptions opts, IpcServerOptions ipc, StatusFn status, ReloadFn reload);
     ~ControlHost();
+    // Answers the PAIR_* operations (receiver started with --allow-pairing). Without a handler they get Unsupported.
+    // Set before start().
+    using PairFn = std::function<ControlResponse(const ControlRequest&)>;
+    void set_pair_handler(PairFn fn);
     void start();   // throws Error (the endpoint could not be created)
     void stop();
     const std::string& endpoint() const;
@@ -98,6 +115,9 @@ public:
     void run(std::atomic<bool>& stop);   // constructs Server (throws Error on bind / key problems) and serves
     StatusSnapshot snapshot();
     ReloadResult reload();
+    // True only when the process asked for the pairing mode (DaemonOptions::allow_pairing) AND [server] pairing is
+    // not "off". Whatever enables pairing (control-channel ops, GUI) must consult this: with "off" there is no way in.
+    bool pairing_allowed() const;
 
 private:
     struct Impl;

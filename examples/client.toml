@@ -92,6 +92,9 @@ host = "may-chu.example.com"
 port = 5656
 # Khoá công khai của máy chủ (dòng hex in ra khi chạy keygen trên máy chủ).
 server_key = "0000000000000000000000000000000000000000000000000000000000000000"
+# Xoay khoá máy chủ: khoá công khai MỚI của máy chủ (sau `mysync key rotate --prepare` ở máy chủ). Thử khoá trên
+# trước, rồi khoá này; khoá nào chạy được thì lần sau dùng trước. Xong xoay thì chuyển nó thành server_key và bỏ dòng này.
+# server_key_next = "<khoá công khai mới, 64 hex>"
 # key_file = "khac.key"      # (tuỳ chọn) khoá riêng cho đích này
 # remote_prefix = "hanoi"    # (tuỳ chọn) ghi vào thư mục con này của đích
 enabled = true

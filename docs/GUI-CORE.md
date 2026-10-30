@@ -78,3 +78,35 @@ Mỗi quy tắc chỉ có MỘT cài đặt, được CLI (`main.cpp`), daemon v
 - Phản hồi không khớp token bị từ chối (trừ câu "không giải mã được" token 0 của daemon), phản hồi Ok sai thao tác cũng vậy; phản hồi quá lớn không bao giờ làm kết nối cụt: peer nhận trạng thái Failed.
 - RELOAD: đổi nội dung tệp khoá (kích thước/thời gian sửa) được coi là thay đổi: client khởi lại engine, server báo cần khởi động lại. Đồng hồ giãn cách chỉ chạy SAU khi cấu hình mới qua kiểm. Sửa kẹt giữa `reload_mu` và dừng kênh điều khiển khi engine chết lúc đang có reload.
 - GUI nên đặt thời gian chờ reload >= 15 s (`tab_config.cpp` dùng 20 s) và gọi `ControlClient::trust_server_account` cho dịch vụ chạy bằng `--user` riêng.
+
+## Lõi chế độ Đơn giản (`include/mysync/simple/`, `engine_lock.h`)
+
+Không phụ thuộc wx; cài đặt ở `src/simple_*.cpp` và `src/engine_lock.cpp`, đều trong `mysync_core`. Thiết kế bảo mật của việc ghép máy: xem `docs/DESIGN.md`, mục "Ghép máy bằng mã" và "Chế độ Đơn giản".
+
+| Header | Việc |
+|---|---|
+| `user_paths.h` | `UserPaths` (cấu hình, khoá, state, log của người dùng; tên kênh điều khiển `mysync-user-<id>` / `...-recv`), `ensure_dirs`, `restrict_to_current_user`, `current_user_sid` |
+| `pair_code.h` | mã ghép `MSY1-...` (`encode_pair_code` / `decode_pair_code`), SAS `pair_sas`, Crockford base32 |
+| `pairing.h` | `PairingManager` (bên nhận: chế độ ghép, hàng chờ, giới hạn), `PairingClient` (bên gửi), thông điệp ghép, `clean_display_name`, `safe_pair_prefix` |
+| `user_engine.h` | `Supervisor` (engine con, khởi động lại có giãn cách, báo lỗi), `InstanceLock`, `find_engine_exe` |
+| `autostart.h` | tự chạy khi đăng nhập: `HKCU\...\Run` / `~/.config/autostart/mysync.desktop` |
+| `wizard_model.h` | lựa chọn đời thường → `ClientConfig` an toàn (`validate_wizard`, `build_client_config`, `save_wizard`), cấu hình máy nhận (`ensure_receiver_config`), `ensure_user_key` |
+| `service_upgrade.h` | "chạy cả khi chưa đăng nhập": `upgrade_to_service` / `downgrade_to_user` (có hoàn tác), `run_migrate_from_user`, `service_locations` |
+| `engine_lock.h` | `FileLock` + `<thư mục>/__sync/engine.lock`: khoá hệ điều hành chống hai engine cùng watch một thư mục |
+
+### Thêm vào kênh điều khiển
+
+- `ControlOp` 5..9: `PairModeOn` (arg = số giây, tối đa 600), `PairModeOff`, `PairList` (đồng thời là "lấy mã": trả khoá công khai + cổng + hàng chờ), `PairApprove` / `PairDeny` (arg = id). Phản hồi mang `PairInfo` (khoá CÔNG KHAI, không bao giờ khoá bí mật). Daemon không bật `--allow-pairing` (hoặc cấu hình `pairing = "off"`) trả `Unsupported`.
+- `ControlClient::pair_info / pair_mode / pair_approve / pair_deny`.
+- `IpcServerOptions::user_only` (`mysync run --user-mode`): pipe Windows chỉ cho người dùng hiện tại (không SYSTEM, không Administrators); Linux thư mục 0700, socket 0600; không kèm `allow`.
+- `ServiceAction::MigrateFromUser` + `ServiceRequest::user_config`: chạy `mysync service migrate-from-user --user-config <tệp> --name <tên>` nâng quyền.
+
+### Dòng lệnh mới
+
+`mysync run ... --user-mode` (kênh điều khiển chỉ người dùng) · `--exit-on-stdin-eof` (dừng sạch khi tiến trình cha đóng stdin hoặc chết) · `--allow-pairing` (bên nhận) · `mysync service migrate-from-user --user-config <tệp> [--name N]` (nâng quyền, mã thoát theo `ServiceExit`).
+
+### Sửa ba lỗi Medium của vòng rà soát 4 (F1, F2, F3)
+
+- **F1** `state_dir` trống: engine dùng thư mục mặc định (client `<thư mục cấu hình>/state`, server `<root>/__sync/__meta`) mà trước đây không được kiểm. `effective_client_state_dir` / `effective_server_state_dir` (`gui/trust.h`) cho đúng thư mục đó; `require_trusted_run` của daemon và của `mysync run` nhận chính nó.
+- **F2** trong `mysync run`, khi `need_strict_trust` (quyền cao hoặc `--service`), kiểm tin cậy chạy ngay sau `load_config` và TRƯỚC `setup_log` (không tạo thư mục log, không mở log từ cấu hình chưa tin); `--trust-writer` được kiểm cú pháp và `broad_principal_reason` ngay (lỗi cú pháp, mã 2). Kiểm của nhánh `--once` được gộp vào chỗ này.
+- **F3** (Linux) `gid:N` / `uid:N` được phân tích chặt bằng MỘT hàm (`detail::parse_numeric_id`: chỉ chữ số, không `+`/khoảng trắng/số 0 đầu, ≤ 4294967295) cho cả `parse_trusted` lẫn `broad_principal_reason`, rồi so SỐ; `gid:` 100, 50, 65534 (users, staff, nogroup) và uid 65534 bị coi là nhóm rộng, `nogroup`/`nobody`/`staff` cũng vậy (tên và `@nhóm`); giá trị không phân tích được bị từ chối thẳng. Windows: thêm SID rộng S-1-5-13, S-1-5-32-555, S-1-5-3, S-1-5-6. `broad_principal_reason` còn áp cho `--user` (qua `validate_install_inputs`) và cho `run --trust-writer`.

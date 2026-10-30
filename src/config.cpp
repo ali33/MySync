@@ -458,6 +458,17 @@ void apply_server(const Section& sec, ServerConfig& c) {
     get_num(kv, "port", c.port, 1, 65535);
     get_str(kv, "root", c.root);
     get_str(kv, "key_file", c.key_file);
+    get_str(kv, "key_file_next", c.key_file_next);
+    get_str(kv, "peers_dir", c.peers_dir);
+    {
+        std::string pm = "off";
+        const Entry* e = nullptr;
+        for (const auto& x : sec.entries)
+            if (x.key == "pairing") e = &x;
+        get_str(kv, "pairing", pm);
+        if (e && pm != "off" && pm != "on-demand") fail(e->line, "pairing must be \"off\" or \"on-demand\"");
+        c.pairing = pm == "on-demand" ? PairingMode::OnDemand : PairingMode::Off;
+    }
     get_num(kv, "max_connections", c.max_connections, 1, 100000);
     get_num(kv, "max_bandwidth_kbps", c.max_bandwidth_kbps, 0, INT32_MAX);
     raise_small_bandwidth(c.max_bandwidth_kbps, "[server]");
@@ -504,6 +515,25 @@ void apply_client_acl(const Section& sec, ClientAcl& a) {
     bool has_key = false;
     get_pubkey(kv, "public_key", a.public_key, has_key);
     if (!has_key) fail(sec.line, "[[client]] without 'public_key'");
+    {
+        const Entry* ke = nullptr;
+        for (const auto& x : sec.entries)
+            if (x.key == "public_keys") ke = &x;
+        std::vector<std::string> hexes;
+        get_strs(kv, "public_keys", hexes);
+        for (const auto& h : hexes) {
+            PublicKey k;
+            try {
+                k = parse_public_key_hex(h);
+            } catch (const Error&) {
+                fail(ke ? ke->line : sec.line, "every entry of 'public_keys' must be 64 hexadecimal characters");
+            }
+            if (k == a.public_key || std::find(a.extra_keys.begin(), a.extra_keys.end(), k) != a.extra_keys.end())
+                fail(ke ? ke->line : sec.line, "'public_keys' repeats a key of the same client");
+            a.extra_keys.push_back(k);
+        }
+        if (a.extra_keys.size() > 8) fail(ke ? ke->line : sec.line, "at most 8 extra public_keys per client");
+    }
     std::string access = "rw";
     const Entry* e = nullptr;
     for (const auto& x : sec.entries)
@@ -616,9 +646,10 @@ void apply_target(const Section& sec, TargetConfig& t) {
     get_mode(kv, "dir_mode", t.dir_mode, parse_dir_mode);
     bool has_sk = false;
     get_pubkey(kv, "server_key", t.server_key, has_sk);
+    get_pubkey(kv, "server_key_next", t.server_key_next, t.has_server_key_next);
     kv.finish();
     if (t.is_local()) {
-        for (const char* k : {"host", "port", "key_file", "server_key"})
+        for (const char* k : {"host", "port", "key_file", "server_key", "server_key_next"})
             if (line_of(k))
                 fail(line_of(k), std::string("target has both 'path' and '") + k +
                                      "' (a target is either local or network)");
@@ -628,6 +659,8 @@ void apply_target(const Section& sec, TargetConfig& t) {
         if (line_of("path")) fail(line_of("path"), "target 'path' must not be empty");
         if (t.host.empty()) fail(sec.line, "target needs either 'path' (local) or 'host' (network)");
         if (!has_sk) fail(sec.line, "network target '" + t.host + "' without 'server_key'");
+        if (t.has_server_key_next && t.server_key_next == t.server_key)
+            fail(line_of("server_key_next"), "'server_key_next' equals 'server_key'");
     }
 }
 
@@ -700,16 +733,45 @@ ServerConfig parse_server_config_text(const std::string& text) {
     }
     if (c.root.empty()) throw Error("missing required key 'root'");
     if (c.key_file.empty()) throw Error("missing required key 'key_file'");
-    if (c.clients.empty()) throw Error("at least one [[client]] with a public_key is required");
+    if (c.clients.empty() && c.peers_dir.empty())
+        throw Error("at least one [[client]] with a public_key is required (or set peers_dir)");
+    if (!c.key_file_next.empty() && c.key_file_next == c.key_file) throw Error("key_file_next must differ from key_file");
     std::set<std::string> cn;
     std::set<PublicKey> ck;
     for (const auto& a : c.clients) {
         if (!cn.insert(a.name).second) throw Error("duplicate client name '" + a.name + "'");
         if (!ck.insert(a.public_key).second)
             throw Error("client '" + a.name + "' repeats another client's public_key");
+        for (const auto& k : a.extra_keys)
+            if (!ck.insert(k).second) throw Error("client '" + a.name + "' repeats another client's public_key");
     }
     return c;
 }
+
+ClientAcl parse_peer_file_text(const std::string& text, const std::string& fallback_name) {
+    auto secs = Parser(text).parse();
+    ClientAcl a;
+    bool seen = false;
+    for (const auto& s : secs) {
+        if (!(s.path.empty() || (s.path.size() == 1 && s.path[0] == "client" && s.is_array)) || seen)
+            fail(s.line, "a peers.d file holds exactly one machine as top-level keys (no tables)");
+        seen = true;
+        apply_client_acl(s, a);
+    }
+    if (!seen) throw Error("empty peer file (needs name and public_key)");
+    if (a.name.empty()) a.name = fallback_name;
+    return a;
+}
+
+std::string key_short(const PublicKey& k) { return to_hex(k.data(), 4) + "..."; }
+
+bool acl_has_key(const ClientAcl& a, const PublicKey& k) {
+    bool hit = ct_equal(a.public_key.data(), k.data(), 32);
+    for (const auto& e : a.extra_keys) hit |= ct_equal(e.data(), k.data(), 32);
+    return hit;
+}
+
+const char* pairing_name(PairingMode m) { return m == PairingMode::OnDemand ? "on-demand" : "off"; }
 
 ClientConfig parse_client_config_text(const std::string& text) {
     auto secs = Parser(text).parse();

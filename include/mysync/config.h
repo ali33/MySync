@@ -43,6 +43,10 @@ struct TargetConfig {
     std::string host;
     uint16_t port = 5656;
     PublicKey server_key{};   // pinned server public key (network targets)
+    // Optional second pinned server key for a key rotation (`server_key_next`): tried when the first is refused, the
+    // one that worked is preferred afterwards. Only keys written in the configuration are ever accepted.
+    PublicKey server_key_next{};
+    bool has_server_key_next = false;
     std::string key_file;     // client secret key override; empty = ClientConfig::key_file
     std::string path;         // local destination directory
     std::string remote_prefix;
@@ -72,6 +76,10 @@ struct WatchConfig {
 struct ClientAcl {
     std::string name;
     PublicKey public_key{};
+    // Further keys of the same machine (`public_keys = [...]`): lets a client rotate its key without a gap; the entry
+    // stays ONE peer (same name, access, prefix, limits) whichever of its keys authenticates.
+    std::vector<PublicKey> extra_keys;
+    std::string source;       // "" = the main file; else the peers.d file name (not written to the configuration)
     bool read_only = false;   // access = "ro"
     std::string prefix;       // sub-directory of root this client may see ("" = whole root), no leading/trailing '/'
     uint32_t max_sessions = 4;                              // concurrent sessions of this client (0 = unlimited)
@@ -79,12 +87,23 @@ struct ClientAcl {
     uint32_t max_bandwidth_kbps = 0;  // cap on bytes the server receives + sends for this client, shared by all its connections (0 = none of its own)
 };
 
+// [server] pairing: whether this server may ever enter the code-pairing mode (see gui/daemon.h allow_pairing).
+// "off" (default, services / headless): no path switches it on, not even over the control channel.
+enum class PairingMode { Off, OnDemand };
+
 struct ServerConfig {
     std::string bind = "*";
     uint16_t port = 5656;
     std::string root;
     std::string key_file;     // server secret key (hex, 64 chars)
-    std::vector<ClientAcl> clients;  // [[client]] entries; at least one required
+    // Key rotation (server): a second secret key the server ALSO answers to, so clients may pin either public key
+    // while they are being moved over. Empty = none. Promote = key_file := key_file_next, key_file_next := "".
+    std::string key_file_next;
+    std::vector<ClientAcl> clients;  // [[client]] entries; at least one required unless peers_dir is set
+    // Directory with one <machine>.toml per peer (name, public_key, access, prefix ...), merged after the [[client]]
+    // entries. Empty = <config dir>/peers.d when that directory exists. See peers.h for the merge rules.
+    std::string peers_dir;
+    PairingMode pairing = PairingMode::Off;
     uint32_t max_auth_failures_per_min = 10;  // per source IP
     uint32_t max_connections = 20;
     bool trash = true;
@@ -135,6 +154,15 @@ ServerConfig parse_server_config_text(const std::string& text);
 ClientConfig parse_client_config_text(const std::string& text);
 ServerConfig load_server_config(const std::string& utf8_path);
 ClientConfig load_client_config(const std::string& utf8_path);
+
+// A peers.d file (top level keys of a [[client]]): returns the entry. `fallback_name` names it when `name` is absent
+// (the file's stem). Throws Error with the line number.
+ClientAcl parse_peer_file_text(const std::string& text, const std::string& fallback_name);
+// 64 hex of the key the entry authenticates with, for display: first 8 chars + "..."
+std::string key_short(const PublicKey&);
+// True when `k` is the entry's public_key or one of extra_keys (constant-time per key, no early exit).
+bool acl_has_key(const ClientAcl& a, const PublicKey& k);
+const char* pairing_name(PairingMode);
 
 // Octal permission text ("0640", "640", "0750") -> bits. File modes must not carry any execute bit and must keep
 // owner read+write; directory modes must keep owner rwx. Only the 9 rwx bits are accepted. Throws Error.

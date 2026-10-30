@@ -3,8 +3,11 @@
 // Author: Nguyễn Đức Sơn
 
 #include "mysync/gui/daemon.h"
+#include "mysync/gui/config_io.h"
+#include "mysync/simple/pairing.h"
 
 #include "mysync/gui/trust.h"
+#include "mysync/peers.h"
 
 #include <algorithm>
 #include <cctype>
@@ -97,7 +100,7 @@ void diff_control(Diff& d, bool ea, const std::vector<std::string>& aa, const st
 }
 
 bool same_acl(const ClientAcl& a, const ClientAcl& b) {
-    return a.name == b.name && a.public_key == b.public_key && a.read_only == b.read_only && a.prefix == b.prefix &&
+    return a.name == b.name && a.public_key == b.public_key && a.extra_keys == b.extra_keys && a.read_only == b.read_only && a.prefix == b.prefix &&
            a.max_sessions == b.max_sessions && a.max_write_bytes_per_hour == b.max_write_bytes_per_hour &&
            a.max_bandwidth_kbps == b.max_bandwidth_kbps;
 }
@@ -117,6 +120,10 @@ void diff_clients(Diff& d, const std::vector<ClientAcl>& a, const std::vector<Cl
 }
 
 void diff_server(Diff& d, const ServerConfig& a, const ServerConfig& b) {
+    d.chk("key_file", a.key_file, b.key_file);
+    d.chk("key_file_next", a.key_file_next, b.key_file_next);
+    d.chk("peers_dir", a.peers_dir, b.peers_dir);
+    d.chk_restart("pairing", a.pairing, b.pairing);
     d.chk("max_connections", a.max_connections, b.max_connections);
     d.chk("max_auth_failures_per_min", a.max_auth_failures_per_min, b.max_auth_failures_per_min);
     d.chk("trash", a.trash, b.trash);
@@ -136,7 +143,8 @@ void diff_server(Diff& d, const ServerConfig& a, const ServerConfig& b) {
 }
 
 bool same_target(const TargetConfig& a, const TargetConfig& b) {
-    return a.host == b.host && a.port == b.port && a.server_key == b.server_key && a.key_file == b.key_file &&
+    return a.host == b.host && a.port == b.port && a.server_key == b.server_key && a.has_server_key_next == b.has_server_key_next &&
+           (!a.has_server_key_next || a.server_key_next == b.server_key_next) && a.key_file == b.key_file &&
            a.path == b.path && a.remote_prefix == b.remote_prefix && a.enabled == b.enabled &&
            a.file_mode == b.file_mode && a.dir_mode == b.dir_mode;
 }
@@ -205,10 +213,18 @@ std::string summary(const Diff& d) {
     return s;
 }
 
+std::string trust_state_dir(const ClientConfig& c, const DaemonOptions& o) {
+    return effective_client_state_dir(c.state_dir, o.config_path);
+}
+std::string trust_state_dir(const ServerConfig& c, const DaemonOptions& o) {
+    return effective_server_state_dir(c.state_dir, c.root);
+}
+
 template <class C>
 void check_trust(const C& c, const DaemonOptions& o) {
     if (!o.enforce_config_trust) return;
-    require_trusted_run(o.config_path, c.state_dir, c.log_file, o.trusted_writers);
+    // The DEFAULT state folder counts too (state_dir empty): it is where the engine writes its indexes.
+    require_trusted_run(o.config_path, trust_state_dir(c, o), c.log_file, o.trusted_writers);
 }
 
 // "path:size:mtime" of every key file a configuration names: a rotated key is a change even when the path is not.
@@ -226,7 +242,7 @@ std::string stamp_of(const std::string& p) {
 
 template <>
 std::string key_stamp<ServerConfig>(const ServerConfig& c) {
-    return stamp_of(c.key_file);
+    return stamp_of(c.key_file) + stamp_of(c.key_file_next);
 }
 
 template <>
@@ -272,14 +288,35 @@ void clear_recent_log_errors() {
     ring().q.clear();
 }
 
-ServerConfig load_server_config_resolved(const std::string& path) {
+ServerConfig load_server_config_resolved(const std::string& path, PeerLoad* report,
+                                         const std::vector<std::string>* trust_writers) {
     std::string p = abs_of(path);
     std::string dir = fs::u8path(p).parent_path().u8string();
     ServerConfig c = load_server_config(p);
     c.root = resolve_in(dir, c.root);
     c.key_file = resolve_in(dir, c.key_file);
+    c.key_file_next = resolve_in(dir, c.key_file_next);
     c.state_dir = resolve_in(dir, c.state_dir);
     c.log_file = resolve_in(dir, c.log_file);
+    if (trust_writers) {
+        // The peers folder decides who may connect: it is held to the same standard as the configuration folder.
+        std::string pd = peers_dir_path(c, dir);
+        if (!pd.empty()) require_trusted_dir(pd, "peers_dir", *trust_writers);
+        // the revocation list too: whoever can edit it can re-admit a revoked machine by deleting a line
+        std::string rl = revoked_list_path(dir);
+        std::error_code ec;
+        if (fs::exists(fs::u8path(rl), ec)) {
+            std::string why = untrusted_writer_reason(rl, *trust_writers);
+            if (!why.empty()) throw Error("refusing to trust the revocation list " + rl + ": " + why);
+        }
+    }
+    std::function<std::string(const std::string&)> check;
+    if (trust_writers) {
+        std::vector<std::string> w = *trust_writers;
+        check = [w](const std::string& f) { return untrusted_writer_reason(f, w); };
+    }
+    PeerLoad pl = load_peers(c, dir, check);
+    if (report) *report = std::move(pl);
     return c;
 }
 
@@ -300,6 +337,7 @@ struct ControlHost::Impl {
     IpcServerOptions ipc_opts;
     StatusFn status;
     ReloadFn reload;
+    PairFn pair;
     std::unique_ptr<IpcServer> server;
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
     std::mutex m;
@@ -345,6 +383,20 @@ struct ControlHost::Impl {
         case ControlOp::GetRecentErrors:
             r.errors = recent_log_errors(q.arg == 0 ? 50 : std::min<size_t>(q.arg, kMaxErrorsReturned));
             break;
+        case ControlOp::PairModeOn:
+        case ControlOp::PairModeOff:
+        case ControlOp::PairList:
+        case ControlOp::PairApprove:
+        case ControlOp::PairDeny:
+            if (!pair) {
+                r.status = ControlStatus::Unsupported;
+                r.error = "pairing is not available on this daemon";
+            } else {
+                r = pair(q);
+                r.op = q.op;
+                r.token = q.token;
+            }
+            break;
         }
         return r;
     }
@@ -362,8 +414,11 @@ ControlHost::ControlHost(Role role, DaemonOptions opts, IpcServerOptions ipc, St
 
 ControlHost::~ControlHost() { stop(); }
 
+void ControlHost::set_pair_handler(PairFn fn) { p_->pair = std::move(fn); }
+
 void ControlHost::start() {
     Impl* im = p_.get();
+    im->ipc_opts.user_only = im->opts.control_user_only;
     im->server = std::make_unique<IpcServer>(im->ipc_opts, [im](const ControlRequest& q) { return im->handle(q); });
     im->server->start();
     log_info("control channel on " + im->server->endpoint());
@@ -595,27 +650,161 @@ struct ServerDaemon::Impl {
     std::unique_ptr<ControlHost> host;
 
     StatusSnapshot snapshot() {
-        std::lock_guard<std::mutex> lk(mu);
         StatusSnapshot s;
-        if (server) s = server->snapshot();
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            if (server) s = server->snapshot();
+        }
         s.role = Role::Server;
+        std::lock_guard<std::mutex> pl(info_mu);
+        // what is really in effect: the process asked for it AND the (reloaded) configuration still allows it
+        s.pairing = opts.allow_pairing && cfg_pairing != PairingMode::Off ? "on-demand" : "off";
+        s.peer_file_errors = static_cast<uint32_t>(peers.bad);
+        s.warnings = peers.warnings;
+        if (rotation_under_way) s.warnings.push_back("server key rotation under way: key_file_next is set");
         return s;
     }
 
     ReloadGate gate;
     std::string key_stamp_running;
+    std::mutex info_mu;  // guards peers / cfg_pairing / rotation_under_way (read by snapshot())
+    PeerLoad peers;
+    PairingMode cfg_pairing = PairingMode::Off;
+    bool rotation_under_way = false;
+    void note_config(const ServerConfig& c, const PeerLoad& pl) {
+        std::lock_guard<std::mutex> lk(info_mu);
+        peers = pl;
+        cfg_pairing = c.pairing;
+        rotation_under_way = !c.key_file_next.empty();
+    }
+
+    // ---- pairing by code (simple/pairing.h): runs on the thread of whoever calls approve (an IPC worker)
+    // Adds the machine to the allowlist of THIS configuration file (ConfigEditor: atomic, .bak) and applies it at once
+    // (Server::apply_config), bypassing the reload spacing: the operator just clicked "Approve".
+    bool pairing_configured() {
+        std::lock_guard<std::mutex> lk(info_mu);
+        return cfg_pairing != PairingMode::Off;
+    }
+
+    void close_pairing_if_off() {
+        if (!opts.allow_pairing || pairing_configured()) return;
+        std::lock_guard<std::mutex> lk(mu);
+        if (server) server->pairing().disable();
+    }
+
+    std::string pair_approve(const std::string& name, const PubKey& key) {
+        std::lock_guard<std::mutex> rl(reload_mu);
+        if (!pairing_configured()) throw Error("pairing is switched off in the configuration ([server] pairing = \"off\")");
+        if (opts.config_path.empty()) throw Error("pairing needs a configuration file");
+        std::set<std::string> prefixes, names;
+        for (const ClientAcl& c : cfg.clients) {  // the running configuration also holds the peers.d entries
+            prefixes.insert(c.prefix);
+            names.insert(c.name);
+            PublicKey k = key;
+            if (acl_has_key(c, k)) throw Error("this computer is already paired");
+        }
+        std::string display = name;
+        for (int n = 2; names.count(display) && n < 1000; ++n) display = name + " (" + std::to_string(n) + ")";
+        // A folder that already exists may hold another machine's files: never hand it over.
+        std::string prefix = simple::safe_pair_prefix(name, prefixes);
+        for (int i = 0; i < 1000; ++i) {
+            std::error_code ec;
+            if (!fs::exists(fs::u8path(cfg.root) / fs::u8path(prefix), ec)) break;
+            prefixes.insert(prefix);
+            prefix = simple::safe_pair_prefix(name, prefixes);
+        }
+        // The one place peers are written (peers.h): `mysync peer list/remove` sees a machine paired by code too.
+        PeerSpec spec;
+        spec.name = display;
+        spec.key = key;
+        spec.read_only = false;  // "rw"
+        spec.prefix = prefix;
+        peer_add(opts.config_path, spec);
+        PeerLoad pl;
+        ServerConfig n = load_server_config_resolved(opts.config_path, &pl,
+                                                     opts.enforce_config_trust ? &opts.trusted_writers : nullptr);
+        check_trust(n, opts);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            if (!server) throw Error("the server is not running");
+            server->apply_config(n);
+        }
+        cfg = n;
+        note_config(n, pl);
+        log_info("paired machine '" + display + "' added with folder '" + prefix + "'");
+        return prefix;
+    }
+
+    ControlResponse pair_op(Server& srv, const ControlRequest& q) {
+        ControlResponse r;
+        simple::PairingManager& pm = srv.pairing();
+        if (!pairing_configured()) {  // checked on EVERY request: a reload may have switched it off meanwhile
+            pm.disable();
+            r.status = ControlStatus::Unsupported;
+            r.error = "pairing is switched off in the configuration ([server] pairing = \"off\")";
+            return r;
+        }
+        try {
+            switch (q.op) {
+            case ControlOp::PairModeOn:
+            {
+                simple::PairToken tok = pm.enable(q.arg == 0 ? simple::kPairWindowSeconds : int(std::min<uint32_t>(q.arg, simple::kPairWindowSeconds)));
+                r.pair.token_hex = to_hex(tok.data(), tok.size());
+                secure_wipe(tok.data(), tok.size());
+            }
+                log_info("pairing mode switched on");
+                break;
+            case ControlOp::PairModeOff:
+                pm.disable();
+                log_info("pairing mode switched off");
+                break;
+            case ControlOp::PairApprove:
+                r.pair.message = pm.approve(q.arg);
+                break;
+            case ControlOp::PairDeny:
+                pm.deny(q.arg);
+                break;
+            default:
+                break;  // PairList: just the state below
+            }
+        } catch (const Error& e) {
+            r.status = ControlStatus::Failed;
+            r.error = e.what();
+        }
+        PairInfo& p = r.pair;
+        p.available = true;
+        p.mode_on = pm.enabled();
+        p.seconds_left = static_cast<uint32_t>(pm.seconds_left());
+        p.public_hex = key_to_hex(srv.public_key());
+        p.port = srv.port();
+        for (const simple::PendingPair& w : pm.pending()) {
+            PairPendingInfo i;
+            i.id = w.id;
+            i.name = w.name;
+            i.sas = w.sas;
+            i.ip = w.ip;
+            i.seconds_left = static_cast<uint32_t>(w.seconds_left);
+            p.pending.push_back(i);
+        }
+        return r;
+    }
 
     ReloadResult reload() {
         std::lock_guard<std::mutex> rl(reload_mu);
         try {
-            ServerConfig n = load_server_config_resolved(opts.config_path);
+            PeerLoad pl;
+
+            ServerConfig n = load_server_config_resolved(opts.config_path, &pl,
+                                                         opts.enforce_config_trust ? &opts.trusted_writers : nullptr);
             check_trust(n, opts);
             Diff d;
             diff_server(d, cfg, n);
-            if (key_stamp(n) != key_stamp_running) d.restart.push_back("key_file contents (restart needed)");
-            bool structural = n.bind != cfg.bind || n.port != cfg.port || n.root != cfg.root || n.key_file != cfg.key_file ||
-                              n.state_dir != cfg.state_dir;
+            std::string new_stamp = key_stamp(n);
+            if (new_stamp != key_stamp_running) d.applied.push_back("server key file(s) read again");
+            bool structural = n.bind != cfg.bind || n.port != cfg.port || n.root != cfg.root || n.state_dir != cfg.state_dir;
             if (d.applied.empty() && !structural) {
+                note_config(n, pl);  // a peer file that went bad / came back changes the report, not the policy
+                close_pairing_if_off();  // (pairing "off" is a restart-only setting, but it must still stop an open window)
                 log_info("reload: configuration unchanged");
                 return make_result(true, summary(d), &d);
             }
@@ -628,11 +817,40 @@ struct ServerDaemon::Impl {
             gate.stamp();
             apply_logging(n.log_level, n.log_file);
             cfg = n;
+            key_stamp_running = new_stamp;
+            note_config(n, pl);
+            close_pairing_if_off();  // switched off by this reload: close it now
             log_info("configuration reloaded from " + opts.config_path);
             return make_result(true, summary(d), &d);
         } catch (const std::exception& e) {
             log_warn(std::string("reload refused, keeping the running configuration: ") + e.what());
             return make_result(false, e.what(), nullptr);
+        }
+    }
+
+    // Looks at the peers folder (and the revocation list) every few seconds; a change reloads the configuration, so a
+    // peer added / removed by a script or a configuration-management tool takes effect without anyone calling reload.
+    void watch_peers(std::atomic<bool>& stop, std::atomic<bool>& done) {
+        std::string cdir = opts.config_path.empty() ? dir : fs::u8path(opts.config_path).parent_path().u8string();
+        auto fp = [&] {
+            ServerConfig c;
+            {
+                std::lock_guard<std::mutex> rl(reload_mu);
+                c.peers_dir = cfg.peers_dir;
+            }
+            return peers_fingerprint(c, cdir);
+        };
+        std::string last = fp();
+        while (!stop.load() && !done.load()) {
+            for (int i = 0; i < opts.peers_poll_ms / 100 && !stop.load() && !done.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (stop.load() || done.load()) break;
+            std::string now = fp();
+            if (now == last) continue;
+            ReloadResult rr = reload();
+            // "too quickly" is the only refusal worth retrying on the same fingerprint
+            if (rr.ok || rr.message.find("too quickly") == std::string::npos) last = now;
+            if (rr.ok) log_info("peers folder changed: " + rr.message);
         }
     }
 };
@@ -642,6 +860,13 @@ ServerDaemon::ServerDaemon(ServerConfig cfg, std::string config_dir, DaemonOptio
     p_->dir = std::move(config_dir);
     p_->opts = std::move(opts);
     if (p_->opts.service_name.empty()) p_->opts.service_name = "mysync-server";
+    p_->cfg_pairing = p_->cfg.pairing;
+    p_->rotation_under_way = !p_->cfg.key_file_next.empty();
+    // [server] pairing = "off" (the default) closes every way into the pairing mode, the control channel included.
+    if (p_->opts.allow_pairing && p_->cfg.pairing == PairingMode::Off) {
+        log_warn("pairing was requested but [server] pairing = \"off\": the pairing mode stays unavailable");
+        p_->opts.allow_pairing = false;
+    }
 }
 
 ServerDaemon::~ServerDaemon() {
@@ -649,14 +874,27 @@ ServerDaemon::~ServerDaemon() {
 }
 
 StatusSnapshot ServerDaemon::snapshot() { return p_->snapshot(); }
+bool ServerDaemon::pairing_allowed() const { return p_->opts.allow_pairing; }  // already cleared in the constructor when [server] pairing = "off"
 ReloadResult ServerDaemon::reload() { return p_->reload(); }
 
 void ServerDaemon::run(std::atomic<bool>& stop) {
     Impl& im = *p_;
     install_error_tap();
     check_trust(im.cfg, im.opts);  // throws: an untrusted configuration stops the daemon
+    if (!im.opts.config_path.empty()) {
+        // The report of what the first load skipped (status, log file). With the strict trust check on, the
+        // configuration handed in may have been merged without it: the freshly loaded, vetted one replaces it.
+        PeerLoad pl;
+        ServerConfig fresh = load_server_config_resolved(im.opts.config_path, &pl,
+                                                         im.opts.enforce_config_trust ? &im.opts.trusted_writers : nullptr);
+        if (im.opts.enforce_config_trust) im.cfg = fresh;
+        else im.cfg.clients = fresh.clients;  // peers.d may have changed since the caller loaded the file
+        im.note_config(im.cfg, pl);
+    }
     im.key_stamp_running = key_stamp(im.cfg);
     Server srv(im.cfg);
+    if (im.opts.allow_pairing)
+        srv.pairing().set_approve_handler([&im](const std::string& n, const PubKey& k) { return im.pair_approve(n, k); });
     log_info("MySync server " + im.opts.version + " listening on " + im.cfg.bind + ":" + std::to_string(srv.port()) +
              ", root " + im.cfg.root + ", public key " + key_to_hex(srv.public_key()));
     {
@@ -673,12 +911,26 @@ void ServerDaemon::run(std::atomic<bool>& stop) {
                     return s;
                 },
                 [&im] { return im.reload(); });
+            if (im.opts.allow_pairing)
+                im.host->set_pair_handler([&im, &srv](const ControlRequest& q) { return im.pair_op(srv, q); });
             im.host->start();
         } catch (const std::exception& e) {
             log_error(std::string("control channel unavailable (the GUI cannot manage this server): ") + e.what());
             im.host.reset();
         }
     }
+    std::atomic<bool> watch_done{false};
+    std::thread peers_watcher;
+    if (im.opts.peers_poll_ms > 0 && !im.opts.config_path.empty())
+        peers_watcher = std::thread([&im, &stop, &watch_done] { im.watch_peers(stop, watch_done); });
+    struct Join {
+        std::atomic<bool>& done;
+        std::thread& th;
+        ~Join() {
+            done = true;
+            if (th.joinable()) th.join();
+        }
+    } join_watcher{watch_done, peers_watcher};
     try {
         srv.run(stop);
     } catch (...) {

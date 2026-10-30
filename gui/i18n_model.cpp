@@ -18,6 +18,7 @@ struct Entry {
 const Entry kTable[] = {
 #include "i18n_strings.inc"
 #include "i18n_strings_ui.inc"
+#include "i18n_strings_simple.inc"
 };
 
 std::atomic<int> g_lang{0};
@@ -71,6 +72,12 @@ std::string trf(const char* key, const std::vector<std::string>& args) {
 
 size_t i18n_count() { return sizeof(kTable) / sizeof(kTable[0]); }
 bool i18n_has(const char* key) { return index().count(key) != 0; }
+
+std::vector<std::string> i18n_keys() {
+    std::vector<std::string> k;
+    for (const auto& e : kTable) k.push_back(e.key);
+    return k;
+}
 
 std::vector<std::string> i18n_problems() {
     std::vector<std::string> p;

@@ -20,6 +20,7 @@
 #include <unordered_set>
 
 #include "fsutil.h"
+#include "mysync/engine_lock.h"
 #include "mysync/filter.h"
 #include "mysync/gui/status.h"
 #include "mysync/hash.h"
@@ -115,7 +116,44 @@ public:
         : w_(w), root_(std::move(root)), index_file_(std::move(index_file)), filter_(w.filter), global_(global) {
         cache_.load(index_file_);
     }
-    ~WatchCtx() { stop(); }
+    ~WatchCtx() {
+        stop();
+        lock_.reset();  // after every thread of this watch ended
+    }
+
+    // One engine per folder: <root>/__sync/engine.lock (OS lock, released by the system if we die). Returns false and
+    // sets blocked_message() when another process (maybe a service) holds it. The folder must exist (it is never
+    // created here); the lock is kept until this object dies.
+    bool acquire_lock() {
+        if (has_lock()) return true;
+        std::string holder, msg;
+        try {
+            lock_ = FileLock::try_acquire(engine_lock_path_for_folder(root_), &holder);
+            if (!lock_) msg = engine_lock_busy_message(root_, holder);
+        } catch (const LockNotPossible& e) {
+            // The folder is read-only for us (typically a read-only source): that is not "somebody else owns it".
+            // Keep working as before, but say that exclusivity is not guaranteed.
+            lock_skipped_ = true;
+            log_warn("[" + w_.name + "] cannot take the folder lock of " + root_ + " (" + e.what() +
+                     "): continuing without protection against a second engine");
+        } catch (const std::exception& e) {
+            // Anything else (a link where the lock should be, a folder named engine.lock, an I/O error): exclusivity cannot
+            // be proven on a folder we can write, so this engine does NOT touch the folder.
+            msg = std::string("cannot take the folder lock of ") + root_ + ": " + e.what();
+        }
+        std::lock_guard<std::mutex> lk(block_mu_);
+        block_msg_ = msg;
+        return msg.empty();
+    }
+    bool has_lock() const { return lock_ != nullptr || lock_skipped_; }
+    bool blocked() const {
+        std::lock_guard<std::mutex> lk(block_mu_);
+        return !block_msg_.empty();
+    }
+    std::string blocked_message() const {
+        std::lock_guard<std::mutex> lk(block_mu_);
+        return block_msg_;
+    }
 
     const WatchConfig& cfg() const { return w_; }
     const std::string& root() const { return root_; }
@@ -227,6 +265,10 @@ private:
 
     std::unique_ptr<Watcher> watcher_;
     std::unique_ptr<Scheduler> sched_;
+    std::unique_ptr<FileLock> lock_;
+    bool lock_skipped_ = false;
+    mutable std::mutex block_mu_;
+    std::string block_msg_;
 };
 
 // -------------------------------------------------------------------------------------- one (watch, target) pair
@@ -323,12 +365,18 @@ public:
             s.queued = q + renames_.size();
             s.last_error = last_error_;
             s.last_error_unix_ms = last_error_ms_;
+            s.last_ok_unix_ms = last_ok_ms_;
             s.state = fail_state_ == 2   ? gui::TargetState::Disconnected
                       : fail_state_ == 1 ? gui::TargetState::Error
                       : idle_locked()    ? gui::TargetState::Idle
                                          : gui::TargetState::Syncing;
         }
         s.tx_bps = tx_meter_.update(st.bytes);
+        if (watch_.blocked()) {  // another process owns this folder: nothing is synchronised from here
+            s.state = gui::TargetState::Error;
+            s.last_error = watch_.blocked_message();
+            s.last_error_unix_ms = now_unix_ns() / 1000000;
+        }
         return s;
     }
 
@@ -575,6 +623,7 @@ private:
     }
     void note_success(int clears) {  // a connection (2) or a file (1) went well: that kind of failure is over
         std::lock_guard<std::mutex> lk(mu_);
+        last_ok_ms_ = now_unix_ns() / 1000000;
         if (fail_state_ != 0 && fail_state_ <= clears) fail_state_ = 0;
     }
 
@@ -605,6 +654,7 @@ private:
                     std::lock_guard<std::mutex> lk(mu_);
                     reconciling_ = false;
                     reconcile_done_ = true;
+                    last_ok_ms_ = now_unix_ns() / 1000000;
                     if (fail_state_ == 2) fail_state_ = 0;
                 }
                 cv_.notify_all();
@@ -879,6 +929,7 @@ private:
     gui::RateMeter tx_meter_;
     std::string last_error_;       // guarded by mu_
     int64_t last_error_ms_ = 0;
+    int64_t last_ok_ms_ = 0;       // guarded by mu_: a connection or a file went through
     int fail_state_ = 0;           // 0 ok, 1 file failures, 2 target unreachable
 
     std::mutex mu_;
@@ -1008,7 +1059,7 @@ void WatchCtx::start_watching() {
 }
 
 void WatchCtx::start_scheduler() {
-    if (w_.schedule_at.empty() && w_.schedule_interval_s == 0) return;
+    if (sched_ || (w_.schedule_at.empty() && w_.schedule_interval_s == 0)) return;
     SchedulerOptions so;
     so.times = w_.schedule_at;
     so.interval_s = static_cast<int>(w_.schedule_interval_s);
@@ -1179,6 +1230,17 @@ bool SyncEngine::idle() const {
 void SyncEngine::start_watchers(bool first) {
     for (auto& w : p_->watches) {
         if (w->watching()) continue;
+        // One engine per folder. A folder that does not exist yet is not locked (and never created): the watcher
+        // reports it as before and the lock is taken on a later retry.
+        std::error_code ec;
+        if (!w->has_lock() && fs::is_directory(fs::u8path(w->root()), ec)) {
+            bool was_blocked = w->blocked();
+            if (!w->acquire_lock()) {
+                if (!was_blocked) log_error("[" + w->name() + "] " + w->blocked_message() + " (not synchronised from here; retrying)");
+                continue;
+            }
+            if (was_blocked) log_info("[" + w->name() + "] the folder is free now: starting");
+        }
         try {
             w->start_watching();
             log_info("[" + w->name() + "] watching " + w->root());
@@ -1196,15 +1258,21 @@ void SyncEngine::run(std::atomic<bool>& stop) {
              " target(s), state in " + p_->state_dir);
     // Watchers first, so no change can fall between the initial scan and the start of watching.
     start_watchers(true);
-    for (auto& w : p_->watches) w->start_scheduler();
-    for (auto& r : p_->runners) {
-        // Initial reconcile when start_sync is on (the periodic safety scan of the watcher covers the other case).
-        bool init = true;
-        for (auto& w : p_->watches)
-            for (TargetRunner* tr : w->runners())
-                if (tr == r.get()) init = w->cfg().start_sync;
-        r->start(init);
-    }
+    // Watches whose folder is owned by another process stay idle (and are started as soon as the lock is free).
+    std::set<TargetRunner*> started;
+    auto start_ready = [&] {
+        for (auto& w : p_->watches) {
+            if (w->blocked()) continue;
+            w->start_scheduler();
+            for (TargetRunner* tr : w->runners()) {
+                if (started.count(tr)) continue;
+                // Initial reconcile when start_sync is on (the periodic safety scan of the watcher covers the other case).
+                tr->start(w->cfg().start_sync);
+                started.insert(tr);
+            }
+        }
+    };
+    start_ready();
     auto last_retry = Clock::now();
     auto last_save = Clock::now();
     while (!stop.load()) {
@@ -1213,6 +1281,7 @@ void SyncEngine::run(std::atomic<bool>& stop) {
         if (now - last_retry >= std::chrono::seconds(5)) {
             last_retry = now;
             start_watchers(false);
+            start_ready();
         }
         if (now - last_save >= std::chrono::minutes(5)) {
             last_save = now;
@@ -1227,6 +1296,15 @@ void SyncEngine::run(std::atomic<bool>& stop) {
 void SyncEngine::sync_once(std::atomic<bool>& stop) {
     p_->once = true;
     p_->build();
+    // One engine per folder: a folder owned by another process (the service, another GUI) is an error, not a wait.
+    for (auto& w : p_->watches) {
+        std::error_code ec;
+        if (fs::is_directory(fs::u8path(w->root()), ec) && !w->acquire_lock()) {
+            std::string msg = "[" + w->name() + "] " + w->blocked_message();
+            p_->shutdown();
+            throw Error(msg);
+        }
+    }
     for (auto& r : p_->runners) r->start(true);
     for (;;) {
         if (stop.load()) break;

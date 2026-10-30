@@ -235,6 +235,12 @@ public:
     // Moves `p` (the destination path of `rel`) to <dest>/__sync/__trash/<UTC timestamp>/<rel> by rename and returns
     // the new location. Throws Error.
     fs::path move_to_trash(const std::string& rel, const fs::path& p) {
+        {   // a `__sync` (or `__trash`) that is a link would send the old data wherever it points
+            for (const fs::path& q : {fs::u8path(base_) / "__sync", fs::u8path(base_) / "__sync" / "__trash"}) {
+                fsutil::FsStat si = fsutil::stat_path(q);
+                if (si.ok && (si.is_link || !si.is_dir)) throw Error("refusing the trash: '" + q.u8string() + "' is a link or not a folder");
+            }
+        }
         fs::path trash_root = fs::u8path(base_) / "__sync" / "__trash";
         fs::path stamp_dir = trash_root / fs::u8path(utc_stamp());
         std::error_code ec;

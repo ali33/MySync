@@ -35,3 +35,5 @@ Bản quyền (C) 2026 META.vn · Tác giả: Nguyễn Đức Sơn · GPL-2.0-or
 | FingerPrint (vân tay máy bằng WMI+MD5) | Bỏ | Chỉ dùng cho nhận dạng/giấy phép máy cũ; MD5 yếu; thay bằng xác thực khoá. (Không có yêu cầu nghiệp vụ nào được ghi nhận cho nó.) |
 | PipeStream, TimeoutHelper, StackQueue, TimeTask, TaskScheduler | Đổi | Thay bằng hàng đợi/luồng chuẩn C++ và timeout của Socket. |
 | Cấu hình App.config XML (`WatcherSettings`, `MirrorSettings`, appSettings) | Đổi | TOML: `examples/server.toml`, `examples/client.toml`. Tuỳ chọn mail/Yahoo bị bỏ cùng tính năng cảnh báo. |
+| Vận hành giữa các máy chủ (không GUI, Ansible/script) | Thêm | `mysync peer add/remove/revoke/list`, thư mục `peers.d`, xoay khoá máy chủ/máy khách không gián đoạn, `mysync status --json`, `mysync health`; xem `docs/SERVER-TO-SERVER.md`. |
+| Chế độ Đơn giản của GUI (mới, không có ở bản cũ) | Mới — theo yêu cầu người dùng | Chạy không cần admin dưới tài khoản người dùng, trình hướng dẫn 3 bước, ghép máy bằng mã dùng một lần + chuỗi xác nhận, nâng lên dịch vụ khi cần; xem `docs/GUI.md`. |

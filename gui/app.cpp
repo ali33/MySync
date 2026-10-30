@@ -42,7 +42,8 @@ public:
             return false;
         }
         if (!dump_icons_.empty()) return DumpIcons(dump_icons_), false;  // tiện ích chẩn đoán: vẽ 5 trạng thái ra một ảnh PNG rồi thoát
-        auto* f = new MainFrame(daemon_, lang_);
+        bool force_adv = !daemon_.empty() || !config_.empty() || tab_ >= 0 || page_ >= 0;
+        auto* f = new MainFrame(daemon_, lang_, force_adv, user_dir_);
         g_frame = f;
         bool hidden = false;
         hidden = tray_only_;
@@ -52,6 +53,22 @@ public:
         if (page_ >= 0) f->SelectCfgPage(page_ / 10, page_ % 10);
         if (!hidden) f->Show();
         SetTopWindow(f);
+        // Tham số kiểm thử: lái trình hướng dẫn thật bằng sự kiện giao diện, chụp cửa sổ, thoát.
+        if (!auto_src_.empty()) f->SimpleAutoDrive(auto_src_, auto_dst_);
+        if (!auto_recv_.empty()) f->CallAfter([f, this] { f->SimpleAutoReceive(auto_recv_); });
+        if (!shot_.empty()) {
+            std::string png = shot_;
+            bool ex = shot_exit_;
+            f->CallAfter([f, png, ex, this] {
+                wxTimer* t = new wxTimer;
+                t->Bind(wxEVT_TIMER, [f, png, ex, t](wxTimerEvent&) {
+                    f->Screenshot(png);
+                    t->Stop();
+                    if (ex) f->Close(true);
+                });
+                t->StartOnce(shot_delay_);
+            });
+        }
         return true;
     }
 
@@ -64,6 +81,13 @@ public:
         p.AddOption("", "lang", "vi or en", wxCMD_LINE_VAL_STRING);
         p.AddOption("", "dump-icons", "write the tray icon states to a PNG and exit", wxCMD_LINE_VAL_STRING);
         p.AddOption("", "config", "open this configuration file", wxCMD_LINE_VAL_STRING);
+        p.AddOption("", "user-dir", "folder for Simple mode data (default: the per-user location)", wxCMD_LINE_VAL_STRING);
+        p.AddOption("", "screenshot", "write a PNG of the window after --shot-delay ms", wxCMD_LINE_VAL_STRING);
+        p.AddOption("", "shot-delay", "milliseconds before --screenshot (default 2500)", wxCMD_LINE_VAL_NUMBER);
+        p.AddSwitch("", "shot-exit", "exit after the screenshot");
+        p.AddOption("", "auto-src", "test: run the wizard with this source folder", wxCMD_LINE_VAL_STRING);
+        p.AddOption("", "auto-recv", "test: turn on receiving into this folder", wxCMD_LINE_VAL_STRING);
+        p.AddOption("", "auto-dst", "test: run the wizard with this destination folder", wxCMD_LINE_VAL_STRING);
     }
     bool OnCmdLineParsed(wxCmdLineParser& p) override {
         tray_only_ = p.Found("tray");
@@ -75,6 +99,13 @@ public:
         if (p.Found("daemon", &c)) daemon_ = S(c);
         if (p.Found("dump-icons", &c)) dump_icons_ = S(c);
         if (p.Found("lang", &c)) lang_ = S(c);
+        if (p.Found("user-dir", &c)) user_dir_ = S(c);
+        if (p.Found("screenshot", &c)) shot_ = S(c);
+        if (p.Found("shot-delay", &n)) shot_delay_ = static_cast<int>(n);
+        shot_exit_ = p.Found("shot-exit");
+        if (p.Found("auto-src", &c)) auto_src_ = S(c);
+        if (p.Found("auto-dst", &c)) auto_dst_ = S(c);
+        if (p.Found("auto-recv", &c)) auto_recv_ = S(c);
         return wxApp::OnCmdLineParsed(p);
     }
 
@@ -116,7 +147,9 @@ private:
     bool tray_only_ = false;
     int tab_ = -1;
     int page_ = -1;
-    std::string config_, daemon_, lang_, dump_icons_;
+    std::string config_, daemon_, lang_, dump_icons_, user_dir_, shot_, auto_src_, auto_dst_, auto_recv_;
+    int shot_delay_ = 2500;
+    bool shot_exit_ = false;
 
     static void DumpIcons(const std::string& path) {
         const TrayState sts[] = {TrayState::Offline, TrayState::Idle, TrayState::Syncing, TrayState::Warning, TrayState::Error};

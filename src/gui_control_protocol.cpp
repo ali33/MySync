@@ -77,6 +77,7 @@ void put_target(Writer& w, const TargetStatus& t, const Limits& lim) {
     size_t n = std::min({t.active_files.size(), lim.active_files, size_t(kMaxActiveFiles)});
     w.u8(static_cast<uint8_t>(n));
     for (size_t i = 0; i < n; ++i) w.str(clean(t.active_files[i], lim.file_len));
+    w.i64(t.last_ok_unix_ms);
 }
 
 TargetStatus get_target(Reader& r) {
@@ -98,6 +99,7 @@ TargetStatus get_target(Reader& r) {
     size_t n = r.u8();
     if (n > kMaxActiveFiles) throw Error("control message: too many active files");
     for (size_t i = 0; i < n; ++i) t.active_files.push_back(r.str());
+    t.last_ok_unix_ms = r.i64();
     return t;
 }
 
@@ -125,6 +127,11 @@ void put_snapshot(Writer& w, const StatusSnapshot& s, const Limits& lim) {
         w.u32(p.sessions);
         put_u64s(w, {p.rx_bps, p.tx_bps, p.bytes_rx, p.bytes_tx});
     }
+    w.str(clean(s.pairing, 32));
+    w.u32(s.peer_file_errors);
+    size_t nw = std::min<size_t>(s.warnings.size(), 8);
+    w.u8(static_cast<uint8_t>(nw));
+    for (size_t i = 0; i < nw; ++i) w.str(clean(s.warnings[i], 400));
 }
 
 StatusSnapshot get_snapshot(Reader& r) {
@@ -163,10 +170,61 @@ StatusSnapshot get_snapshot(Reader& r) {
         p.bytes_tx = r.u64();
         s.peers.push_back(std::move(p));
     }
+    s.pairing = r.str();
+    s.peer_file_errors = r.u32();
+    size_t nw = r.u8();
+    if (nw > 8) throw Error("control message: too many warnings");
+    for (size_t i = 0; i < nw; ++i) s.warnings.push_back(r.str());
     return s;
 }
 
+constexpr size_t kMaxPending = 8;
+
+void put_pair(Writer& w, const PairInfo& p, const Limits& lim) {
+    w.boolean(p.available);
+    w.boolean(p.mode_on);
+    w.u32(p.seconds_left);
+    w.str(clean(p.public_hex, 64));
+    w.u16(p.port);
+    w.str(clean(p.message, std::min<size_t>(lim.text_len, 300)));
+    w.str(clean(p.token_hex, 64));
+    size_t n = std::min(p.pending.size(), kMaxPending);
+    w.u16(static_cast<uint16_t>(n));
+    for (size_t i = 0; i < n; ++i) {
+        const PairPendingInfo& q = p.pending[i];
+        w.u32(q.id);
+        w.str(clean(q.name, 200));
+        w.str(clean(q.sas, 40));
+        w.str(clean(q.ip, 64));
+        w.u32(q.seconds_left);
+    }
+}
+
+PairInfo get_pair(Reader& r) {
+    PairInfo p;
+    p.available = r.boolean();
+    p.mode_on = r.boolean();
+    p.seconds_left = r.u32();
+    p.public_hex = r.str();
+    p.port = r.u16();
+    p.message = r.str();
+    p.token_hex = r.str();
+    size_t n = r.u16();
+    if (n > kMaxPending) throw Error("control message: too many pairing requests");
+    for (size_t i = 0; i < n; ++i) {
+        PairPendingInfo q;
+        q.id = r.u32();
+        q.name = r.str();
+        q.sas = r.str();
+        q.ip = r.str();
+        q.seconds_left = r.u32();
+        p.pending.push_back(std::move(q));
+    }
+    return p;
+}
+
 Bytes encode_once(const ControlResponse& m, const Limits& lim) {
+
     Writer w;
     w.u16(kControlVersion);
     w.u8(static_cast<uint8_t>(m.op));
@@ -196,11 +254,18 @@ Bytes encode_once(const ControlResponse& m, const Limits& lim) {
         }
         break;
     }
+    case ControlOp::PairModeOn:
+    case ControlOp::PairModeOff:
+    case ControlOp::PairList:
+    case ControlOp::PairApprove:
+    case ControlOp::PairDeny:
+        put_pair(w, m.pair, lim);
+        break;
     }
     return w.take();
 }
 
-bool known_op(uint8_t op) { return op >= 1 && op <= 4; }
+bool known_op(uint8_t op) { return op >= 1 && op <= 9; }
 
 }  // namespace
 
@@ -210,6 +275,11 @@ const char* control_op_name(ControlOp op) {
     case ControlOp::GetStatus: return "GET_STATUS";
     case ControlOp::ReloadConfig: return "RELOAD_CONFIG";
     case ControlOp::GetRecentErrors: return "GET_RECENT_ERRORS";
+    case ControlOp::PairModeOn: return "PAIR_MODE_ON";
+    case ControlOp::PairModeOff: return "PAIR_MODE_OFF";
+    case ControlOp::PairList: return "PAIR_LIST";
+    case ControlOp::PairApprove: return "PAIR_APPROVE";
+    case ControlOp::PairDeny: return "PAIR_DENY";
     }
     return "?";
 }
@@ -295,6 +365,13 @@ ControlResponse decode_response(const void* data, size_t n) {
         }
         break;
     }
+    case ControlOp::PairModeOn:
+    case ControlOp::PairModeOff:
+    case ControlOp::PairList:
+    case ControlOp::PairApprove:
+    case ControlOp::PairDeny:
+        m.pair = get_pair(r);
+        break;
     }
     r.expect_end();
     return m;

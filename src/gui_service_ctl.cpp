@@ -80,6 +80,7 @@ const char* service_action_name(ServiceAction a) {
     case ServiceAction::Uninstall: return "uninstall";
     case ServiceAction::Start: return "start";
     case ServiceAction::Stop: return "stop";
+    case ServiceAction::MigrateFromUser: return "migrate-from-user";
     }
     return "?";
 }
@@ -561,6 +562,22 @@ std::vector<std::string> ServiceController::build_args(ServiceAction act, const 
             a.push_back("--trust-writer");
             a.push_back(x);
         }
+    } else if (act == ServiceAction::MigrateFromUser) {
+        if (!rq.config_path.empty() || !rq.role.empty() || !rq.run_as.empty() || !rq.control_allow.empty() ||
+            !rq.trust_writers.empty())
+            throw Error("migrate-from-user takes only the user configuration and the service name");
+        if (rq.remove_migrated) {
+            if (!rq.user_config.empty()) throw Error("remove_migrated takes no user configuration");
+            a.push_back("--remove");
+            a.push_back("--name");
+            a.push_back(rq.name);
+            return a;
+        }
+        fs::path up = fs::u8path(rq.user_config);
+        if (rq.user_config.empty() || !up.is_absolute() || has_ctl(rq.user_config) || rq.user_config[0] == '-')
+            throw Error("the user configuration path must be absolute");
+        a.push_back("--user-config");
+        a.push_back(rq.user_config);
     } else if (!rq.config_path.empty() || !rq.role.empty() || !rq.run_as.empty() || !rq.control_allow.empty() ||
                !rq.trust_writers.empty()) {
         // not needed for these actions; ignoring silently would hide a caller mistake

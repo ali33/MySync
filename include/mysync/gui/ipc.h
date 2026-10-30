@@ -47,7 +47,9 @@ bool ipc_peer_allowed(uint32_t peer_uid, uint32_t self_uid, const std::vector<ui
                       uint32_t group_gid);
 // Windows: security descriptor text (SDDL) for the pipe, from SID strings. Refuses Everyone / Users /
 // Authenticated Users / Anonymous / Network / Interactive / Guests / Local. Pure, testable everywhere.
-std::string ipc_pipe_sddl(const std::vector<std::string>& extra_sids, const std::string& owner_sid);
+// user_only (simple mode): ONLY owner_sid (plus the network-logon deny); SYSTEM and Administrators are not added and
+// `extra_sids` must be empty.
+std::string ipc_pipe_sddl(const std::vector<std::string>& extra_sids, const std::string& owner_sid, bool user_only = false);
 }  // namespace detail
 
 // ---------------------------------------------------------------- server (inside the daemon)
@@ -60,6 +62,9 @@ struct IpcServerOptions {
     std::string dir_override;              // Linux test hook: directory instead of /run/mysync
     int idle_timeout_ms = 60000;           // a connection that sends nothing for this long is closed
     int max_lifetime_ms = 600000;          // no connection lives longer than this, however busy
+    // Simple mode (an engine started by the GUI for a plain user): Windows DACL = the current user only (no SYSTEM, no
+    // Administrators); Linux directory 0700 and socket 0600. `allow` / `group` must be empty.
+    bool user_only = false;
 };
 
 // Handler runs on an IPC worker thread; it may throw (answered with status Failed + the message).
@@ -96,6 +101,11 @@ public:
     StatusSnapshot get_status();                   // throws Error
     ReloadResult reload_config();                  // throws Error for transport errors; config errors come back in .ok/.message
     std::vector<ErrorEntry> recent_errors(uint32_t max = 50);
+    // Pairing (receiver daemon started with --allow-pairing). All throw Error on transport problems / refusal.
+    PairInfo pair_info();                       // public key + port + mode + waiting requests
+    PairInfo pair_mode(bool on, uint32_t seconds = 0);
+    std::string pair_approve(uint32_t id);      // returns the prefix granted
+    void pair_deny(uint32_t id);
 
     const std::string& name() const { return name_; }
 
@@ -103,12 +113,16 @@ public:
     // (GetNamedPipeServerProcessId). Accepted: SYSTEM, LocalService, NetworkService, a member of Administrators, the
     // calling user, and every account added here ("S-1-5-..." or a name). Elsewhere the owner of the socket is checked.
     void trust_server_account(const std::string& sid_or_name);
+    // Simple mode: the engine must run as the current user, nobody else (Windows: not SYSTEM / LocalService / any
+    // administrator either; POSIX: the socket must belong to the current user). Use for the per-user control names.
+    void require_current_user_only();
 
 private:
     std::string name_;
     int timeout_ms_;
     std::string dir_override_;
     std::vector<std::string> trusted_accounts_;
+    bool user_only_ = false;
     std::mutex m_;
     uint64_t next_token_ = 1;
 };

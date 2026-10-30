@@ -87,3 +87,82 @@ Chạy độc lập: lệnh ở foreground, Ctrl+C / SIGTERM dừng sạch. Serv
   `fchmod`/`chmod` nên không phụ thuộc umask. Tệp tạm được tạo 0600. Windows bỏ qua.
 - **Tên nguy hiểm trong `pathsafe`**: chặn `COM¹ COM² COM³ LPT¹ LPT² LPT³` (mọi kiểu chữ, có/không đuôi) trên mọi nền
   tảng; `__sync` và `.mysync-tmp-` được so sánh sau khi gấp chữ đơn giản, gồm U+017F (ſ → s) và U+212A (K Kelvin → k).
+
+## Ghép máy bằng mã (chế độ Đơn giản)
+
+Mục tiêu: người không chuyên nối hai máy mà không phải chép khoá, không cần quyền quản trị. Mã nguồn: `include/mysync/simple/pair_code.h`, `pairing.h`; phía máy chủ trong `server.cpp` (`serve_unpaired`) và `gui_daemon.cpp` (`pair_approve`, `pair_op`).
+
+### Mã ghép (một dòng người dùng sao chép)
+
+`MSY1-` + base32 Crockford (bỏ I L O U, không phân biệt hoa thường, bỏ qua `-` và khoảng trắng khi nhập; O đọc là 0, I/L đọc là 1), chia nhóm 5 ký tự, của payload:
+
+```
+version(1)=2 | khoá công khai máy nhận (32) | TOKEN dùng một lần (16) | cổng (2, big-endian) | độ dài host (1) | host (1..100) | checksum (4)
+checksum = 4 byte đầu của BLAKE2b-256 trên mọi byte đứng trước
+```
+
+Host là IPv4 / IPv6 (không có zone) / tên DNS (nhãn `[A-Za-z0-9-]`, ≤ 63). Mã **không có trường nào cho khoá bí mật**. Token là 128 bit ngẫu nhiên do máy nhận tạo mỗi lần người dùng bật chế độ ghép; daemon chỉ giữ BĂM BLAKE2b của nó (không ghi log, không đưa vào trạng thái IPC; chỉ GUI nhận một lần trong câu trả lời `PAIR_MODE_ON` qua kênh chỉ-người-dùng để dựng mã). `decode` ném lỗi chung (không lặp lại nội dung đã nhập) khi: sai tiền tố hoặc phiên bản, ký tự ngoài bảng chữ, độ dài sai, bit đệm khác 0, checksum sai, host / cổng vô lý, thừa byte. Có vector kiểm cố định trong `tests/test_simple_core.cpp`, fuzz giải mã và kiểm "đổi một ký tự bất kỳ thì bị phát hiện".
+
+### Chuỗi xác nhận (SAS)
+
+`SAS = BLAKE2b("MySync-SAS-v1" || khoá_công_khai_máy_gửi || khoá_công_khai_máy_nhận)`, lấy 80 bit đầu, 16 ký tự Crockford, hiển thị `ABCD-EFGH-JKMN-PQRS`. Hai bên tự tính từ hai khoá công khai nên hiện cùng một chuỗi; người dùng so bằng mắt trước khi bấm Đồng ý. Nếu có kẻ chen vào giữa thì khoá của một trong hai phía khác đi và hai chuỗi khác nhau.
+
+### Chế độ "đang ghép" trên máy nhận
+
+- **Token một lần**: một khoá lạ chỉ đi tiếp khi `PAIR_REQUEST` (bên trong kênh Noise đã mã hoá, đã xác thực máy nhận nhờ khoá ghim) mang đúng token (so băm bằng `ct_equal`). Sai token thì phiên bị đóng không báo lý do và tính như xác thực sai của IP đó; token sai không làm hộp 'Đồng ý' hiện. Token bị huỷ ngay khi một yêu cầu dùng nó (dù sau đó được duyệt, bị từ chối hay hết hạn), khi tắt chế độ ghép, hoặc hết 10 phút; bật lại tạo token mới. Hết token thì khoá lạ bị từ chối ngay ở bắt tay, nên mỗi lần bật chỉ ghép được một máy (`BUSY` chỉ còn xảy ra khi token đúng nhưng vượt giới hạn tốc độ).
+- Mặc định **tắt**. Chỉ bật khi người dùng bấm (qua kênh điều khiển cục bộ `PAIR_MODE_ON`), và chỉ khi daemon được khởi động với `--allow-pairing` **và** cấu hình có `[server] pairing = "on-demand"` (mặc định `off`: dịch vụ không có đường nào vào chế độ này).
+- Tự tắt sau 10 phút (`kPairWindowSeconds`); đếm ngược lấy được qua IPC (`PairInfo::seconds_left`). Tắt tay hoặc hết giờ thì mọi yêu cầu đang chờ bị huỷ.
+- Trong chế độ này `SecureChannel::server` cho một khoá **chưa có** trong allowlist đi qua bắt tay Noise, nhưng phiên được đánh dấu "chưa ghép" (`serve_unpaired`): nó **không** có `Policy`, `Tree`, chỗ phiên, hạn mức. Chỉ ba thông điệp được chấp nhận: `PAIR_REQUEST{tên}`, `PAIR_POLL`, `BYE`. Mọi thứ khác (HELLO, OFFER, LIST ...) nhận `PAIR_ERROR` rồi đóng, và tính một lần xác thực hỏng cho IP đó. Thông điệp ghép có byte đầu ≥ 0x40, không thể trùng `proto::MsgType`.
+- Khi chế độ tắt, khoá lạ bị từ chối ngay ở bắt tay y như trước khi có tính năng này.
+
+### Giới hạn
+
+| Giới hạn | Giá trị |
+|---|---|
+| yêu cầu chờ duyệt cùng lúc | 1 (yêu cầu thứ hai nhận `BUSY`) |
+| hạn dùng một yêu cầu | 2 phút |
+| yêu cầu mới | 3 / phút / IP, 10 / phút toàn cục (vượt thì `BUSY`) |
+| bắt tay của khoá lạ | 12 / phút / IP, 40 / phút toàn cục |
+| một khoá hỏi quá 4 lần / phút | bị chặn 10 phút |
+| khoá bị từ chối | bị chặn 10 phút (chặn ngay ở bắt tay) |
+| phiên ghép đang sống | tối đa 4 cùng lúc, 2 mỗi IP, tính RIÊNG (không ăn vào hạn mức kết nối chưa xác thực của máy khách thường); mỗi phiên sống tối đa ~135 s |
+
+Tên hiển thị của máy gửi: ≤ 40 ký tự UTF-8, không điều khiển, không ký tự định dạng (zero-width, đảo chiều, dấu phân dòng, tag); `clean_display_name` từ chối cả tên nếu có một ký tự xấu, không cố "sửa".
+
+### Duyệt
+
+`PAIR_APPROVE` (từ GUI, người dùng đã thấy tên và SAS) làm `ServerDaemon::pair_approve`: mở cấu hình người dùng bằng `ConfigEditor`, thêm `[[client]]` (tên làm duy nhất, `public_key`, `access = "rw"`, `prefix = from-<tên>` đã làm sạch), ghi nguyên tử (có `.bak`), nạp lại cấu hình đã kiểm tin cậy và `Server::apply_config` ngay (không qua giãn cách reload 2 s), rồi trả `PAIR_OK` cho máy gửi. `prefix` do `safe_pair_prefix` tạo: một thành phần đường dẫn `[a-z0-9._-]`, bỏ dấu tiếng Việt, không `.`/`..`/dấu chấm đầu, ≤ 48 byte, không trùng prefix đang dùng và **không trùng thư mục đã có** trên đĩa (tránh giao nhầm thư mục của máy khác). Máy gửi sau đó kết nối bình thường bằng khoá của nó. `PAIR_DENY` chặn khoá 10 phút.
+
+### Bên gửi
+
+`PairingClient` kiểm mã, đọc / tạo khoá của mình, kết nối `host:cổng` với **khoá máy chủ ghim từ mã** (Noise IK: máy không giữ khoá đó không trả lời được), gửi `PAIR_REQUEST`, tính SAS cục bộ để hiện, hỏi lại mỗi 2 s tối đa ~125 s, huỷ được bất cứ lúc nào. Mọi lỗi (không tới được, chế độ ghép tắt, mã không phải của máy đó, bị chặn) cho **cùng một thông điệp chung**, không phân biệt, để máy gửi không dò được gì.
+
+### Mối đe doạ và điều không được bảo đảm
+
+| Mối đe doạ | Cách chặn |
+|---|---|
+| Người lạ trong mạng gửi yêu cầu khi cửa sổ ghép đang mở | Không có quyền gì trước khi duyệt; chỉ 1 yêu cầu chờ; giới hạn tốc độ; người nhận thấy tên + SAS + IP và có thể từ chối (chặn 10 phút); cửa sổ chỉ mở 10 phút khi người dùng chủ động bật |
+| Kẻ chen giữa (MITM) giả máy nhận | Máy gửi ghim khoá máy nhận lấy từ mã; không có khoá bí mật đó thì không hoàn tất bắt tay IK |
+| Kẻ chen giữa giả máy gửi | Khoá tĩnh của máy gửi được mã hoá trong bắt tay và gắn với SAS; kẻ chen giữa phải dùng khoá khác, SAS hai bên sẽ khác nhau |
+| Mã bị lộ (chụp màn hình, chia sẻ nhầm) | Mã chỉ chứa khoá công khai và địa chỉ, không cho quyền gì; kẻ cầm mã vẫn chỉ gửi được yêu cầu và phải được duyệt |
+| Làm ngập yêu cầu | giới hạn trên; yêu cầu thừa nhận `BUSY` mà không tốn bộ nhớ lâu dài (bảng đếm có trần) |
+| Tên độc hại (điều khiển, đảo chiều, `..`) | `clean_display_name` từ chối; thư mục dùng `safe_pair_prefix` |
+
+Không được bảo đảm: (1) nếu người dùng bấm Đồng ý mà không so SAS thì không có gì ngăn một yêu cầu từ kẻ lạ trong cửa sổ ghép được chấp nhận (mọi cơ chế "bấm xác nhận" đều vậy); (2) mã đi qua kênh nào thì kênh đó thấy địa chỉ và khoá công khai; (3) chặn theo IP không chống được kẻ có nhiều địa chỉ, giới hạn toàn cục mới là chốt; (4) không chống kẻ đã kiểm soát máy nhận hay máy gửi; (5) địa chỉ trong mã phải tới được từ máy gửi (NAT, tường lửa là việc của người dùng); (6) ghép xong, quyền là đọc-ghi trong một thư mục riêng — thu hồi bằng cách xoá `[[client]]` tương ứng.
+
+## Chế độ Đơn giản: engine con, khoá thư mục, nâng lên dịch vụ
+
+- **Cấu hình người dùng** ở `%APPDATA%\MySync\` / `~/.config/mysync/` (`UserPaths`): `config.toml`, `server-user.toml`, `key`, `receiver.key`, `state/`, `receiver-state/`, `log/`. Thư mục và khoá chỉ người dùng đó truy cập (Windows: DACL có bảo vệ, chỉ người dùng + SYSTEM; Linux 0700/0600). Tin cậy cấu hình đi nhánh "tài khoản thường, tệp của chính mình" (`need_strict_trust` = false).
+- **Supervisor** (`user_engine.h`): GUI chạy `mysync run -c ... --user-mode --exit-on-stdin-eof` (và `--allow-pairing` cho bên nhận) làm TIẾN TRÌNH CON dưới quyền người dùng; không qua shell, không thừa handle, ẩn cửa sổ console. Windows: Job Object `KILL_ON_JOB_CLOSE`; Linux: `PR_SET_PDEATHSIG`. Dừng sạch bằng cách đóng stdin của engine (engine thoát sạch, lưu chỉ mục), quá hạn mới ép buộc. Engine chết ngoài ý muốn thì khởi động lại sau 1, 2, 5, 10, 30, 60 s (rồi 60 s); sau 5 lần liên tiếp chết trong 10 s thì ngừng thử và báo `last_error` nguyên văn (cuối stderr/stdout). Đóng cửa sổ về khay không động đến engine.
+- **Kênh điều khiển chỉ người dùng** (`IpcServerOptions::user_only`): pipe Windows có DACL chỉ chứa người dùng hiện tại (không SYSTEM, không Administrators, và vẫn từ chối đăng nhập mạng); Linux thư mục 0700 + socket 0600.
+- **Khoá chống chạy đôi**: mỗi engine giữ khoá hệ điều hành độc quyền trên `<thư mục>/__sync/engine.lock` cho TỪNG watch trước khi watch (Windows `LockFileEx` một byte xa phần chữ, Linux `flock`); chết thì hệ điều hành tự nhả. Bị giữ bởi tiến trình khác (kể cả dịch vụ) thì engine **không watch và không đồng bộ** thư mục đó, báo "folder 'X' is already being synchronised by another process (PID n)" trên trạng thái đích, thử lại mỗi 5 s; `run --once` thất bại hẳn. Nguồn chỉ-đọc không tạo được tệp khoá thì chạy như cũ và ghi cảnh báo (không bảo đảm độc quyền). Mỗi người dùng chỉ một GUI (một bộ engine) nhờ `InstanceLock`.
+- **Nâng lên dịch vụ** (`service_upgrade.h`): kiểm tiền điều kiện → dừng engine người dùng (chờ nhả khoá) → `mysync service migrate-from-user --user-config <đường dẫn>` chạy NÂNG QUYỀN (kiểm tệp là tệp thường thuộc đúng người gọi, phân tích được; chép cấu hình và khoá sang `%ProgramData%\MySync\<tên>\` ACL chỉ Administrators+SYSTEM, hoặc `/etc/mysync` + `/var/lib/mysync` của root; ghi lại đường dẫn khoá/state/log; kiểm lại bằng đúng luật tin cậy của dịch vụ) → `service install` (qua `validate_install_inputs`, chạy bằng LocalSystem để đọc được thư mục người dùng, cho SID người dùng vào `[control] allow`) → start → GUI theo dõi dịch vụ. Chiều ngược: dừng, gỡ dịch vụ, bật lại engine người dùng (cấu hình người dùng chưa từng bị sửa nên không cần chép về). Bước nào hỏng cũng hoàn tác theo thứ tự ngược (gỡ dịch vụ, bật lại engine người dùng), không để hai engine, không mất cấu hình; bước hoàn tác hỏng được báo nguyên văn.
+
+### Vòng sửa sau rà soát độc lập Chế độ Đơn giản
+
+- **Di chuyển cấu hình sang dịch vụ không tin nội dung của người dùng** (`migrate-from-user`, chạy nâng quyền). Dịch vụ chạy bằng tài khoản mạnh hơn người dùng, nên tiến trình nâng quyền tự kiểm lại: mở tệp cấu hình MỘT lần và kiểm ngay trên handle (không phải liên kết, tệp thường, đúng chủ sở hữu); từ chối thư mục nguồn / đích nằm trong thư mục hệ thống (`SystemRoot`, `ProgramData`, `Program Files`, `/etc`, `/usr`, `/root`...) hoặc trong hồ sơ của người dùng khác, hoặc có liên kết / junction trên đường đi; khoá phải nằm trong thư mục MySync của chính người dùng; khoá riêng của từng đích bị từ chối; `control_allow` / `control_group` do người dùng viết bị XOÁ (quyền điều khiển dịch vụ do quản trị đặt lúc cài). Thư mục đích (`C:\ProgramData\MySync`, `/etc/mysync`, `/var/lib/mysync`) nếu đã tồn tại phải đã thuộc quản trị, không bị chiếm lại. `PKEXEC_UID` chỉ được tin khi tiến trình cha là `pkexec`; `SUDO_UID` và `PKEXEC_UID` mâu thuẫn thì từ chối.
+- **Bản tóm tắt trước hộp UAC**: `summarize_user_config` trả nguồn, đích, vân tay khoá, tài khoản chạy dịch vụ, lời cảnh báo và danh sách `problems` (không rỗng = sẽ bị từ chối); `check_preconditions` dùng nó nên lỗi hiện trước khi hỏi quyền.
+- **Gỡ bản sao**: `mysync service migrate-from-user --remove --name N` xoá cấu hình, `.bak` và khoá đã sao; `DowngradeOptions::remove_service_copy` gọi nó sau khi chuyển ngược thành công (lỗi chỉ ghi vào nhật ký). Huỷ hộp UAC ở bước chuyển không còn kích hoạt hoàn tác gây hộp thứ hai.
+- **Khoá thư mục (`engine_lock`)**: `__sync` hay `engine.lock` là liên kết / junction / thư mục bị từ chối thẳng (POSIX: `openat` từ descriptor của thư mục với `O_NOFOLLOW`; Windows: `FILE_FLAG_OPEN_REPARSE_POINT` rồi kiểm trước và sau khi mở; bỏ `FILE_SHARE_DELETE`). Chỉ `LockNotPossible` (thư mục chỉ-đọc / không ghi được) mới cho engine chạy không khoá, kèm cảnh báo; mọi lỗi khác trên thư mục ghi được thì engine KHÔNG đụng vào thư mục đó và báo lỗi nguyên văn. Thùng rác của `LocalTarget` và của máy chủ cũng từ chối `__sync` / `__trash` là liên kết.
+- **Kênh chỉ người dùng, phía GUI**: `ControlClient::require_current_user_only()` — Windows chỉ chấp nhận tiến trình / chủ pipe là đúng SID người dùng hiện tại (không SYSTEM, LocalService, Administrators khác); POSIX chấp nhận socket do đúng euid này sở hữu.
+- **Duyệt ghép máy khi cửa sổ vừa đóng**: bản duyệt đã ghi vào allowlist thì bên gửi nhận `OK` (không bị báo "hết hạn"); tắt chế độ ghép / hết cửa sổ chỉ huỷ yêu cầu ĐANG CHỜ, không xoá phán quyết đã có.

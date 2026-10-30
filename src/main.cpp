@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -18,6 +19,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -26,6 +28,7 @@
 #include <unistd.h>
 #endif
 
+#include "mysync/cli_ops.h"
 #include "mysync/client_engine.h"
 #include "mysync/config.h"
 #include "mysync/gui/config_io.h"
@@ -36,6 +39,7 @@
 #include "mysync/keys.h"
 #include "mysync/server.h"
 #include "mysync/service.h"
+#include "mysync/simple/service_upgrade.h"
 #include "mysync/util.h"
 
 namespace fs = std::filesystem;
@@ -55,19 +59,32 @@ const char* kHelp =
     "MySync " "1.0.0" " - file synchronisation (GPL-2.0-or-later, META.vn)\n"
     "\n"
     "Usage:\n"
-    "  mysync keygen [-o <keyfile>]            create an identity key (default ./mysync.key); prints the PUBLIC key\n"
+    "  mysync keygen [--out|-o <keyfile>] [--force|--if-missing] [--changed-exit]\n"
+    "                                          create an identity key (default ./mysync.key); prints the PUBLIC key. Never\n"
+    "                                          overwrites a key unless --force; --if-missing keeps an existing key (idempotent)\n"
     "  mysync run -c <config> [--role server|client] [--once]\n"
     "                                          run in the foreground (Ctrl+C stops). --once = one sync pass, then exit\n"
+    "                  [--exit-on-stdin-eof]   stop cleanly when standard input closes (used by the GUI that starts the engine)\n"
+    "                  [--user-mode]           control channel for the current user only (engine started by the GUI)\n"
+    "                  [--allow-pairing]       (server) allow the pairing-by-code mode, switched on from the GUI\n"
     "  mysync status -c <config> [--role ...]  show the loaded configuration (no secrets)\n"
     "  mysync service install|uninstall|start|stop [-c <config>] [--role server|client] [--name N] [--user U]\n"
     "                  [--trust-writer <account>]...   (install: also allowed to edit the configuration; kept in the service arguments)\n"
     "                  [--control-allow <SID|DOMAIN\\user>]...   (install: admit that account to the GUI control channel)\n"
     "                                          install/remove/start/stop the Windows service or systemd unit (admin/root)\n"
+    "  mysync status -c <config> --json        the same as a stable JSON document (daemon state when it runs)\n"
+    "  mysync health -c <config> [--max-lag-seconds N] [--json]   one line; exit 0 healthy, 1 warning, 2 critical\n"
+    "  mysync peer add <public key hex> --name N --perm ro|rw [--subdir D] [--rotate] -c <server.toml>\n"
+    "  mysync peer remove|revoke <name|key> | peer retire-key <name> <key> | peer list [--json]   (server peers, idempotent)\n"
+    "  mysync key show --public [-k keyfile|-c config] [--json]\n"
+    "  mysync key rotate --server-config <server.toml> --prepare|--promote|--status   (server key rotation, no downtime)\n"
+    "                                          --changed-exit on the commands above: exit 10 when something changed\n"
+    "                                          (docs/SERVER-TO-SERVER.md)\n"
     "  mysync hash <file>                      BLAKE3 of a file\n"
     "  mysync version | help\n"
     "\n"
     "The role of a config file is detected from its tables ([server]/[[client]] = server, [[watch]] = client).\n"
-    "Exit code: 0 ok, 1 runtime error, 2 usage or configuration error.\n";
+    "Exit code: 0 ok, 1 runtime error, 2 usage or configuration error (10 = changed, only with --changed-exit; 3 = a peer/key command wrote the file but the running daemon refused it; health: 0/1/2 = ok/warning/critical, 64 = bad arguments).\n";
 
 [[noreturn]] void usage(const std::string& m) { throw UsageError(m); }
 
@@ -156,6 +173,11 @@ struct Opts {
     std::string out;
     bool once = false;
     bool service = false;
+    bool exit_on_stdin_eof = false;  // parent (GUI supervisor) closes our stdin => stop cleanly
+    bool remove_copy = false;        // service migrate-from-user --remove
+    bool user_mode = false;          // engine of a plain user started by the GUI: control channel for that user only
+    bool allow_pairing = false;      // receiver: enable the code-pairing mode (simple/pairing.h)
+    std::string user_config;
     std::vector<std::string> control_allow;
     std::vector<std::string> trust_writers;
     std::vector<std::string> pos;
@@ -178,6 +200,11 @@ Opts parse_opts(const std::vector<std::string>& a, size_t from) {
         else if (s == "--trust-writer") o.trust_writers.push_back(val());
         else if (s == "--once") o.once = true;
         else if (s == "--service") o.service = true;
+        else if (s == "--exit-on-stdin-eof") o.exit_on_stdin_eof = true;
+        else if (s == "--allow-pairing") o.allow_pairing = true;
+        else if (s == "--user-mode") o.user_mode = true;
+        else if (s == "--remove") o.remove_copy = true;
+        else if (s == "--user-config") o.user_config = val();
         else if (s == "--foreground") {}
         else if (!s.empty() && s[0] == '-') usage("unknown option " + s);
         else o.pos.push_back(s);
@@ -215,11 +242,7 @@ Loaded load_config(const Opts& o) {
     if (l.role == Role::None)
         throw Error("cannot tell the role of " + o.config + ": no [server]/[[client]]/[[watch]] table (use --role)");
     if (l.role == Role::Server) {
-        l.server = load_server_config(l.path);
-        l.server.root = resolve(l.dir, l.server.root);
-        l.server.key_file = resolve(l.dir, l.server.key_file);
-        l.server.state_dir = resolve(l.dir, l.server.state_dir);
-        l.server.log_file = resolve(l.dir, l.server.log_file);
+        l.server = gui::load_server_config_resolved(l.path);  // paths made absolute, peers.d merged
     } else {
         l.client = load_client_config(l.path);
         l.client.key_file = resolve(l.dir, l.client.key_file);
@@ -231,25 +254,6 @@ Loaded load_config(const Opts& o) {
 }
 
 // ---------------------------------------------------------------------------------------------- commands
-int cmd_keygen(const Opts& o) {
-    std::string out = o.out.empty() ? "mysync.key" : o.out;
-    KeyPair kp = generate_keypair();
-    save_keypair(out, kp);  // refuses to overwrite; 0600 on POSIX
-    std::string pub = key_to_hex(kp.pub);
-    std::string pubfile = out + ".pub";
-    try {
-        if (!fs::exists(fs::u8path(pubfile))) save_public_file(pubfile, kp.pub);
-        else pubfile.clear();
-    } catch (const std::exception&) {
-        pubfile.clear();
-    }
-    std::cerr << "secret key written to " << out << " (keep it private, never copy it to the other machine)\n";
-    if (!pubfile.empty()) std::cerr << "public key also in " << pubfile << "\n";
-    std::cerr << "give the public key below to the other side:\n";
-    std::cout << pub << "\n";
-    return 0;
-}
-
 int cmd_hash(const Opts& o) {
     if (o.pos.size() != 1) usage("usage: mysync hash <file>");
     uint64_t size = 0;
@@ -304,6 +308,28 @@ std::string default_service_name(Role r) { return r == Role::Server ? "mysync-se
 
 int cmd_run(const Opts& o) {
     Loaded l = load_config(o);
+    // Trust comes FIRST: before the log file is opened or anything is created from this configuration. With high
+    // rights (elevated / SYSTEM / root / --service) the file, its folder, the state folder (the default one when
+    // state_dir is empty) and the log folder must not be changeable by others. A plain account running its own files
+    // is not blocked. The daemon repeats the check at start and on every reload.
+    for (const auto& w : o.trust_writers) {
+        if (!gui::valid_trust_writer_entry(w)) usage("invalid --trust-writer entry");
+        std::string why = gui::broad_principal_reason(w);
+        if (!why.empty()) usage("refusing --trust-writer: " + why);
+    }
+    if (gui::need_strict_trust(gui::ServiceController::is_elevated(), o.service)) {
+        try {
+            if (l.role == Role::Server)
+                gui::require_trusted_run(l.path, gui::effective_server_state_dir(l.server.state_dir, l.server.root),
+                                         l.server.log_file, o.trust_writers);
+            else
+                gui::require_trusted_run(l.path, gui::effective_client_state_dir(l.client.state_dir, l.path),
+                                         l.client.log_file, o.trust_writers);
+        } catch (const Error& e) {
+            std::cerr << "mysync: " << e.what() << "\n";
+            return 1;
+        }
+    }
     std::function<void(std::atomic<bool>&)> body;
     int rc = 0;
     if (l.role == Role::Server) {
@@ -316,6 +342,8 @@ int cmd_run(const Opts& o) {
         dopt.version = kVersion;
         dopt.enforce_config_trust = gui::need_strict_trust(gui::ServiceController::is_elevated(), o.service);
         dopt.trusted_writers = o.trust_writers;
+        dopt.control_user_only = o.user_mode;
+        dopt.allow_pairing = o.allow_pairing;
         std::string dir = l.dir;
         body = [sc, dir, dopt](std::atomic<bool>& stop) {
             gui::ServerDaemon d(sc, dir, dopt);
@@ -327,9 +355,6 @@ int cmd_run(const Opts& o) {
         ClientConfig cc = l.client;
         std::string dir = l.dir;
         bool once = o.once;
-        bool strict_once = gui::need_strict_trust(gui::ServiceController::is_elevated(), o.service);
-        std::vector<std::string> once_writers = o.trust_writers;
-        std::string once_config = l.path;
         int* prc = &rc;
         gui::DaemonOptions dopt;
         dopt.service_name = o.name.empty() ? default_service_name(l.role) : o.name;
@@ -337,12 +362,10 @@ int cmd_run(const Opts& o) {
         dopt.version = kVersion;
         dopt.enforce_config_trust = gui::need_strict_trust(gui::ServiceController::is_elevated(), o.service);
         dopt.trusted_writers = o.trust_writers;
-        body = [cc, dir, once, strict_once, once_writers, once_config, prc, dopt](std::atomic<bool>& stop) {
+        dopt.control_user_only = o.user_mode;
+        body = [cc, dir, once, prc, dopt](std::atomic<bool>& stop) {
             log_info("MySync client " + std::string(kVersion) + (once ? ": one sync pass" : ": watching"));
             if (once) {
-                // Same rule as the daemon: with high rights (elevated / SYSTEM / root / --service) the configuration must
-                // not be editable by others; a plain account running its own files is not blocked.
-                if (strict_once) gui::require_trusted_run(once_config, cc.state_dir, cc.log_file, once_writers);
                 SyncEngine eng(cc, dir);
                 eng.sync_once(stop);
                 EngineStats s = eng.stats();
@@ -358,6 +381,24 @@ int cmd_run(const Opts& o) {
         return run_as_service(name, body);
     }
     install_signal_handlers(g_stop);
+    if (o.exit_on_stdin_eof) {
+        // The supervising GUI holds the write end of our stdin; when it closes it (or dies) we stop like on Ctrl+C.
+        std::thread([] {
+            char c;
+#ifdef _WIN32
+            HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+            DWORD n = 0;
+            while (h && h != INVALID_HANDLE_VALUE && ReadFile(h, &c, 1, &n, nullptr) && n > 0) {}
+#else
+            while (true) {
+                ssize_t n = ::read(0, &c, 1);
+                if (n > 0 || (n < 0 && errno == EINTR)) continue;
+                break;
+            }
+#endif
+            g_stop = true;
+        }).detach();
+    }
     try {
         body(g_stop);
     } catch (const std::exception& e) {
@@ -385,6 +426,14 @@ int cmd_service(const Opts& o) {
 }
 
 int cmd_service_impl(const Opts& o) {
+    if (o.pos.size() == 1 && o.pos[0] == "migrate-from-user") {  // elevated helper of the GUI (simple mode)
+        if (o.user_config.empty() && !o.remove_copy) usage("service migrate-from-user needs --user-config <file>");
+        std::vector<std::string> a;
+        if (!o.user_config.empty()) { a.push_back("--user-config"); a.push_back(o.user_config); }
+        if (o.remove_copy) a.push_back("--remove");
+        if (!o.name.empty()) { a.push_back("--name"); a.push_back(o.name); }
+        return simple::run_migrate_from_user(a);
+    }
     if (o.pos.size() != 1) usage("usage: mysync service install|uninstall|start|stop [options]");
     const std::string& act = o.pos[0];
     if (act != "install" && act != "uninstall" && act != "start" && act != "stop") usage("unknown service action " + act);
@@ -486,8 +535,10 @@ int dispatch(const std::vector<std::string>& a) {
         std::cout << "mysync " << kVersion << "\n";
         return 0;
     }
+    if (cmd == "keygen" || cmd == "peer" || cmd == "key" || cmd == "health" ||
+        (cmd == "status" && std::find(a.begin(), a.end(), "--json") != a.end()))
+        return cli_ops_main(a);  // server operations: non-interactive, scriptable (see cli_ops.h)
     Opts o = parse_opts(a, 2);
-    if (cmd == "keygen") return cmd_keygen(o);
     if (cmd == "hash") return cmd_hash(o);
     if (cmd == "status") return cmd_status(o);
     if (cmd == "run") return cmd_run(o);

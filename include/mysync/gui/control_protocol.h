@@ -24,7 +24,15 @@ constexpr uint32_t kMaxMessageBytes = 64 * 1024;
 constexpr uint16_t kControlVersion = 1;
 constexpr uint32_t kMaxErrorsReturned = 100;
 
-enum class ControlOp : uint8_t { Ping = 1, GetStatus = 2, ReloadConfig = 3, GetRecentErrors = 4 };
+enum class ControlOp : uint8_t {
+    Ping = 1, GetStatus = 2, ReloadConfig = 3, GetRecentErrors = 4,
+    // Pairing (receiver daemon started with --allow-pairing; others answer Unsupported):
+    PairModeOn = 5,   // arg = seconds (0 = 600, capped at 600)
+    PairModeOff = 6,
+    PairList = 7,     // doubles as GET_PAIR_CODE: the answer carries the public key and port
+    PairApprove = 8,  // arg = request id
+    PairDeny = 9,     // arg = request id
+};
 enum class ControlStatus : uint8_t { Ok = 0, Failed = 1, BadRequest = 2, Unsupported = 3, Denied = 4 };
 const char* control_op_name(ControlOp);
 
@@ -42,6 +50,7 @@ struct ControlResponse {
     StatusSnapshot snapshot;              // GetStatus
     ReloadResult reload;                  // ReloadConfig
     std::vector<ErrorEntry> errors;       // GetRecentErrors (oldest first)
+    PairInfo pair;                        // Pair* ops
 };
 
 Bytes encode_request(const ControlRequest&);

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <climits>
 #include <cstring>
+#include <memory>
 
 #include "monocypher.h"
 
@@ -30,6 +31,10 @@ void make_nonce(uint8_t nonce[24], uint64_t ctr) {
 
 using SteadyClock = std::chrono::steady_clock;
 
+struct ConnClosed : Error {  // the peer closed the connection (how a refusal looks from the initiator)
+    using Error::Error;
+};
+
 // Milliseconds left until `deadline`; throws once it has passed. Always >= 1 so it can be used as a socket timeout.
 int ms_left(SteadyClock::time_point deadline) {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - SteadyClock::now()).count();
@@ -46,7 +51,7 @@ void recv_by(net::Socket& s, void* data, size_t n, SteadyClock::time_point deadl
         int left = ms_left(deadline);
         s.set_timeouts(left, left);
         size_t r = s.recv_some(p + done, n - done);
-        if (r == 0) throw Error("connection closed by peer");
+        if (r == 0) throw ConnClosed("connection closed by peer");
         done += r;
     }
 }
@@ -64,6 +69,13 @@ void dh(uint8_t out[32], const PubKey& sk, const uint8_t pk[32]) {
     static const uint8_t zero[32] = {};
     crypto_x25519(out, sk.data(), pk);
     if (ct_equal(out, zero, 32)) throw AuthFailed{};
+}
+
+// Same, but reports a low-order result instead of throwing (the multi-key responder must do equal work per key).
+bool dh_ok(uint8_t out[32], const PubKey& sk, const uint8_t pk[32]) {
+    static const uint8_t zero[32] = {};
+    crypto_x25519(out, sk.data(), pk);
+    return !ct_equal(out, zero, 32);
 }
 
 // Noise SymmetricState with BLAKE2b (keyed-BLAKE2b plays the role of HMAC in HKDF) and XChaCha20-Poly1305.
@@ -130,6 +142,17 @@ struct Sym {
         if (crypto_aead_unlock(pt.data(), ct + len, k, nonce, h, 32, ct, len) != 0) throw AuthFailed{};
         mix_hash(ct, total);
         return pt;
+    }
+    // decrypt_and_hash without the exception: false on a bad tag (the nonce is consumed either way).
+    bool try_decrypt_and_hash(const uint8_t* ct, size_t total, Bytes& out) {
+        if (total < 16) return false;
+        size_t len = total - 16;
+        out.assign(len, 0);
+        uint8_t nonce[24];
+        make_nonce(nonce, n++);
+        if (crypto_aead_unlock(out.data(), ct + len, k, nonce, h, 32, ct, len) != 0) return false;
+        mix_hash(ct, total);
+        return true;
     }
     void split(uint8_t k1[32], uint8_t k2[32]) const { hkdf2(nullptr, 0, k1, k2); }
 };
@@ -223,7 +246,15 @@ SecureChannel SecureChannel::client(net::Socket&& s, const KeyPair& self, const 
         SecureChannel ch = make(std::move(s), k_send, k_recv, server_pub);
         wipe_all();
         return ch;
-    } catch (...) {
+    } catch (const AuthFailed&) {
+        wipe_all();
+        s.close();
+        throw AuthError("authentication failed");
+    } catch (const ConnClosed&) {  // EOF during the handshake: the server refused us (or is not who we pinned)
+        wipe_all();
+        s.close();
+        throw AuthError("authentication failed");
+    } catch (...) {  // connection errors, timeouts, resets: NOT evidence about the pinned key
         wipe_all();
         s.close();
         throw Error("authentication failed");
@@ -232,6 +263,13 @@ SecureChannel SecureChannel::client(net::Socket&& s, const KeyPair& self, const 
 
 SecureChannel SecureChannel::server(net::Socket&& s, const KeyPair& self,
                                     const std::function<bool(const PubKey&)>& is_allowed, int handshake_timeout_ms) {
+    std::vector<const KeyPair*> one{&self};
+    return server(std::move(s), one, is_allowed, handshake_timeout_ms, nullptr);
+}
+
+SecureChannel SecureChannel::server(net::Socket&& s, const std::vector<const KeyPair*>& selves,
+                                    const std::function<bool(const PubKey&)>& is_allowed, int handshake_timeout_ms,
+                                    size_t* matched_key) {
     if (!s.valid()) throw Error("invalid socket");
     KeyPair e;
     uint8_t k_send[32], k_recv[32], d[32];
@@ -241,22 +279,46 @@ SecureChannel SecureChannel::server(net::Socket&& s, const KeyPair& self,
         secure_wipe(d, 32);
     };
     try {
+        if (selves.empty()) throw AuthFailed{};
         const auto deadline = SteadyClock::now() + std::chrono::milliseconds(handshake_timeout_ms);
-        Sym st;
-        st.mix_hash(self.pub.data(), 32);  // pre-message: <- s (ours)
 
         uint8_t m1[kMsg1];
         recv_by(s, m1, kMsg1, deadline);
         const uint8_t* re = m1;
-        st.mix_hash(re, 32);
-        dh(d, self.secret, re);  // es
-        st.mix_key(d);
-        Bytes rs_b = st.decrypt_and_hash(m1 + 32, 48);  // s
-        PubKey rs;
-        std::memcpy(rs.data(), rs_b.data(), 32);
-        dh(d, self.secret, rs.data());  // ss
-        st.mix_key(d);
-        st.decrypt_and_hash(m1 + 80, 16);
+
+        // The initiator encrypted to ONE of our static keys but does not say which. Try every key and always do the
+        // full amount of work for each (no early exit, no throw on a bad tag): time reveals neither which key matched
+        // nor how many were tried before it. The first key that authenticates wins.
+        std::unique_ptr<Sym> winner;
+        PubKey rs{};
+        size_t win_idx = 0;
+        for (size_t i = 0; i < selves.size(); ++i) {
+            const KeyPair& self = *selves[i];
+            auto st = std::make_unique<Sym>();
+            st->mix_hash(self.pub.data(), 32);  // pre-message: <- s (this candidate)
+            st->mix_hash(re, 32);
+            bool good = dh_ok(d, self.secret, re);  // es
+            st->mix_key(d);
+            Bytes rs_b;
+            good = st->try_decrypt_and_hash(m1 + 32, 48, rs_b) && good;  // s
+            PubKey cand{};
+            if (good && rs_b.size() == 32) std::memcpy(cand.data(), rs_b.data(), 32);
+            else std::memcpy(cand.data(), re, 32);  // any valid point: keeps the work identical
+            good = dh_ok(d, self.secret, cand.data()) && good;  // ss
+            st->mix_key(d);
+            Bytes empty;
+            good = st->try_decrypt_and_hash(m1 + 80, 16, empty) && good;
+            if (good && !winner) {
+                winner = std::move(st);
+                rs = cand;
+                win_idx = i;
+            }
+        }
+        if (!winner) throw AuthFailed{};
+        Sym& st = *winner;
+        if (matched_key) *matched_key = win_idx;
+        const KeyPair& self = *selves[win_idx];
+        (void)self;
 
         bool ok = false;
         try { ok = is_allowed(rs); } catch (...) { ok = false; }

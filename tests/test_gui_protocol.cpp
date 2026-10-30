@@ -76,6 +76,11 @@ ControlResponse sample_response(ControlOp op) {
     case ControlOp::GetRecentErrors:
         for (int i = 0; i < 5; ++i) r.errors.push_back({1760000000000 + i, i % 2 ? "ERROR" : "WARN", "message " + std::to_string(i)});
         break;
+    case ControlOp::PairModeOn:
+    case ControlOp::PairModeOff:
+    case ControlOp::PairList:
+    case ControlOp::PairApprove:
+    case ControlOp::PairDeny: break;
     }
     return r;
 }

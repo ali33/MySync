@@ -4,7 +4,10 @@
 
 #include "testing.h"
 
+int fake_engine_main(int argc, char** argv);  // tests/test_simple_engine.cpp: the engine the supervisor tests start
+
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--fake-engine") return fake_engine_main(argc, argv);
     std::string filter = argc > 1 ? argv[1] : "";
     int pass = 0, fail = 0;
     for (auto& c : mytest::registry()) {

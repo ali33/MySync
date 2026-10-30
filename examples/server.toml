@@ -31,6 +31,23 @@ root = "/srv/mysync"
 # thì dán vào `server_key` trong cấu hình máy khách.
 key_file = "server.key"
 
+# Xoay khoá MÁY CHỦ không gián đoạn (docs/SERVER-TO-SERVER.md): khoá bí mật thứ hai mà máy chủ CŨNG trả lời,
+# nên máy khách ghim khoá cũ hay khoá mới đều vào được trong lúc chuyển. Đừng sửa tay: dùng
+#   mysync key rotate --server-config server.toml --prepare   (tạo khoá mới + điền dòng này)
+#   mysync key rotate --server-config server.toml --promote   (khoá mới thành key_file, bỏ khoá cũ)
+# key_file_next = "server.key.next"
+
+# Thư mục peers.d: mỗi máy khách một tệp .toml (name, public_key, access, prefix...), để Ansible/script rải ra
+# mà không phải sửa tệp này. Mặc định <thư mục của tệp này>/peers.d nếu thư mục đó tồn tại. Có thể bỏ hẳn khối
+# [[client]] bên dưới khi đã khai peers_dir. Tệp lỗi chỉ bị bỏ qua (kèm cảnh báo), không làm hỏng máy khác;
+# trùng tên/khoá với [[client]] trong tệp này thì tệp này thắng. Thêm bằng CLI: `mysync peer add ...`.
+peers_dir = "peers.d"
+
+# Chế độ ghép bằng mã (GUI Đơn giản). "off" (mặc định): KHÔNG có đường nào bật chế độ ghép, kể cả qua kênh
+# điều khiển cục bộ - dùng cho dịch vụ/máy chủ không người trông. "on-demand": chỉ khi tiến trình được chạy với
+# --allow-pairing (GUI của người dùng) mới bật được, và chỉ theo yêu cầu.
+pairing = "off"
+
 # Số kết nối đồng thời tối đa.
 max_connections = 20
 
@@ -75,11 +92,14 @@ max_file_size = "10GB"
 io_timeout_s = 60
 
 # ---- Máy khách được phép kết nối: mỗi máy một khối [[client]] -------------------------------------------
-# Chỉ khoá công khai có trong danh sách này mới vào được (Noise_IK, khoá được ghim, không cần CA).
+# Chỉ khoá công khai có trong danh sách này (và trong peers.d) mới vào được (Noise_IK, khoá được ghim, không cần CA).
 [[client]]
 name = "van-phong-ha-noi"
 # Khoá công khai của máy khách (dòng hex in ra khi chạy `mysync keygen` trên máy khách).
 public_key = "0000000000000000000000000000000000000000000000000000000000000000"
+# Xoay khoá máy khách: thêm khoá MỚI vào đây (hoặc `mysync peer add --rotate`), đổi khoá ở máy khách,
+# rồi bỏ khoá cũ. Cùng một máy: cùng tên, quyền, thư mục con, hạn mức.
+# public_keys = ["<khoá cũ hoặc khoá mới, 64 hex>"]
 # "rw" = đọc-ghi; "ro" = chỉ liệt kê/đọc, không ghi/xoá.
 access = "rw"
 # Chỉ cho máy này thấy thư mục con này của root ("" = cả root). Không có "/" đầu/cuối.

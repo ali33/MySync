@@ -242,6 +242,9 @@ std::string serialize_server_config(const ServerConfig& c) {
     kv(o, "port", std::to_string(c.port));
     kv(o, "root", q(c.root));
     kv(o, "key_file", q(c.key_file));
+    if (!c.key_file_next.empty()) kv(o, "key_file_next", q(c.key_file_next));
+    if (!c.peers_dir.empty()) kv(o, "peers_dir", q(c.peers_dir));
+    kv(o, "pairing", q(pairing_name(c.pairing)));
     kv(o, "max_connections", std::to_string(c.max_connections));
     kv(o, "max_bandwidth_kbps", std::to_string(c.max_bandwidth_kbps));
     kv(o, "max_auth_failures_per_min", std::to_string(c.max_auth_failures_per_min));
@@ -261,6 +264,11 @@ std::string serialize_server_config(const ServerConfig& c) {
         o += "\n[[client]]\n";
         kv(o, "name", q(a.name));
         kv(o, "public_key", q(hex_of(a.public_key)));
+        if (!a.extra_keys.empty()) {
+            std::vector<std::string> ks;
+            for (const auto& k : a.extra_keys) ks.push_back(hex_of(k));
+            kv(o, "public_keys", arr(ks));
+        }
         kv(o, "access", q(a.read_only ? "ro" : "rw"));
         if (!a.prefix.empty()) kv(o, "prefix", q(a.prefix));
         kv(o, "max_sessions", std::to_string(a.max_sessions));
@@ -317,6 +325,7 @@ std::string serialize_client_config(const ClientConfig& c) {
                 kv(o, "host", q(t.host));
                 kv(o, "port", std::to_string(t.port));
                 kv(o, "server_key", q(hex_of(t.server_key)));
+                if (t.has_server_key_next) kv(o, "server_key_next", q(hex_of(t.server_key_next)));
                 if (!t.key_file.empty()) kv(o, "key_file", q(t.key_file));
             }
             if (!t.remote_prefix.empty()) kv(o, "remote_prefix", q(t.remote_prefix));

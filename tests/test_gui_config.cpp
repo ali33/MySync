@@ -206,7 +206,8 @@ TEST(gui_config_invalid_edit_is_not_written) {
     CHECK_EQ(slurp(path), before);
     CHECK(!any_tmp_left(t.p));
     ed.server().port = 5656;
-    ed.server().clients.clear();    // a server needs at least one client
+    ed.server().clients.clear();    // a server needs at least one client (or a peers_dir)
+    ed.server().peers_dir.clear();
     CHECK_THROWS(ed.validate());
     ed.reload();
     CHECK_EQ(ed.server().port, uint16_t(5656));

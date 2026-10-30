@@ -5,6 +5,15 @@
 - Bản quyền (C) 2026 **META.vn** · Tác giả: **Nguyễn Đức Sơn**
 - Giấy phép: **GPL-2.0-or-later** (xem `LICENSE`). Thư viện vendor đều tương thích GPLv2: Monocypher (BSD-2/CC0), BLAKE3 (CC0), LZ4 (BSD-2).
 
+## Dùng nhanh cho người mới
+1. Dựng `mysync-gui` (xem mục "Giao diện đồ hoạ" bên dưới) và mở nó. Lần đầu bạn thấy màn **Bắt đầu nhanh**: chọn **Dùng ngay, không cần cài đặt** (không cần quyền quản trị).
+2. **Bước 1**: chọn (hoặc kéo-thả) thư mục cần giữ bản sao. **Bước 2**: chọn nơi lưu: thư mục khác, ổ USB, thư mục chia sẻ trong mạng (`\máy\chia-sẻ`), hoặc một máy tính khác có MySync (dán mã ghép). **Bước 3**: bấm **Bắt đầu đồng bộ**.
+3. MySync chạy dưới biểu tượng ở khay hệ thống (xanh lá = đã xong, xanh dương = đang chép, vàng/đỏ = cần chú ý). Đóng cửa sổ chỉ thu xuống khay; **Thoát hẳn** ở menu khay để dừng. Mặc định tự chạy khi bạn đăng nhập (tắt được).
+4. Gửi file sang máy khác: máy nhận bật **Cho phép máy khác gửi file vào đây** và sao chép **mã ghép** (dùng một lần, hết hạn sau khoảng 10 phút); máy gửi dán mã ở bước 2; hai bên so **chuỗi xác nhận** giống nhau rồi bấm **Đồng ý** ở máy nhận.
+5. Muốn chạy cả khi chưa đăng nhập máy: ở màn Trạng thái bấm **Chạy cả khi chưa đăng nhập máy (cài dịch vụ)**. Cần chỉnh sâu hơn: bấm **Chế độ nâng cao**.
+
+Dùng cho máy chủ (không GUI, ghép bằng dòng lệnh, Ansible, xoay khoá, thu hồi, giám sát): xem `docs/SERVER-TO-SERVER.md`. Ghép bằng mã **mặc định tắt** khi chạy dạng dịch vụ.
+
 ## Điểm chính
 - **Watch realtime**: ReadDirectoryChangesW (Windows) / inotify (Linux), gộp sự kiện theo từng tệp (mặc định 300 ms), chờ tệp hết bị khoá, tràn hàng đợi thì quét lại, quét toàn bộ định kỳ để dự phòng.
 - **Nhanh**: so size+mtime trước, chỉ băm BLAKE3 khi khác; chỉ mục hash lưu ra đĩa; tệp trùng nội dung không truyền; delta theo khối kiểu rsync cho tệp lớn sửa một phần; nén LZ4 (bỏ qua đuôi đã nén); nhiều kết nối song song, gửi OFFER theo lô không chờ từng tệp.
@@ -77,5 +86,7 @@ Bốn tab: **Trạng thái** (kèm icon khay đổi màu), **Cấu hình** (sử
 - `docs/FEATURES.md` — bảng đối chiếu tính năng cũ → mới (giữ / đổi / bỏ, kèm lý do)
 - `docs/DESIGN.md` — kiến trúc, giao thức
 - `docs/SETUP.md`, `docs/SERVICE.md` — triển khai
+- `docs/SERVER-TO-SERVER.md` — đồng bộ giữa các máy chủ bằng dòng lệnh: `peer add/remove/revoke`, `peers.d`, xoay khoá không gián đoạn, `status --json`, `health`, Ansible
+- `docs/SERVER-TO-SERVER.md` — ghép/vận hành giữa các máy chủ bằng CLI (peer, peers.d, xoay khoá, thu hồi, health)
 - `docs/GUI.md`, `docs/GUI-CORE.md` — giao diện đồ hoạ và kênh điều khiển cục bộ
 - `docs/STATUS.md` — đã kiểm gì, chưa kiểm gì, hạn chế đã biết

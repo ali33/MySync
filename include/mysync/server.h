@@ -37,6 +37,7 @@
 namespace mysync {
 
 namespace detail { struct ServerCore; }
+namespace simple { class PairingManager; }
 
 // allow/deny lists of "*", IP or CIDR (IPv4 and IPv6; IPv4-mapped IPv6 addresses are treated as IPv4).
 // Deny wins. An empty allow list permits nobody. Throws Error on a malformed entry.
@@ -117,7 +118,8 @@ public:
     // authenticated sessions): at most 4 per source and max(8, max_connections / 2) in all.
     void run(std::atomic<bool>& stop);
     uint16_t port() const;
-    const PubKey& public_key() const;
+    PubKey public_key() const;                 // primary key (what clients pin)
+    std::vector<PubKey> public_keys() const;   // primary, then key_file_next when a rotation is under way
 
     // Lightweight, thread-safe status for the GUI (role Server): listen address, sessions, per-client name /
     // sessions / bytes / rates. Carries no key material.
@@ -125,9 +127,16 @@ public:
     // Hot reload: swaps the allowlist, ip allow/deny, limits, quotas, trash / mode / size settings and the
     // auth-failure throttle for sessions that start afterwards. A live session keeps its policy, except that it is
     // closed at its next request when its client was removed from the allowlist or its access / prefix changed.
-    // Throws Error (and changes nothing) when bind / port / root / key_file / state_dir differ from the running
+    // Server keys (key_file / key_file_next) are read again: a rotation needs no restart. A session whose client was
+    // removed or whose access / prefix / keys no longer allow it is cut at once (its blocked read is woken), not at
+    // its next request.
+    // Throws Error (and changes nothing) when bind / port / root / state_dir differ from the running
     // values: those need a restart. Paths in `n` must be resolved the same way as for the constructor.
     void apply_config(const ServerConfig& n);
+
+    // Pairing by code (simple/pairing.h). Off until the operator calls enable(); while on, a key that is not in the
+    // allowlist may finish the handshake but its session only speaks PAIR_REQUEST / PAIR_POLL / BYE.
+    simple::PairingManager& pairing();
 
 private:
 

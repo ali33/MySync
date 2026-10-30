@@ -32,6 +32,7 @@
 #include "mysync/protocol.h"
 #include "mysync/ratelimit.h"
 #include "mysync/secure_channel.h"
+#include "mysync/simple/pairing.h"
 
 namespace mysync {
 
@@ -353,9 +354,29 @@ struct Policy {
         : cfg(std::move(c)), ipf(cfg.allow, cfg.deny), total_bw(std::make_shared<RateLimiter>(cfg.max_bandwidth_kbps)) {}
 };
 
+// The server's static identities: the primary key and, during a rotation, a second one it also answers to.
+struct KeySet {
+    KeyPair primary;
+    std::optional<KeyPair> next;
+};
+
+// A session past its handshake, known to the server so a reload can cut it at once.
+struct LiveSess {
+    SessRec* rec;
+    ClientAcl acl;
+    PubKey key;  // the client key it authenticated with
+};
+
 struct ServerCore {
-    ServerConfig cfg;  // as started: bind / port / root / key_file never change; the rest lives in `pol`
-    KeyPair key;
+    ServerConfig cfg;  // as started: bind / port / root / state_dir never change; key files may (rotation); the rest lives in `pol`
+    std::shared_ptr<const KeySet> keys;
+    std::shared_ptr<const KeySet> key_set() const {
+        std::lock_guard<std::mutex> lk(pm);
+        return keys;
+    }
+    std::mutex live_mu;
+    std::list<LiveSess> live;
+    std::unique_ptr<simple::PairingManager> pairing;  // created with the keys; off until the operator turns it on
     AuthThrottle thr;
     net::Socket lsock;
     std::string root;
@@ -377,11 +398,25 @@ struct ServerCore {
         return pol;
     }
     // False when the client was removed from the allowlist, or its access / prefix changed, by a reload.
-    bool still_permitted(const ClientAcl& a) const {
+    bool still_permitted(const ClientAcl& a, const PubKey& authkey) const {
         auto p = policy();
         for (const ClientAcl& n : p->cfg.clients)
-            if (n.public_key == a.public_key) return n.read_only == a.read_only && n.prefix == a.prefix;
+            if (acl_has_key(n, authkey)) return n.read_only == a.read_only && n.prefix == a.prefix;
         return false;
+    }
+    // Wakes every live session whose client was removed (or whose access / prefix / key set no longer allows what it
+    // authenticated with): its blocked read fails at once instead of at the client's next request.
+    size_t cut_unpermitted() {
+        // live_mu is held while waking: an entry is erased (under live_mu) before its SessRec can be reaped.
+        size_t n = 0;
+        std::lock_guard<std::mutex> lk(live_mu);
+        for (const LiveSess& l : live) {
+            if (still_permitted(l.acl, l.key)) continue;
+            std::lock_guard<std::mutex> rl(l.rec->m);
+            if (l.rec->sock) wake(*l.rec->sock);
+            ++n;
+        }
+        return n;
     }
     std::mutex trash_mu;           // serialises moves into / purges of <root>/__sync/__trash
     bool trash_scanned = false;    // trash_bytes is valid (computed lazily, only when max_trash_bytes != 0)
@@ -415,8 +450,16 @@ struct ServerCore {
     }
 
     ServerCore(ServerConfig c, const KeyPair& k)
-        : cfg(std::move(c)), key(k), thr(cfg.max_auth_failures_per_min) {
+        : cfg(std::move(c)), thr(cfg.max_auth_failures_per_min) {
         if (cfg.root.empty()) throw Error("server root is not set");
+        {
+            auto ks = std::make_shared<KeySet>();
+            ks->primary = k;
+            if (!cfg.key_file_next.empty()) ks->next = key_from_file(cfg.key_file_next);
+            if (ks->next && ks->next->pub == ks->primary.pub) throw Error("key_file_next holds the same key as key_file");
+            keys = ks;
+            pairing = std::make_unique<simple::PairingManager>(ks->primary.pub);
+        }
         net::init();
         std::error_code ec;
         fio::create_dirs(u8(cfg.root), cfg.dir_mode, ec);
@@ -554,6 +597,10 @@ fs::path trash_move(ServerCore& c, const ServerConfig& cfg, const fs::path& abs,
         }
         if (c.trash_bytes + sz > limit) trash_purge_to(c, limit - sz);
     }
+    for (const fs::path& q : {u8(c.root) / "__sync", u8(c.root) / "__sync" / "__trash"}) {  // a link would redirect the removed data
+        fio::StatInfo si = fio::stat_path(q);
+        if (si.exists && (si.is_symlink || !si.is_dir)) throw OpError(ErrCode::IoError, "the trash folder is a link: refusing");
+    }
     fs::path base = u8(c.root) / "__sync" / "__trash" / utc_stamp() / u8(real);
     std::error_code ec;
     fio::create_dirs(base.parent_path(), cfg.dir_mode, ec);
@@ -638,7 +685,7 @@ public:
 
         for (;;) {
             Message m = decode(recv());
-            if (!c_.still_permitted(acl_)) {  // removed from the allowlist (or access changed) by a reload
+            if (!c_.still_permitted(acl_, ch_.peer_public())) {  // removed from the allowlist (or access changed) by a reload
                 log_warn("client '" + acl_.name + "' is no longer permitted by the configuration: session closed");
                 break;
             }
@@ -1072,6 +1119,52 @@ private:
     }
 };
 
+// A connection whose key is NOT in the allowlist but was admitted because the operator turned the pairing mode on.
+// It may only say PAIR_REQUEST / PAIR_POLL / BYE (PairingManager::on_message refuses everything else and says so);
+// no policy, no tree, no session slot is ever created for it.
+void serve_unpaired(ServerCore& c, SecureChannel& ch, SessRec& rec, const std::string& ip, const PubKey& key,
+                    std::atomic<bool>& stop) {
+    {
+        std::lock_guard<std::mutex> lk(rec.m);
+        rec.sock = &ch.socket();
+    }
+    struct Unreg {
+        SessRec& rec;
+        ~Unreg() {
+            std::lock_guard<std::mutex> lk(rec.m);
+            rec.sock = nullptr;
+        }
+    } unreg{rec};
+    try {
+        const int64_t deadline = steady_ms() + int64_t(simple::kPairRequestTtlSeconds + 15) * 1000;
+        bool first = true;
+        while (!stop.load()) {
+            int64_t left = deadline - steady_ms();
+            if (left <= 0) break;
+            // The request itself must come promptly; afterwards the sender polls every couple of seconds.
+            int wait_ms = first ? kHelloTimeoutMs : int(std::min<int64_t>(left, 30000));
+            Bytes raw = ch.recv_msg_within(wait_ms);
+            first = false;
+            simple::PairingManager::Reply rep = c.pairing->on_message(ip, key, raw);
+            if (!rep.msg.empty()) {
+                ch.socket().set_timeouts(10000, 10000);
+                ch.send_msg(rep.msg);
+            }
+            if (rep.close) {
+                // A refusal for misbehaviour counts against the source like a failed authentication.
+                try {
+                    if (!rep.msg.empty() && simple::decode_pair_wire(rep.msg).type == simple::PairMsg::Error)
+                        c.thr.record_failure(ip, steady_ms());
+                } catch (const std::exception&) {
+                }
+                break;
+            }
+        }
+    } catch (const std::exception& e) {
+        if (!stop.load()) log_debug("pairing session from " + ip + " ended: " + e.what());
+    }
+}
+
 void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRec& rec, std::atomic<bool>& stop) {
     struct Done {
         SessRec& rec;
@@ -1091,21 +1184,50 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
 
     std::optional<SecureChannel> ch;
     int idx = -1;
+    bool unpaired = false;  // pairing mode: unknown key admitted, only PAIR_* messages allowed
+    PubKey unpaired_key{};
+    struct PairSlot {  // the place taken in the pairing budget by admit_handshake, given back on any exit
+        ServerCore& c;
+        std::string ip;
+        bool held = false;
+        ~PairSlot() {
+            if (held) c.pairing->session_ended(ip);
+        }
+    } pair_slot{c, ip};
     std::shared_ptr<const Policy> pol = c.policy();  // fixed for this session, whatever a reload does meanwhile
     try {
-        ch.emplace(SecureChannel::server(std::move(sock), c.key, [&](const PubKey& k) {
+        std::shared_ptr<const detail::KeySet> ks = c.key_set();
+        std::vector<const KeyPair*> selves{&ks->primary};
+        if (ks->next) selves.push_back(&*ks->next);
+        size_t used_key = 0;
+        ch.emplace(SecureChannel::server(std::move(sock), selves, [&](const PubKey& k) {
             int found = -1;
             for (size_t i = 0; i < pol->cfg.clients.size(); i++) {  // no early exit: time does not reveal the position
-                bool eq = ct_equal(k.data(), pol->cfg.clients[i].public_key.data(), 32);
+                bool eq = acl_has_key(pol->cfg.clients[i], k);
                 if (eq && found < 0) found = int(i);
             }
             idx = found;
-            return found >= 0;
-        }));
+            if (found >= 0) return true;
+            // Not in the allowlist. Normally that ends here; while the operator has the pairing mode on, the key may
+            // continue as an UNPAIRED session (no rights at all, see serve_unpaired).
+            if (c.pairing->admit_handshake(ip, k)) {
+                pair_slot.held = true;
+                unpaired = true;
+                unpaired_key = k;
+                return true;
+            }
+            return false;
+        }, SecureChannel::kHandshakeTimeoutMs, &used_key));
+        if (used_key != 0) log_info("client at " + ip + " used the NEXT server key (key_file_next)");
     } catch (const std::exception&) {  // refused, torn, or out of time: all count against the source
         unauth.release();
         c.thr.record_failure(ip, steady_ms());
         log_warn("authentication failed from " + ip);
+        return;
+    }
+    if (unpaired) {  // lives on the pairing budget (4 sessions, 2 per source), not on the shared unauthenticated one
+        unauth.release();
+        serve_unpaired(c, *ch, rec, ip, unpaired_key, stop);
         return;
     }
     // The unauthenticated place is kept until a valid HELLO arrives: only then does the connection count
@@ -1128,6 +1250,23 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
         } unreg{rec};
         if (stop.load()) return;
         sess.emplace(c, *ch, acl, ip, cs, pol);
+        struct Live {
+            ServerCore& c;
+            std::list<detail::LiveSess>::iterator it;
+            Live(ServerCore& c_, std::list<detail::LiveSess>::iterator it_) : c(c_), it(it_) {}
+            Live(const Live&) = delete;
+            ~Live() {
+                std::lock_guard<std::mutex> lk(c.live_mu);
+                c.live.erase(it);
+            }
+        };
+        std::optional<Live> live_reg;
+        {
+            std::lock_guard<std::mutex> lk(c.live_mu);
+            c.live.push_back(detail::LiveSess{&rec, acl, ch->peer_public()});
+            live_reg.emplace(c, std::prev(c.live.end()));
+        }
+        if (!c.still_permitted(acl, ch->peer_public())) return;  // revoked between the handshake and now
         if (!sess->read_hello()) return;
         unauth.release();
         if (!c.session_acquire()) {
@@ -1184,7 +1323,16 @@ Server::~Server() = default;
 
 uint16_t Server::port() const { return p_->lsock.local_port(); }
 
-const PubKey& Server::public_key() const { return p_->key.pub; }
+simple::PairingManager& Server::pairing() { return *p_->pairing; }
+
+PubKey Server::public_key() const { return p_->key_set()->primary.pub; }
+
+std::vector<PubKey> Server::public_keys() const {
+    auto ks = p_->key_set();
+    std::vector<PubKey> v{ks->primary.pub};
+    if (ks->next) v.push_back(ks->next->pub);
+    return v;
+}
 
 gui::StatusSnapshot Server::snapshot() const {
     ServerCore& c = *p_;
@@ -1214,16 +1362,28 @@ void Server::apply_config(const ServerConfig& n) {
     ServerCore& c = *p_;
     if (n.bind != c.cfg.bind || n.port != c.lsock.local_port())
         throw Error("changing bind / port needs a restart of the server (reload refused, the running configuration is unchanged)");
-    if (n.root != c.cfg.root || n.key_file != c.cfg.key_file || n.state_dir != c.cfg.state_dir)
-        throw Error("changing root / key_file / state_dir needs a restart of the server (reload refused, the running "
+    if (n.root != c.cfg.root || n.state_dir != c.cfg.state_dir)
+        throw Error("changing root / state_dir needs a restart of the server (reload refused, the running "
                     "configuration is unchanged)");
+    // Key rotation is hot: key_file / key_file_next are read again on every reload (a file that cannot be read or
+    // a duplicate key refuses the whole reload, nothing is changed). An empty key_file (embedding / tests that pass
+    // the identity explicitly) keeps the running primary key.
+    std::shared_ptr<const detail::KeySet> new_keys;
+    {
+        auto cur = c.key_set();
+        auto ks = std::make_shared<detail::KeySet>();
+        ks->primary = n.key_file.empty() ? cur->primary : key_from_file(n.key_file);
+        if (!n.key_file_next.empty()) ks->next = key_from_file(n.key_file_next);
+        if (ks->next && ks->next->pub == ks->primary.pub) throw Error("key_file_next holds the same key as key_file");
+        new_keys = ks;
+    }
     std::shared_ptr<const detail::Policy> old = c.policy();
     auto np = std::make_shared<detail::Policy>(n);  // throws Error on a malformed allow / deny entry, nothing swapped yet
     for (const ClientAcl& a : n.clients) {
         std::shared_ptr<detail::ClientState> reuse;
         for (size_t i = 0; i < old->cfg.clients.size(); i++) {
             const ClientAcl& o = old->cfg.clients[i];
-            if (o.public_key == a.public_key && old->cstate[i]->quota_limit == a.max_write_bytes_per_hour &&
+            if (o.name == a.name && old->cstate[i]->quota_limit == a.max_write_bytes_per_hour &&
                 old->cstate[i]->kbps == a.max_bandwidth_kbps)
                 reuse = old->cstate[i];
         }
@@ -1234,9 +1394,12 @@ void Server::apply_config(const ServerConfig& n) {
     {
         std::lock_guard<std::mutex> lk(c.pm);
         c.pol = np;
+        c.keys = new_keys;
     }
     c.max_conn = n.max_connections;
     c.thr.set_max(n.max_auth_failures_per_min);
+    size_t cut = c.cut_unpermitted();
+    if (cut) log_info("reload: " + std::to_string(cut) + " open session(s) of removed / changed peers closed");
 }
 
 void Server::run(std::atomic<bool>& stop) {

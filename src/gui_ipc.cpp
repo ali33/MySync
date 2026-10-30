@@ -63,9 +63,11 @@ bool ipc_peer_allowed(uint32_t peer_uid, uint32_t self_uid, const std::vector<ui
     return false;
 }
 
-std::string ipc_pipe_sddl(const std::vector<std::string>& extra_sids, const std::string& owner_sid) {
+std::string ipc_pipe_sddl(const std::vector<std::string>& extra_sids, const std::string& owner_sid, bool user_only) {
+    if (user_only && (!extra_sids.empty() || owner_sid.empty()))
+        throw Error("a user-only control channel takes no allow entries and needs the account's SID");
     // Deny network logons first (canonical order), then grant. SY and BA get full control, the others read/write.
-    std::string s = "D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)";
+    std::string s = user_only ? "D:P(D;;GA;;;NU)" : "D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)";
     std::vector<std::string> seen;
     // Allowed principals get FILE_GENERIC_READ|WRITE minus FILE_APPEND_DATA (= CREATE_PIPE_INSTANCE): they can talk
     // to the pipe but never create a competing instance of it. The daemon's own account keeps the full right
@@ -73,7 +75,7 @@ std::string ipc_pipe_sddl(const std::vector<std::string>& extra_sids, const std:
     auto add = [&](const std::string& sid, const char* rights) {
         if (sid.empty()) return;
         if (is_broad_sid(sid)) throw Error("control allow: refusing broad principal " + sid);  // list lives in gui_trust.cpp
-        if (sid == "S-1-5-18" || sid == "S-1-5-32-544") return;  // SYSTEM / Administrators already present
+        if (!user_only && (sid == "S-1-5-18" || sid == "S-1-5-32-544")) return;  // SYSTEM / Administrators already present
         if (std::find(seen.begin(), seen.end(), sid) != seen.end()) return;
         seen.push_back(sid);
         s += std::string("(A;;") + rights + ";;;" + sid + ")";
@@ -396,7 +398,8 @@ std::string resolve_allow_entry(const std::string& entry) {
 }
 
 // Who runs the process that owns the pipe? Refuse to talk to anybody but the expected kinds of account.
-bool account_expected(const std::string& sid, const std::vector<std::string>& extra) {
+bool account_expected(const std::string& sid, const std::vector<std::string>& extra, bool user_only = false) {
+    if (user_only) return sid == current_user_sid();  // simple mode: only the user's own engine, no SYSTEM / admins
     if (sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20" || sid == "S-1-5-32-544" || sid == current_user_sid())
         return true;
     for (const auto& x : extra) {
@@ -411,7 +414,7 @@ bool account_expected(const std::string& sid, const std::vector<std::string>& ex
 // When the process cannot be inspected (a service of another account, a protected process) the decision falls back to
 // the owner recorded in the security descriptor of the pipe itself, which only the creating account can have set.
 // Failing to verify never means "trust".
-void verify_by_pipe_owner(HANDLE pipe, const std::vector<std::string>& extra, const std::string& name) {
+void verify_by_pipe_owner(HANDLE pipe, const std::vector<std::string>& extra, const std::string& name, bool user_only) {
     PSID owner = nullptr;
     PSECURITY_DESCRIPTOR sd = nullptr;
     DWORD rc = GetSecurityInfo(pipe, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &owner, nullptr, nullptr, nullptr, &sd);
@@ -424,30 +427,32 @@ void verify_by_pipe_owner(HANDLE pipe, const std::vector<std::string>& extra, co
         LocalFree(s);
     }
     LocalFree(sd);
-    if (!account_expected(sid, extra))
+    if (!account_expected(sid, extra, user_only))
         throw Error("the control pipe of '" + name + "' is owned by an unexpected account (" + sid +
                     "): not talking to it. For a service that runs under its own account, trust that account explicitly.");
 }
 
-void verify_server_process(HANDLE pipe, const std::vector<std::string>& extra, const std::string& name) {
+void verify_server_process(HANDLE pipe, const std::vector<std::string>& extra, const std::string& name, bool user_only) {
     ULONG pid = 0;
     if (!GetNamedPipeServerProcessId(pipe, &pid)) throw Error("cannot identify the process behind the control pipe");
     HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!ph) return verify_by_pipe_owner(pipe, extra, name);
+    if (!ph) return verify_by_pipe_owner(pipe, extra, name, user_only);
     Handle hp(ph);
     HANDLE tok = nullptr;
-    if (!OpenProcessToken(ph, TOKEN_QUERY, &tok)) return verify_by_pipe_owner(pipe, extra, name);
+    if (!OpenProcessToken(ph, TOKEN_QUERY, &tok)) return verify_by_pipe_owner(pipe, extra, name, user_only);
     Handle ht(tok);
     DWORD len = 0;
     GetTokenInformation(tok, TokenUser, nullptr, 0, &len);
     std::vector<uint8_t> buf(len ? len : 1);
-    if (!len || !GetTokenInformation(tok, TokenUser, buf.data(), len, &len)) return verify_by_pipe_owner(pipe, extra, name);
+    if (!len || !GetTokenInformation(tok, TokenUser, buf.data(), len, &len)) return verify_by_pipe_owner(pipe, extra, name, user_only);
     LPWSTR s = nullptr;
     if (!ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid, &s))
-        return verify_by_pipe_owner(pipe, extra, name);
+        return verify_by_pipe_owner(pipe, extra, name, user_only);
     std::string sid = narrow(s);
     LocalFree(s);
-    if (account_expected(sid, extra)) return;
+    if (account_expected(sid, extra, user_only)) return;
+    if (user_only)
+        throw Error("the control pipe of '" + name + "' is run by another account (" + sid + "): not talking to it");
     // an elevated administrator running the daemon in the foreground
     DWORD gl = 0;
     GetTokenInformation(tok, TokenGroups, nullptr, 0, &gl);
@@ -593,7 +598,7 @@ void IpcServer::start() {
     if (s.started) return;
     std::vector<std::string> sids;
     for (const auto& a : s.opts.allow) sids.push_back(resolve_allow_entry(a));
-    s.sddl = detail::ipc_pipe_sddl(sids, current_user_sid());
+    s.sddl = detail::ipc_pipe_sddl(sids, current_user_sid(), s.opts.user_only);
     s.stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!s.stop_event) throw Error("cannot create an event");
     HANDLE first = INVALID_HANDLE_VALUE;
@@ -652,7 +657,7 @@ ControlResponse ControlClient::call(const ControlRequest& req) {
         throw Error("cannot open the control pipe " + path + ": " + win_msg(e));
     }
     Handle hh(h);
-    verify_server_process(h, trusted_accounts_, name_);
+    verify_server_process(h, trusted_accounts_, name_, user_only_);
     DWORD mode = PIPE_READMODE_BYTE;
     SetNamedPipeHandleState(h, &mode, nullptr, nullptr);
     PipeChannel ch(h, nullptr);
@@ -835,7 +840,7 @@ struct IpcServer::Impl {
         if (::lstat(dir.c_str(), &lst) == 0) {
             if (S_ISLNK(lst.st_mode)) throw Error("refusing a symbolic link as the control directory: " + dir);
         } else if (errno == ENOENT) {
-            if (::mkdir(dir.c_str(), 0750) != 0 && errno != EEXIST)
+            if (::mkdir(dir.c_str(), opts.user_only ? 0700 : 0750) != 0 && errno != EEXIST)
                 throw Error("cannot create the control directory " + dir + ": " + errno_text(errno));
         } else {
             throw Error("cannot inspect the control directory " + dir + ": " + errno_text(errno));
@@ -850,8 +855,9 @@ struct IpcServer::Impl {
             if (::fchown(d.fd, static_cast<uid_t>(-1), group_gid) != 0 && ::geteuid() == 0)
                 throw Error("cannot set the group of " + dir + ": " + errno_text(errno));
         }
-        if (st.st_uid == self_uid && (st.st_mode & 07777) != 0750 && ::fchmod(d.fd, 0750) != 0)
-            throw Error("cannot set mode 0750 on " + dir + ": " + errno_text(errno));
+        const mode_t want_mode = opts.user_only ? 0700 : 0750;
+        if (st.st_uid == self_uid && (st.st_mode & 07777) != want_mode && ::fchmod(d.fd, want_mode) != 0)
+            throw Error("cannot set the mode of " + dir + ": " + errno_text(errno));
         if (::fstat(d.fd, &st) == 0 && (st.st_mode & 0022) != 0)
             throw Error("the control directory " + dir + " is writable by group or others");
         // no symbolic link anywhere on the way (the descriptor above only proves the last component)
@@ -1080,6 +1086,10 @@ ControlResponse ControlClient::call(const ControlRequest& req) {
             last_err = "the process behind " + path + " is not the owner of the socket: refusing";
             continue;
         }
+        if (user_only_ && (!peer_cred(f.fd, puid, pgid) || puid != ::geteuid())) {
+            last_err = "the process behind " + path + " is not run by you: refusing";
+            continue;
+        }
         FdChannel ch(f.fd);
         try {
             return client_exchange(ch, req, timeout_ms_);
@@ -1092,6 +1102,7 @@ ControlResponse ControlClient::call(const ControlRequest& req) {
 #endif
 
 // ============================================================================================= ControlClient (shared)
+void ControlClient::require_current_user_only() { user_only_ = true; }
 void ControlClient::trust_server_account(const std::string& sid_or_name) { trusted_accounts_.push_back(sid_or_name); }
 
 ControlClient::ControlClient(std::string name, int timeout_ms, std::string dir_override)
@@ -1160,5 +1171,31 @@ std::vector<ErrorEntry> ControlClient::recent_errors(uint32_t max) {
     require_ok(r);
     return std::move(r.errors);
 }
+
+namespace {
+PairInfo pair_call(ControlClient& c, ControlOp op, uint32_t arg, uint64_t token) {
+    ControlRequest q;
+    q.op = op;
+    q.token = token;
+    q.arg = arg;
+    ControlResponse r = c.call(q);
+    if (r.status == ControlStatus::Unsupported) throw Error("this program does not accept pairing");
+    if (r.status != ControlStatus::Ok) throw Error(r.error.empty() ? "pairing request refused" : r.error);
+    return std::move(r.pair);
+}
+}  // namespace
+
+PairInfo ControlClient::pair_info() { return pair_call(*this, ControlOp::PairList, 0, take_token(m_, next_token_)); }
+
+PairInfo ControlClient::pair_mode(bool on, uint32_t seconds) {
+    return pair_call(*this, on ? ControlOp::PairModeOn : ControlOp::PairModeOff, on ? seconds : 0,
+                     take_token(m_, next_token_));
+}
+
+std::string ControlClient::pair_approve(uint32_t id) {
+    return pair_call(*this, ControlOp::PairApprove, id, take_token(m_, next_token_)).message;
+}
+
+void ControlClient::pair_deny(uint32_t id) { pair_call(*this, ControlOp::PairDeny, id, take_token(m_, next_token_)); }
 
 }  // namespace mysync::gui

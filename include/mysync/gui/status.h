@@ -42,6 +42,7 @@ struct TargetStatus {
     uint64_t bytes = 0;                      // payload bytes transferred so far
     std::string last_error;                  // verbatim, no secrets; empty = none
     int64_t last_error_unix_ms = 0;          // 0 = none
+    int64_t last_ok_unix_ms = 0;             // last time a connection / file went through; 0 = never since start
 };
 
 // One [[client]] of a server daemon (by name only: no key).
@@ -71,12 +72,39 @@ struct StatusSnapshot {
     // both
     int64_t config_loaded_unix_ms = 0;       // when the running configuration was (re)loaded
     std::string config_error;                // why the last RELOAD_CONFIG was refused ("" = none)
+    // server (operations): pairing mode of the configuration ("off" | "on-demand"), peers.d files that could not be
+    // used, and short warnings about the configuration (key rotation under way, skipped peer files ...). Verbatim, no secrets.
+    std::string pairing;
+    uint32_t peer_file_errors = 0;
+    std::vector<std::string> warnings;
 };
 
 struct ErrorEntry {
     int64_t unix_ms = 0;
     std::string level;                       // "WARN" | "ERROR"
     std::string message;                     // verbatim log message
+};
+
+// Pairing (simple/pairing.h): what the receiving daemon reports about its "pairing mode" and waiting requests.
+// Carries the receiver's PUBLIC key (never a secret) so the GUI can build the pairing code.
+struct PairPendingInfo {
+    uint32_t id = 0;
+    std::string name;           // display name given by the sending machine (cleaned)
+    std::string sas;            // "ABCD-EFGH-JKMN-PQRS", shown on both machines
+    std::string ip;
+    uint32_t seconds_left = 0;
+};
+struct PairInfo {
+    bool available = false;     // the daemon was started with --allow-pairing
+    bool mode_on = false;
+    uint32_t seconds_left = 0;  // until the mode switches itself off
+    std::string public_hex;     // receiver public key, 64 hex
+    uint16_t port = 0;          // listening port
+    std::vector<PairPendingInfo> pending;
+    std::string message;        // approve: the prefix granted ("from-...")
+    // ONLY in the answer to PairModeOn: the one-time token (32 hex) for the pairing code. Never in any other answer,
+    // never logged; the daemon keeps just its hash.
+    std::string token_hex;
 };
 
 struct ReloadResult {

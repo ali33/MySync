@@ -27,7 +27,9 @@ namespace mysync::gui {
 // characters, option-looking text, at most 256 bytes.
 bool valid_control_allow_entry(const std::string& entry);
 
-enum class ServiceAction { Install, Uninstall, Start, Stop };
+// MigrateFromUser: `mysync service migrate-from-user` - copies a per-user configuration (and its key) into the trusted
+// service location (simple mode, see simple/service_upgrade.h). It needs ServiceRequest::user_config and name.
+enum class ServiceAction { Install, Uninstall, Start, Stop, MigrateFromUser };
 const char* service_action_name(ServiceAction);  // "install" ...
 
 // Exit codes of `mysync service <action>` (0 = success). Stable: the GUI maps them to messages.
@@ -57,6 +59,8 @@ struct ServiceState {
 
 struct ServiceRequest {
     std::string name;                         // service name, required
+    bool remove_migrated = false;             // migrate-from-user: delete the service's copy instead (no user_config)
+    std::string user_config;                  // migrate-from-user: absolute path of the user's configuration file
     std::string config_path;                  // install: absolute path of the config file
     std::string role;                         // install: "server" | "client" | "" (auto from the config)
     std::string run_as;                       // install: Windows account / Linux user ("" = default)

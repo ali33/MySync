@@ -513,13 +513,13 @@ TEST(gui_daemon_key_file_change_is_noticed_and_a_failed_reload_does_not_lock_out
     d.start_server(true, false);
     ControlClient sc(d.sctl, 5000, d.sdir);
     CHECK(wait_until([&] { return sc.ping(); }, 10));
-    // the server key file is replaced in place (same path): only a restart picks it up, and the reload says so
+    // the server key file is replaced in place (same path): the key is read again by the reload (rotation needs no restart)
     {
         std::ofstream(d.skey, std::ios::binary | std::ios::app) << "\n";
     }
     ReloadResult rr = sc.reload_config();
     CHECK(rr.ok);
-    CHECK(contains(rr.needs_restart, "key_file contents"));
+    CHECK(contains(rr.applied, "server key file(s)"));
 
     d.start_client();
     ControlClient cc(d.cctl, 5000, d.cdir);

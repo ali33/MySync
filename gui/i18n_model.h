@@ -24,5 +24,6 @@ std::string trf(const char* key, const std::vector<std::string>& args);
 size_t i18n_count();
 std::vector<std::string> i18n_problems();
 bool i18n_has(const char* key);
+std::vector<std::string> i18n_keys();             // mọi khoá (cho test quét nội dung)
 
 }  // namespace mysync::gui

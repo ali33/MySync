@@ -19,6 +19,7 @@
 //   GENERIC_ALL) must belong to T, the owner must be in T, and conditional / object ACEs are refused outright.
 // A violation is an Error whose message names the object, the offender and how to fix it.
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -70,7 +71,14 @@ bool valid_trust_writer_entry(const std::string& entry);
 // not writable by group/other. Returns "" or the reason.
 std::string untrusted_executable_reason(const std::string& exe);
 
+// The state folder the engine really uses: `state_dir` when set, else the default (client: <config folder>/state, server:
+// <root>/__sync/__meta). Pass the RESOLVED values: this is what require_trusted_run must be given.
+std::string effective_client_state_dir(const std::string& state_dir, const std::string& config_path);
+std::string effective_server_state_dir(const std::string& state_dir, const std::string& root);
+
 namespace detail {
+// Strict decimal id for "uid:N" / "gid:N": digits only, no sign / space / leading zero, at most 4294967295.
+bool parse_numeric_id(const std::string& s, uint32_t& out);
 // True for the SID text of a broad group (also used by the control pipe's DACL builder).
 bool is_broad_sid(const std::string& sid);
 // Windows: normalised SID string for "S-1-5-..." or an account name; elsewhere returns the input.
