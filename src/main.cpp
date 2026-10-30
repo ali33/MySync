@@ -314,7 +314,7 @@ int cmd_run(const Opts& o) {
         dopt.service_name = o.name.empty() ? default_service_name(l.role) : o.name;
         dopt.config_path = l.path;
         dopt.version = kVersion;
-        dopt.enforce_config_trust = o.service || gui::ServiceController::is_elevated();
+        dopt.enforce_config_trust = gui::need_strict_trust(gui::ServiceController::is_elevated(), o.service);
         dopt.trusted_writers = o.trust_writers;
         std::string dir = l.dir;
         body = [sc, dir, dopt](std::atomic<bool>& stop) {
@@ -327,16 +327,22 @@ int cmd_run(const Opts& o) {
         ClientConfig cc = l.client;
         std::string dir = l.dir;
         bool once = o.once;
+        bool strict_once = gui::need_strict_trust(gui::ServiceController::is_elevated(), o.service);
+        std::vector<std::string> once_writers = o.trust_writers;
+        std::string once_config = l.path;
         int* prc = &rc;
         gui::DaemonOptions dopt;
         dopt.service_name = o.name.empty() ? default_service_name(l.role) : o.name;
         dopt.config_path = l.path;
         dopt.version = kVersion;
-        dopt.enforce_config_trust = o.service || gui::ServiceController::is_elevated();
+        dopt.enforce_config_trust = gui::need_strict_trust(gui::ServiceController::is_elevated(), o.service);
         dopt.trusted_writers = o.trust_writers;
-        body = [cc, dir, once, prc, dopt](std::atomic<bool>& stop) {
+        body = [cc, dir, once, strict_once, once_writers, once_config, prc, dopt](std::atomic<bool>& stop) {
             log_info("MySync client " + std::string(kVersion) + (once ? ": one sync pass" : ": watching"));
             if (once) {
+                // Same rule as the daemon: with high rights (elevated / SYSTEM / root / --service) the configuration must
+                // not be editable by others; a plain account running its own files is not blocked.
+                if (strict_once) gui::require_trusted_run(once_config, cc.state_dir, cc.log_file, once_writers);
                 SyncEngine eng(cc, dir);
                 eng.sync_once(stop);
                 EngineStats s = eng.stats();
@@ -404,10 +410,11 @@ int cmd_service_impl(const Opts& o) {
         // go into the service arguments, never into (or from) the file itself.
         std::vector<std::string> trusted = o.trust_writers;
         trusted.insert(trusted.end(), o.control_allow.begin(), o.control_allow.end());
-        // The service will obey this file with elevated rights: nobody else may be able to edit it or its folder.
-        gui::require_trusted_config(l.path, trusted);
         std::string exe = self_exe();
-        if (exe.empty()) throw Error("cannot determine the path of the mysync executable");
+        // One shared vetting (also used by the GUI): the program, broad groups, and a configuration that nobody but the
+        // service's trusted set can edit.
+        std::string bad = gui::validate_install_inputs(exe, l.path, o.trust_writers, o.control_allow, o.user);
+        if (!bad.empty()) throw Error(bad);
         ServiceSpec sp;
         sp.name = name;
         sp.display = role == Role::Server ? "MySync server" : "MySync client";

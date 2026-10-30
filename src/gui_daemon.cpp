@@ -208,9 +208,7 @@ std::string summary(const Diff& d) {
 template <class C>
 void check_trust(const C& c, const DaemonOptions& o) {
     if (!o.enforce_config_trust) return;
-    require_trusted_config(o.config_path, o.trusted_writers);
-    require_trusted_dir(c.state_dir, "state_dir", o.trusted_writers);
-    if (!c.log_file.empty()) require_trusted_dir(fs::u8path(c.log_file).parent_path().u8string(), "the log folder", o.trusted_writers);
+    require_trusted_run(o.config_path, c.state_dir, c.log_file, o.trusted_writers);
 }
 
 // "path:size:mtime" of every key file a configuration names: a rotated key is a change even when the path is not.

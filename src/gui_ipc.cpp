@@ -64,19 +64,6 @@ bool ipc_peer_allowed(uint32_t peer_uid, uint32_t self_uid, const std::vector<ui
 }
 
 std::string ipc_pipe_sddl(const std::vector<std::string>& extra_sids, const std::string& owner_sid) {
-    static const char* const kForbidden[] = {
-        "S-1-1-0",       // Everyone
-        "S-1-5-11",      // Authenticated Users
-        "S-1-5-32-545",  // Users
-        "S-1-5-32-546",  // Guests
-        "S-1-5-7",       // Anonymous
-        "S-1-5-2",       // Network
-        "S-1-5-4",       // Interactive
-        "S-1-2-0",       // Local
-        "S-1-2-1",       // Console logon
-        "S-1-5-14",      // Remote interactive logon
-        "S-1-5-15",      // This organization
-    };
     // Deny network logons first (canonical order), then grant. SY and BA get full control, the others read/write.
     std::string s = "D:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)";
     std::vector<std::string> seen;
@@ -85,8 +72,7 @@ std::string ipc_pipe_sddl(const std::vector<std::string>& extra_sids, const std:
     // because it creates the further instances.
     auto add = [&](const std::string& sid, const char* rights) {
         if (sid.empty()) return;
-        for (const char* f : kForbidden)
-            if (sid == f) throw Error("control allow: refusing broad principal " + sid);
+        if (is_broad_sid(sid)) throw Error("control allow: refusing broad principal " + sid);  // list lives in gui_trust.cpp
         if (sid == "S-1-5-18" || sid == "S-1-5-32-544") return;  // SYSTEM / Administrators already present
         if (std::find(seen.begin(), seen.end(), sid) != seen.end()) return;
         seen.push_back(sid);

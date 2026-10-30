@@ -51,6 +51,27 @@ struct TrTmp {
     }
 };
 
+#ifdef _WIN32
+std::string my_sid_text() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return {};
+    DWORD len = 0;
+    GetTokenInformation(tok, TokenUser, nullptr, 0, &len);
+    std::vector<uint8_t> buf(len ? len : 1);
+    std::string out;
+    if (len && GetTokenInformation(tok, TokenUser, buf.data(), len, &len)) {
+        LPWSTR s = nullptr;
+        if (ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(buf.data())->User.Sid, &s)) {
+            std::wstring w(s);
+            LocalFree(s);
+            out.assign(w.begin(), w.end());
+        }
+    }
+    CloseHandle(tok);
+    return out;
+}
+#endif
+
 }  // namespace
 
 TEST(gui_trust_normal_private_config_is_accepted) {
@@ -92,12 +113,12 @@ TEST(gui_trust_file_or_folder_writable_by_everyone_is_refused) {
 }
 
 #ifdef _WIN32
-TEST(gui_trust_windows_allow_list_exempts_the_principal) {
+TEST(gui_trust_windows_world_writable_file_is_refused_even_when_a_personal_sid_is_listed) {
     TrTmp t;
     fs::path f = t.file("server.toml");
     CHECK(guitest::make_world_writable(f));
-    CHECK(untrusted_writer_reason(f.u8string(), {}).find("S-1-1-0") != std::string::npos);
-    CHECK_EQ(untrusted_writer_reason(f.u8string(), {"S-1-1-0"}), std::string());  // an admin put Everyone in allow
+    // listing one's own SID does not excuse an Everyone ACE (and Everyone itself can no longer be listed at install)
+    CHECK(untrusted_writer_reason(f.u8string(), {my_sid_text()}).find("S-1-1-0") != std::string::npos);
 }
 
 TEST(gui_trust_windows_executable_rules) {
@@ -254,4 +275,130 @@ TEST(gui_service_build_args_carries_trust_writers) {
     CHECK(std::find(a.begin(), a.end(), std::string("--trust-writer")) != a.end());
     r.trust_writers = {"a\"b"};
     CHECK_THROWS(sc.build_args(ServiceAction::Install, r));
+}
+
+// ---------------------------------------------------------------------------------------------- M-B / M-D / M-E
+
+TEST(gui_trust_need_strict_trust_policy) {
+    CHECK(!need_strict_trust(false, false));  // a plain account running its own files is not blocked
+    CHECK(need_strict_trust(true, false));    // elevated / root
+    CHECK(need_strict_trust(false, true));    // --service
+    CHECK(need_strict_trust(true, true));
+}
+
+TEST(gui_trust_run_check_refuses_files_others_can_write_and_passes_private_ones) {
+    // what `mysync run --once` and the daemons run when strict
+    TrTmp t;
+    fs::path f = t.file("client.toml");
+    fs::path st = t.p / "state";
+    fs::create_directories(st);
+    guitest::make_private_dir(st);
+    fs::path log = t.p / "log" / "m.log";
+    CHECK_EQ(untrusted_writer_reason(f.u8string(), {}), std::string());
+    require_trusted_run(f.u8string(), st.u8string(), log.u8string(), {});
+    // the configuration writable by everybody
+    CHECK(guitest::make_world_writable(f));
+    CHECK_THROWS(require_trusted_run(f.u8string(), st.u8string(), "", {}));
+    // state_dir writable by everybody
+    TrTmp t2;
+    fs::path f2 = t2.file("client.toml");
+    fs::path st2 = t2.p / "state";
+    fs::create_directories(st2);
+    CHECK(guitest::make_world_writable(st2));
+    CHECK_THROWS(require_trusted_run(f2.u8string(), st2.u8string(), "", {}));
+}
+
+TEST(gui_trust_broad_sids_and_names_are_recognised) {
+    for (const char* sid : {"S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-5-32-546", "S-1-5-32-547", "S-1-5-4", "S-1-5-2",
+                            "S-1-5-7", "S-1-2-0", "S-1-5-21-1-2-3-513", "S-1-5-21-1-2-3-515"})
+        CHECK(detail::is_broad_sid(sid));
+    for (const char* sid : {"S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-512", "S-1-5-18", "S-1-5-32-544", "S-1-5-80-1"})
+        CHECK(!detail::is_broad_sid(sid));
+    for (const char* n : {"Everyone", "everyone", "Users", "BUILTIN\\Users", "Authenticated Users",
+                          "NT AUTHORITY\\INTERACTIVE", "Guests", "Domain Users", "CORP\\Domain Computers", "users",
+                          "@users", "other", "others", "*"}) {
+        std::string why = broad_principal_reason(n);
+        CHECK(!why.empty());
+        CHECK(why.find("broad group") != std::string::npos);
+        CHECK(why.find("escalate") != std::string::npos);
+    }
+#ifdef _WIN32
+    CHECK(!broad_principal_reason("S-1-1-0").empty());
+    CHECK(!broad_principal_reason("s-1-5-32-545").empty());
+    CHECK(!broad_principal_reason("S-1-5-21-5-6-7-513").empty());
+    CHECK(broad_principal_reason(my_sid_text()).empty());
+#else
+    CHECK(!broad_principal_reason("gid:100").empty());
+#endif
+    for (const char* n : {"alice", "CORP\\alice", "S-1-5-21-1-2-3-1001", "uid:1234", "gid:4321", "@no-such-group-xyz"})
+        CHECK(broad_principal_reason(n).empty());
+}
+
+TEST(gui_service_build_args_refuses_broad_principals) {
+    TrTmp t;
+#ifdef _WIN32
+    fs::path exe = t.file("mysync.exe");
+#else
+    fs::path exe = t.file("mysync");
+    fs::permissions(exe, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read |
+                             fs::perms::others_exec);
+#endif
+    ServiceController sc(exe.u8string());
+    fs::path cfg = t.file("c.toml");
+    ServiceRequest r;
+    r.name = "n";
+    r.config_path = cfg.u8string();
+    for (const char* bad : {"Everyone", "Users", "S-1-5-11", "users", "*"}) {
+        ServiceRequest a = r;
+        a.control_allow = {bad};
+        CHECK_THROWS(sc.build_args(ServiceAction::Install, a));
+        ServiceRequest b = r;
+        b.trust_writers = {bad};
+        CHECK_THROWS(sc.build_args(ServiceAction::Install, b));
+    }
+    ServiceRequest ok = r;
+    ok.control_allow = {"CORP\\alice"};
+    ok.trust_writers = {"CORP-ops"};
+    CHECK(!sc.build_args(ServiceAction::Install, ok).empty());
+}
+
+TEST(gui_trust_validate_install_inputs_rejects_untrusted_inputs) {
+    TrTmp t;
+#ifdef _WIN32
+    fs::path exe = t.file("mysync.exe");
+    std::string good_exe = "C:\\Windows\\System32\\cmd.exe";
+#else
+    fs::path exe = t.file("mysync");
+    std::string good_exe = "/usr/bin/env";
+#endif
+    fs::path cfg = t.file("server.toml");
+    // an executable in a user-writable folder
+    std::string why = validate_install_inputs(exe.u8string(), cfg.u8string(), {}, {}, "");
+    CHECK(why.find("not trustworthy") != std::string::npos);
+    CHECK(!validate_install_inputs("", cfg.u8string(), {}, {}, "").empty());
+
+    if (!untrusted_executable_reason(good_exe).empty()) return;  // no administrator-owned program to stand in for mysync
+    // broad principals, on either list
+    CHECK(validate_install_inputs(good_exe, cfg.u8string(), {"Everyone"}, {}, "").find("broad group") != std::string::npos);
+    CHECK(validate_install_inputs(good_exe, cfg.u8string(), {}, {"users"}, "").find("broad group") != std::string::npos);
+#ifdef _WIN32
+    if (!ServiceController::is_elevated()) {
+        // the installing user is not trusted by the service just because they ran the installer ...
+        CHECK(validate_install_inputs(good_exe, cfg.u8string(), {}, {}, "").find("refusing to trust") != std::string::npos);
+        // ... unless named, or unless it is the account the service runs as
+        CHECK_EQ(validate_install_inputs(good_exe, cfg.u8string(), {my_sid_text()}, {}, ""), std::string());
+        CHECK_EQ(validate_install_inputs(good_exe, cfg.u8string(), {}, {}, my_sid_text()), std::string());
+    }
+    CHECK(guitest::make_world_writable(cfg));
+    CHECK(!validate_install_inputs(good_exe, cfg.u8string(), {my_sid_text()}, {}, "").empty());
+#else
+    if (::geteuid() == 0) {
+        CHECK_EQ(::chown(cfg.c_str(), 1234, 4321), 0);
+        CHECK(validate_install_inputs(good_exe, cfg.u8string(), {}, {}, "").find("refusing to trust") != std::string::npos);
+        CHECK_EQ(validate_install_inputs(good_exe, cfg.u8string(), {"uid:1234"}, {}, ""), std::string());
+        CHECK_EQ(validate_install_inputs(good_exe, cfg.u8string(), {}, {}, "uid:1234"), std::string());
+        CHECK(guitest::make_world_writable(cfg));
+        CHECK(!validate_install_inputs(good_exe, cfg.u8string(), {"uid:1234"}, {}, "").empty());
+    }
+#endif
 }

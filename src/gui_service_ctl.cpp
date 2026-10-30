@@ -549,11 +549,15 @@ std::vector<std::string> ServiceController::build_args(ServiceAction act, const 
         }
         for (const auto& x : rq.control_allow) {
             if (!allow_ok(x)) throw Error("invalid control allow entry");
+            std::string broad = broad_principal_reason(x);
+            if (!broad.empty()) throw Error(broad);
             a.push_back("--control-allow");
             a.push_back(x);
         }
         for (const auto& x : rq.trust_writers) {
             if (!allow_ok(x)) throw Error("invalid trust-writer entry");
+            std::string broad = broad_principal_reason(x);
+            if (!broad.empty()) throw Error(broad);
             a.push_back("--trust-writer");
             a.push_back(x);
         }
@@ -582,6 +586,17 @@ ServiceResult ServiceController::run(ServiceAction act, const ServiceRequest& rq
 #endif
         r.state_after = query(rq.name);
         return r;
+    }
+    if (act == ServiceAction::Install) {
+        // same vetting as the command line (one function), before the UAC / pkexec prompt
+        std::string bad = validate_install_inputs(exe_, rq.config_path, rq.trust_writers, rq.control_allow, rq.run_as);
+        if (!bad.empty()) {
+            ServiceResult r;
+            r.exit_code = kServiceConfigError;
+            r.message = bad;
+            r.state_after = query(rq.name);
+            return r;
+        }
     }
     ServiceResult res = run_child(exe_, args);
     res.state_after = query(rq.name);

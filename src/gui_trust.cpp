@@ -5,6 +5,7 @@
 #include "mysync/gui/trust.h"
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <functional>
 #include <set>
@@ -219,12 +220,12 @@ bool valid_trust_writer_entry(const std::string& a) {
     return true;
 }
 
-void require_trusted_config(const std::string& config_path, const std::vector<std::string>& trusted) {
-    std::string r = untrusted_writer_reason(config_path, trusted);
+void require_trusted_config(const std::string& config_path, const std::vector<std::string>& trusted, bool include_self) {
+    std::string r = untrusted_writer_reason(config_path, trusted, include_self);
     if (!r.empty()) throw Error("refusing to trust the configuration file '" + config_path + "': it " + r);
     std::string dir = fs::u8path(config_path).parent_path().u8string();
     if (dir.empty()) dir = ".";
-    r = untrusted_writer_reason(dir, trusted);
+    r = untrusted_writer_reason(dir, trusted, include_self);
     if (!r.empty())
         throw Error("refusing to trust the configuration file '" + config_path + "': its folder '" + dir + "' " + r);
 }
@@ -235,6 +236,125 @@ void require_trusted_dir(const std::string& dir, const std::string& what, const 
     if (!fs::exists(fs::u8path(dir), ec)) return;
     std::string r = untrusted_writer_reason(dir, trusted);
     if (!r.empty()) throw Error("refusing " + what + " '" + dir + "': it " + r);
+}
+
+void require_trusted_run(const std::string& config_path, const std::string& state_dir, const std::string& log_file,
+                         const std::vector<std::string>& trusted) {
+    require_trusted_config(config_path, trusted);
+    require_trusted_dir(state_dir, "state_dir", trusted);
+    if (!log_file.empty())
+        require_trusted_dir(fs::u8path(log_file).parent_path().u8string(), "the log folder", trusted);
+}
+
+bool need_strict_trust(bool elevated, bool service) { return elevated || service; }
+
+// ------------------------------------------------------------------------------------------ broad principals
+namespace {
+
+// Names are also matched as text, so a name that cannot be resolved here (other domain, other language) is still
+// caught when spelled the well-known way. Windows names are additionally resolved and compared by SID.
+bool broad_name(const std::string& entry) {
+    std::string n = entry;
+    for (auto& c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    size_t bs = n.find_last_of('\\');
+    if (bs != std::string::npos) n = n.substr(bs + 1);
+    if (!n.empty() && n[0] == '@') n.erase(0, 1);
+    static const char* const kNames[] = {
+        "*", "everyone", "world", "all", "users", "user", "other", "others", "authenticated users", "interactive",
+        "network", "anonymous", "anonymous logon", "guests", "guest", "domain users", "domain guests",
+        "domain computers", "local", "power users", "console logon", "this organization", "local account",
+    };
+    for (const char* k : kNames)
+        if (n == k) return true;
+    return false;
+}
+
+}  // namespace
+
+namespace detail {
+
+bool is_broad_sid(const std::string& sid) {
+    static const char* const kBroad[] = {
+        "S-1-1-0",       // Everyone
+        "S-1-5-11",      // Authenticated Users
+        "S-1-5-32-545",  // BUILTIN\Users
+        "S-1-5-32-546",  // Guests
+        "S-1-5-32-547",  // Power Users
+        "S-1-5-32-554",  // Pre-Windows 2000 compatible access
+        "S-1-5-7",       // Anonymous
+        "S-1-5-2",       // Network
+        "S-1-5-4",       // Interactive
+        "S-1-2-0",       // Local
+        "S-1-2-1",       // Console logon
+        "S-1-5-14",      // Remote interactive logon
+        "S-1-5-15",      // This organization
+        "S-1-5-113",     // Local account
+    };
+    for (const char* k : kBroad)
+        if (sid == k) return true;
+    if (sid.rfind("S-1-5-21-", 0) == 0) {  // Domain Users / Guests / Computers of any domain or machine
+        std::string rid = sid.substr(sid.find_last_of('-') + 1);
+        if (rid == "513" || rid == "514" || rid == "515") return true;
+    }
+    return false;
+}
+
+}  // namespace detail
+
+std::string broad_principal_reason(const std::string& entry) {
+    std::string upper = entry;
+    for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    bool broad = broad_name(entry) || detail::is_broad_sid(upper);  // a SID spelled out, on any platform
+    std::string what = entry;
+#ifdef _WIN32
+    if (!broad) {
+        try {
+            std::string sid = detail::resolve_principal_sid(entry);
+            if (detail::is_broad_sid(sid)) {
+                broad = true;
+                if (sid != entry) what = entry + " (" + sid + ")";
+            }
+        } catch (const std::exception&) {  // unresolvable here: the install / the pipe rejects it on its own terms
+        }
+    }
+#else
+    if (!broad) {
+        if (entry == "gid:100") {
+            broad = true;
+        } else if (entry.size() > 1 && entry[0] == '@') {
+            struct group gr{}, *res = nullptr;
+            char buf[4096];
+            if (::getgrnam_r(entry.c_str() + 1, &gr, buf, sizeof buf, &res) == 0 && res && gr.gr_gid == 100) broad = true;
+        }
+    }
+#endif
+    if (!broad) return {};
+    return "'" + what + "' is a broad group: granting it write access to the service configuration gives every local " +
+           "user a way to escalate to the service's privileges";
+}
+
+std::string validate_install_inputs(const std::string& exe, const std::string& config_path,
+                                    const std::vector<std::string>& trust_writers,
+                                    const std::vector<std::string>& control_allow, const std::string& run_as) {
+    if (exe.empty()) return "cannot determine the path of the mysync executable";
+    std::string why = untrusted_executable_reason(exe);
+    if (!why.empty()) return "refusing to install: the mysync program is not trustworthy: " + why;
+    for (const auto* list : {&trust_writers, &control_allow})
+        for (const auto& e : *list) {
+            std::string r = broad_principal_reason(e);
+            if (!r.empty()) return "refusing to install: " + r;
+        }
+    // Who may edit the configuration, as the SERVICE will judge it: built-ins, the named entries and its own account.
+    // The installing administrator counts only when named (include_self=false).
+    std::vector<std::string> trusted = trust_writers;
+    trusted.insert(trusted.end(), control_allow.begin(), control_allow.end());
+    if (!run_as.empty()) trusted.push_back(run_as);
+    try {
+        require_trusted_config(config_path, trusted, /*include_self=*/false);
+    } catch (const Error& e) {
+        return e.what();
+    }
+    return {};
 }
 
 }  // namespace mysync::gui
