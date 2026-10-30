@@ -108,3 +108,13 @@ Chưa kiểm: nâng quyền UAC/pkexec thật; cài/gỡ dịch vụ thật và 
 
 ## Đợt 8 — đã duyệt hướng (CHƯA làm, chờ lệnh)
 Người dùng đã duyệt hướng: hỗ trợ tài khoản quản trị viên Windows cho dịch vụ-user bằng **restricted token**: engine chạy với SID Administrators ở chế độ deny-only, quyền đặc biệt bị bỏ, integrity Medium, khởi chạy qua `CreateProcessAsUser` (dịch vụ chỉ là bộ khởi chạy mỏng). Khi đó dịch vụ không còn đặc quyền cao hơn một tiến trình thường của user và lỗ hổng H-1 (junction tráo trong cây của user) không còn leo thang. Cho đến khi có lệnh làm đợt 8, **tài khoản admin vẫn bị từ chối** (GUI/CLI/migrate/apply-config) với thông báo dễ hiểu như hiện tại. Dịch vụ cài bằng CLI cho server-to-server vẫn không đổi.
+
+## Rà soát riêng thay đổi "từ chối tài khoản admin Windows" (hoàn tất, commit local)
+Reviewer độc lập (chỉ đọc, chưa thấy mã) kết luận: không có đường nào cài dịch vụ-user bằng tài khoản admin lọt kiểm, nhưng kiểm yếu (fail-open, chỉ xét token tiến trình hiện tại, nhóm hẹp). Đã sửa:
+- `account_admin_state` ba trạng thái (No/Yes/Unknown), fail-closed: lỗi API hay SID không xét được = từ chối; mọi caller từ chối trừ khi == No.
+- Đánh giá trên TOKEN MỚI của tài khoản đích (LogonUser: TokenGroups gồm deny-only/disabled + TokenLinkedToken), cộng kiểm token tiến trình; mở rộng sang nhóm toán tử (Backup/Server/Account/Print/…) và quyền SeDebug/SeTcb/SeLoadDriver/SeBackup/SeRestore/SeTakeOwnership/SeCreateToken/SeSecurity. SeImpersonate cố ý không tính.
+- `service set-password` từ chối admin/Unknown; dịch vụ-user tự từ chối KHỞI ĐỘNG (lỗi nguyên văn, mã 1) nếu tài khoản nay là admin; `service install` tên `mysync-*-<code>` thiếu `--user-service` bị từ chối.
+- Bỏ `g_admin_override` khỏi API sản phẩm: dùng tham số `AdminProbe` tiêm trong test; production không truyền.
+- Test thật: chạy bước migrate production với probe Yes/Unknown => `kServiceAccessDenied` và không tạo gì. Set-password và đường khởi động mới chỉ test qua hàm thuần từ chối, chưa end-to-end.
+- **Hạn chế chức năng đã xác nhận bằng đọc mã**: bước nâng quyền yêu cầu CÙNG tài khoản người yêu cầu; người dùng chuẩn khi UAC phải nhập tài khoản admin khác => bị từ chối; admin => bị từ chối theo thiết kế. Nên trên Windows nút "cài dịch vụ" hiện bị khoá kèm giải thích ("tạm thời chưa hỗ trợ, hãy dùng Tự chạy khi tôi đăng nhập") cho tới đợt 8 (restricted token). Linux không đổi.
+Test: Windows MinGW Release `mysync_tests` 440 passed, 0 failed; Linux Docker gcc:14 + GTK3 `ctest` 100% (2/2, ~136 s); `mysync-gui.exe` dựng được.

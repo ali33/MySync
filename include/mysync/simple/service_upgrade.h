@@ -119,7 +119,8 @@ struct MigrationPlan {
 MigrationPlan plan_migration(const std::string& user_config, const std::string& expect_hash, const std::string& expect_key_hash,
                              const std::vector<std::string>& allow_roots, bool with_key = true);
 
-MigrationSummary summarize_user_config(const UserPaths& paths, const std::vector<std::string>& allow_roots = {});  // throws Error when the configuration cannot be read
+MigrationSummary summarize_user_config(const UserPaths& paths, const std::vector<std::string>& allow_roots = {},
+                                       const AdminProbe& probe = {});  // throws Error when the configuration cannot be read
 
 // ALLOWLIST of the folders a user configuration may hand to the service. After canonicalisation (links, junctions, 8.3
 // names and \\?\ resolved; a part that does not exist yet is appended to its deepest existing parent) a local folder
@@ -195,8 +196,6 @@ enum class ServiceDirKind { Admin, ServiceTop, UserFull };
 // Kind of the service's state/ and log/ folders for this account: UserFull ONLY when the account is positively known to be an
 // ordinary one (the requester itself, not an administrator). An administrator account - or one we cannot judge - gets ServiceTop:
 // the service then has a full administrator token, so a junction planted in a user-writable state/ would be a way to write anywhere.
-// Tests only: -1 = ask the system (default), 0 / 1 = pretend the requester is / is not an administrator in summarize_user_config.
-void set_admin_probe_override_for_tests(int v);
 ServiceDirKind data_dir_kind_for_account(const std::string& user_sid);
 std::string service_dir_sddl(ServiceDirKind kind, const std::string& user_sid);   // pure; Windows SDDL text
 #ifdef _WIN32
@@ -215,6 +214,7 @@ void install_service_files(const ServiceLocations& loc, uint32_t uid, uint32_t g
 // `mysync service migrate-from-user --user-config <path> [--name n]` (or `--remove --name n` to delete the private copy): runs ELEVATED. Verifies that the source is
 // a regular file owned by the calling (original) user and parses, then writes the copy (config, key) into the trusted
 // location with an admin-only ACL / root ownership. Returns the process exit code (ServiceExit values).
-int run_migrate_from_user(const std::vector<std::string>& args);
+// `probe` (default: the real token check) answers "how powerful is the requesting account"; tests inject it.
+int run_migrate_from_user(const std::vector<std::string>& args, const AdminProbe& probe = {});
 
 }  // namespace mysync::simple

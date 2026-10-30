@@ -651,11 +651,6 @@ void check_for_service(const ClientConfig& cfg, const std::string& user_key, con
 
 }  // namespace
 
-namespace {
-int g_admin_override = -1;
-}
-void set_admin_probe_override_for_tests(int v) { g_admin_override = v; }
-
 ServiceDirKind data_dir_kind_for_account(const std::string& user_sid) {
     if (!user_sid.empty() && user_sid == current_user_sid() && !account_is_administrator(user_sid)) return ServiceDirKind::UserFull;
     return ServiceDirKind::ServiceTop;
@@ -970,7 +965,7 @@ ClientConfig load_user_config_absolute(const std::string& config_path, std::stri
 
 }  // namespace
 
-MigrationSummary summarize_user_config(const UserPaths& paths, const std::vector<std::string>& allow_roots) {
+MigrationSummary summarize_user_config(const UserPaths& paths, const std::vector<std::string>& allow_roots, const AdminProbe& probe) {
     MigrationSummary m;
     // The same checked, single read the elevated step makes; the hash pins these exact bytes.
     std::string text = read_user_file_checked(paths.client_config, 1 << 20);
@@ -994,9 +989,10 @@ MigrationSummary summarize_user_config(const UserPaths& paths, const std::vector
         m.problems.push_back("the key file cannot be read");
     }
     m.service_account = current_account_name();
-    m.account_is_admin = g_admin_override >= 0 ? g_admin_override == 1 : account_is_administrator(current_user_sid());
+    const AdminState power = probe ? probe(current_user_sid()) : account_admin_state(current_user_sid());
+    m.account_is_admin = power != AdminState::No;   // Unknown counts as an administrator (fail closed)
     if (m.account_is_admin)
-        m.problems.insert(m.problems.begin(), admin_account_refusal(true));   // refused outright (d7e); the warning below stays for completeness
+        m.problems.insert(m.problems.begin(), admin_refusal_for(power));   // refused outright (d7e); the warning below stays for completeness
     if (m.account_is_admin)
         m.warnings.push_back("The service runs as " + (m.service_account.empty() ? std::string("you") : m.service_account) +
                              ", an ADMINISTRATOR account, so it has FULL administrator rights, also when nobody is logged in. Its configuration " 
@@ -1060,7 +1056,7 @@ MigrationPlan plan_migration(const std::string& user_config, const std::string& 
     return plan;
 }
 
-int run_migrate_from_user(const std::vector<std::string>& args) {
+int run_migrate_from_user(const std::vector<std::string>& args, const AdminProbe& probe) {
     std::string user_config, name = "mysync-client";
     bool remove = false, config_only = false;
     std::string expect_hash, expect_key_hash, account;
@@ -1090,6 +1086,12 @@ int run_migrate_from_user(const std::vector<std::string>& args) {
         if (!remove && (expect_hash.empty() || (!config_only && expect_key_hash.empty())))
             return bad("service migrate-from-user needs --expect-hash and --expect-key-hash (the hashes shown in the summary)",
                        gui::kServiceBadArguments);
+#ifdef _WIN32
+        if (!remove) {   // before anything else: an administrator (or an account we cannot judge) never gets a service
+            std::string why = admin_refusal_for(probe ? probe(current_user_sid()) : account_admin_state(current_user_sid()));
+            if (!why.empty()) return bad(why, gui::kServiceAccessDenied);
+        }
+#endif
         if (!gui::ServiceController::is_elevated())
             return bad("this step needs administrator rights", gui::kServiceAccessDenied);
         ServiceLocations loc = user_service_locations(name);
@@ -1106,8 +1108,6 @@ int run_migrate_from_user(const std::vector<std::string>& args) {
                            gui::kServiceConfigError);
         }
         trust_entry = owner.sid;
-        // An administrator account is refused for install, migrate and apply-config (removal stays possible).
-        if (!remove && account_is_administrator(owner.sid)) return bad(admin_account_refusal(true), gui::kServiceAccessDenied);
 #endif
         if (remove) {
             // The private copy made by a migration (configuration, its backup, key). The folder must be the user's own.

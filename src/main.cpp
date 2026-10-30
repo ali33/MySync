@@ -330,6 +330,15 @@ constexpr bool kWindowsHost = false;
 #endif
 
 int cmd_run(const Opts& o) {
+    if (o.service && o.enforce_paths && kWindowsHost) {
+        // The Simple-mode service checks again at EVERY start: the account may have been made an administrator after the install.
+        std::string why = simple::service_start_refusal(simple::account_admin_state(simple::current_user_sid()));
+        if (!why.empty()) {
+            log_error(why);
+            std::cerr << "mysync: " << why << "\n";
+            return 1;
+        }
+    }
     Loaded l = load_config(o);
     // Trust comes FIRST: before the log file is opened or anything is created from this configuration. With high
     // rights (elevated / SYSTEM / root / --service) the file, its folder, the state folder (the default one when
@@ -527,6 +536,13 @@ int cmd_service_impl(const Opts& o) {
             std::cerr << "mysync: " << chk.error << "\n";
             return gui::kServiceConfigError;
         }
+        {   // a password is not changed on a service whose account is (or may be) an administrator
+            std::string why = simple::service_account_refusal(chk.admin, simple::account_admin_state(chk.sid));
+            if (!why.empty()) {
+                std::cerr << "mysync: " << why << "\n";
+                return gui::kServiceAccessDenied;
+            }
+        }
         std::string pws = pw.reveal();
         pw.clear();
         std::string err;
@@ -545,6 +561,8 @@ int cmd_service_impl(const Opts& o) {
     bool ok = false;
     if (act == "install") {
         if (o.config.empty()) usage("service install needs -c <config>");
+        if (!o.user_service && simple::looks_like_user_service_name(name))
+            usage("the name '" + name + "' is reserved for Simple-mode services: use --user-service");
         for (const auto& a : o.control_allow)
             if (!gui::valid_control_allow_entry(a)) usage("invalid --control-allow entry (use a SID like S-1-5-21-... or DOMAIN\\user)");
         for (const auto& a : o.trust_writers)
@@ -624,9 +642,12 @@ int cmd_service_impl(const Opts& o) {
                 std::cerr << "mysync: the service must run as the account of the user who asks (" << o.user << " is not you)\n";
                 return gui::kServiceAccessDenied;
             }
-            if (o.user_service && simple::account_is_administrator(chk.sid)) {
-                std::cerr << "mysync: " << simple::admin_account_refusal(true) << "\n";
-                return gui::kServiceAccessDenied;
+            if (o.user_service) {   // the account's NEW logon token AND this process must both say 'ordinary'
+                std::string why = simple::service_account_refusal(chk.admin, simple::account_admin_state(chk.sid));
+                if (!why.empty()) {
+                    std::cerr << "mysync: " << why << "\n";
+                    return gui::kServiceAccessDenied;
+                }
             }
             std::string gerr = simple::grant_service_logon_right(chk.sid, &right_added);
             right_sid = chk.sid;

@@ -297,12 +297,26 @@ void StatusPage::Refresh2() {
 
     bool svc = c_.service_mode();
     b_svc_->SetLabel(L(svc ? "simple.svc.back" : "simple.svc.to"));
-    // An administrator account cannot run the service safely (see DESIGN.md d7e): the button is locked and says why. Going BACK
-    // to the personal mode is always possible.
+    // Windows: the service-as-user cannot be set up for now (DESIGN.md d7f): an ordinary user is asked for ANOTHER account's
+    // credentials by UAC and the elevated step then runs as that other account, which it refuses; an administrator is refused
+    // by design. So the button is locked and says so in plain words instead of failing after a click. Going BACK to the
+    // personal mode (when a service exists) always works. On Linux (pkexec names the requester) it stays available, except for
+    // an account that cannot be shown to be ordinary.
+#ifdef _WIN32
+    const bool admin_locked = !svc;
+    const char* lock_key = "simple.svc.win_unsupported";
+#else
     static const bool admin_acct = simple::account_is_administrator(simple::current_user_sid());
     const bool admin_locked = !svc && admin_acct;
+    const char* lock_key = "simple.svc.admin_refused";
+#endif
     b_svc_->Enable(!busy_op_ && !admin_locked);
-    b_svc_->SetToolTip(admin_locked ? L("simple.svc.admin_refused") : wxString());
+    b_svc_->SetToolTip(admin_locked ? L(lock_key) : wxString());
+    if (admin_locked && !busy_op_ && !svc_result_->IsShown()) {
+        svc_result_->SetText(L(lock_key));
+        svc_result_->SetTextColour(wxColour(0x60, 0x60, 0x60));
+        svc_result_->Show();
+    }
     b_add_->Enable(!svc && !busy_op_);
     b_add_->SetToolTip(svc ? L("simple.add.svc") : wxString());
     content_->Layout();

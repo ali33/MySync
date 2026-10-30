@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cwchar>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -90,6 +91,41 @@ unsigned long min_login_uid() {
     }
     return v;
 #endif
+}
+
+AdminState admin_state_from_facts(const TokenFacts& f) {
+    if (!f.readable || f.linked_unreadable) return AdminState::Unknown;
+    if (f.in_admins || f.in_operator_group || f.powerful_privilege || f.linked_elevated) return AdminState::Yes;
+    return AdminState::No;
+}
+
+bool account_is_administrator(const std::string& sid) { return account_admin_state(sid) != AdminState::No; }
+
+std::string admin_refusal_for(AdminState s) {
+    if (s == AdminState::No) return {};
+    if (s == AdminState::Yes) return admin_account_refusal(true);
+    return "It could not be verified that this account is an ordinary one (the account's rights could not be read), so the service "
+           "is not set up. Use \"Start when I log in\" (no elevated rights needed), or create a separate ordinary Windows account "
+           "to run the service.";
+}
+
+std::string service_account_refusal(AdminState token_state, AdminState process_state) {
+    std::string a = admin_refusal_for(token_state);
+    return a.empty() ? admin_refusal_for(process_state) : a;
+}
+
+std::string service_start_refusal(AdminState now) {
+    std::string r = admin_refusal_for(now);
+    return r.empty() ? r : "the service does not start: " + r;
+}
+
+bool looks_like_user_service_name(const std::string& name) {
+    if (name.size() < std::string("mysync-x-0000").size() || name.rfind("mysync-", 0) != 0) return false;
+    if (name == "mysync-server" || name == "mysync-client") return false;
+    if (name[name.size() - 5] != '-') return false;
+    for (size_t i = name.size() - 4; i < name.size(); ++i)
+        if (!((name[i] >= '0' && name[i] <= '9') || (name[i] >= 'a' && name[i] <= 'f'))) return false;
+    return true;
 }
 
 bool user_service_name_matches_owner(const std::string& name, const std::string& owner_id) {
@@ -373,6 +409,8 @@ bool receive_password(const std::string& pipe_name, const std::string& nonce_hex
     return true;
 }
 
+AdminState admin_state_of_token(HANDLE tok);
+
 AccountCheck check_service_account(const std::string& account, const SecretString& password) {
     AccountCheck r;
     if (!valid_account_name(account)) {
@@ -411,6 +449,7 @@ AccountCheck check_service_account(const std::string& account, const SecretStrin
         return r;
     }
     Handle ht(tok);
+    r.admin = admin_state_of_token(tok);   // the NEW token of the target account, not this process's
     r.sid = process_user_sid_of_token(tok);
     if (r.sid.empty()) {
         // fall back to the name lookup
@@ -468,24 +507,69 @@ std::string primary_group_of_user(const std::string&) { return {}; }
 
 std::string current_owner_id() { return current_user_sid(); }
 
-bool account_is_administrator(const std::string& sid) {
-    if (sid != current_user_sid()) return false;
-    HANDLE tok = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return false;
-    Handle ht(tok);
+// What the token tells about the account's power. EVERYTHING that cannot be read counts against the account (fail closed).
+TokenFacts read_token_facts(HANDLE tok) {
+    TokenFacts f;
     DWORD n = 0;
     GetTokenInformation(tok, TokenGroups, nullptr, 0, &n);
-    std::vector<unsigned char> buf(n ? n : 1);
-    if (!n || !GetTokenInformation(tok, TokenGroups, buf.data(), n, &n)) return false;
-    auto* g = reinterpret_cast<TOKEN_GROUPS*>(buf.data());
-    PSID admins = nullptr;
+    std::vector<unsigned char> gb(n ? n : 1);
+    if (!n || !GetTokenInformation(tok, TokenGroups, gb.data(), n, &n)) return f;
+    auto* g = reinterpret_cast<TOKEN_GROUPS*>(gb.data());
+    // Groups that give administrator-like power over the machine; present in ANY state (enabled, disabled, deny-only: a
+    // UAC-filtered or a network-logon token still carries them, and a later elevation would use them).
+    struct Rid { DWORD rid; bool admins; };
+    static const Rid rids[] = {{DOMAIN_ALIAS_RID_ADMINS, true},      {DOMAIN_ALIAS_RID_BACKUP_OPS, false},
+                               {DOMAIN_ALIAS_RID_SYSTEM_OPS, false}, {DOMAIN_ALIAS_RID_ACCOUNT_OPS, false},
+                               {DOMAIN_ALIAS_RID_PRINT_OPS, false},  {DOMAIN_ALIAS_RID_NETWORK_CONFIGURATION_OPS, false}};
     SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
-    if (!AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &admins)) return false;
-    bool member = false;
-    for (DWORD i = 0; i < g->GroupCount && !member; ++i)
-        if (EqualSid(g->Groups[i].Sid, admins)) member = true;   // enabled or "deny only" (a UAC-filtered token): either way the account is an administrator
-    FreeSid(admins);
-    return member;
+    for (const Rid& r : rids) {
+        PSID want = nullptr;
+        if (!AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, r.rid, 0, 0, 0, 0, 0, 0, &want)) return TokenFacts{};
+        for (DWORD i = 0; i < g->GroupCount; ++i)
+            if (EqualSid(g->Groups[i].Sid, want)) (r.admins ? f.in_admins : f.in_operator_group) = true;
+        FreeSid(want);
+    }
+    // Privileges that are a way to administrator power by themselves (listed even when currently disabled). SeImpersonate and
+    // the like are left out on purpose: standard service accounts have them and an ordinary user does not need them.
+    n = 0;
+    GetTokenInformation(tok, TokenPrivileges, nullptr, 0, &n);
+    std::vector<unsigned char> pb(n ? n : 1);
+    if (!n || !GetTokenInformation(tok, TokenPrivileges, pb.data(), n, &n)) return TokenFacts{};
+    auto* p = reinterpret_cast<TOKEN_PRIVILEGES*>(pb.data());
+    static const wchar_t* const strong[] = {L"SeDebugPrivilege",     L"SeTcbPrivilege",         L"SeLoadDriverPrivilege",
+                                            L"SeBackupPrivilege",    L"SeRestorePrivilege",     L"SeTakeOwnershipPrivilege",
+                                            L"SeCreateTokenPrivilege", L"SeSecurityPrivilege"};
+    for (DWORD i = 0; i < p->PrivilegeCount; ++i) {
+        wchar_t name[128];
+        DWORD len = 128;
+        if (!LookupPrivilegeNameW(nullptr, &p->Privileges[i].Luid, name, &len)) return TokenFacts{};
+        for (const wchar_t* s : strong)
+            if (std::wcscmp(name, s) == 0) f.powerful_privilege = true;
+    }
+    // The other half of a split (UAC) token: if it is elevated, or we cannot tell, the account is an administrator.
+    TOKEN_LINKED_TOKEN lt{};
+    DWORD got = 0;
+    if (GetTokenInformation(tok, TokenLinkedToken, &lt, sizeof lt, &got)) {
+        TOKEN_ELEVATION el{};
+        DWORD en = 0;
+        if (!GetTokenInformation(lt.LinkedToken, TokenElevation, &el, sizeof el, &en)) f.linked_unreadable = true;
+        else if (el.TokenIsElevated) f.linked_elevated = true;
+        CloseHandle(lt.LinkedToken);
+    } else if (GetLastError() != ERROR_NO_SUCH_LOGON_SESSION) {   // 1312: no linked token (an ordinary, unsplit token)
+        f.linked_unreadable = true;
+    }
+    f.readable = true;
+    return f;
+}
+
+AdminState admin_state_of_token(HANDLE tok) { return admin_state_from_facts(read_token_facts(tok)); }
+
+AdminState account_admin_state(const std::string& sid) {
+    if (sid.empty() || sid != current_user_sid()) return AdminState::Unknown;   // cannot be judged from here
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return AdminState::Unknown;
+    Handle ht(tok);
+    return admin_state_of_token(tok);
 }
 
 std::string account_name_from_sid(const std::string& sid) {
@@ -579,6 +663,7 @@ bool receive_password(const std::string&, const std::string&, SecretString*, std
 }
 AccountCheck check_service_account(const std::string&, const SecretString&) {
     AccountCheck r;
+    r.admin = AdminState::No;
     r.ok = true;
     return r;
 }
@@ -589,7 +674,7 @@ std::string grant_service_logon_right(const std::string&, bool* added) {
 std::string revoke_service_logon_right(const std::string&) { return {}; }
 void PasswordChannel::cancel() {}
 std::string current_owner_id() { return std::to_string(static_cast<unsigned long>(::geteuid())); }
-bool account_is_administrator(const std::string&) { return false; }
+AdminState account_admin_state(const std::string&) { return AdminState::No; }
 std::string current_account_name() {
     struct passwd pw{}, *res = nullptr;
     char buf[4096];

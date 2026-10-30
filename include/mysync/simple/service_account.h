@@ -84,9 +84,32 @@ bool user_service_name_matches_owner(const std::string& name, const std::string&
 std::string owner_label(const std::string& owner_id);   // "[owner <id>]"
 // The id of the user running this process: Windows SID text, POSIX uid.
 std::string current_owner_id();
-// Windows: is this account (the requester) a member of Administrators? Then the service runs with FULL administrator rights
-// and the GUI must say so before asking for the password. Evaluated for the user running this process; false elsewhere.
-bool account_is_administrator(const std::string& sid);
+// Windows: how powerful is this account? Three answers, and "Unknown" is treated like "Yes" by every caller: a service is set
+// up for an account only when the answer is No (fail closed). `Yes` = member of Administrators / an operators group, holds a
+// strong privilege, or has an elevated linked token; Unknown = an API failed, the SID could not be resolved, or the SID is not
+// the user running this process.
+enum class AdminState { No, Yes, Unknown };
+struct TokenFacts {   // what was read from a token (pure input of the decision, so it can be tested)
+    bool readable = false;
+    bool in_admins = false;
+    bool in_operator_group = false;     // Backup / Server / Account / Print / Network-configuration operators
+    bool powerful_privilege = false;    // SeDebug, SeTcb, SeLoadDriver, SeBackup, SeRestore, SeTakeOwnership, SeCreateToken, SeSecurity
+    bool linked_elevated = false;
+    bool linked_unreadable = false;
+};
+AdminState admin_state_from_facts(const TokenFacts& f);
+using AdminProbe = std::function<AdminState(const std::string& sid)>;   // dependency injection for the decisions (tests)
+// Evaluated on the token of THIS process (the user running it); POSIX: always No.
+AdminState account_admin_state(const std::string& sid);
+bool account_is_administrator(const std::string& sid);   // == (account_admin_state(sid) != No)
+// "" when `s` is No; otherwise the plain-language reason (different words for Yes and Unknown).
+std::string admin_refusal_for(AdminState s);
+// Install / migrate / set-password: refused unless BOTH the new token of the target account and this process say No.
+std::string service_account_refusal(AdminState token_state, AdminState process_state);
+// Service start-up check (the user may have been added to Administrators after the install): "" = start, else the reason.
+std::string service_start_refusal(AdminState now);
+// Does `name` have the shape of a Simple-mode service name (mysync-<account>-<4 hex>)? Such a name is only valid with --user-service.
+bool looks_like_user_service_name(const std::string& name);
 // Plain-language reason a Simple-mode service is refused for an administrator account (Windows); empty when `is_admin` is false.
 // The service token of an administrator is a full administrator token, and the source / destination trees are writable by the
 // user's other software, so a junction swapped in after the checks would let the service write or delete anywhere.
@@ -154,6 +177,7 @@ struct AccountCheck {
     bool ok = false;
     std::string sid;    // the account's SID ("S-1-5-21-...")
     std::string error;  // plain words, never contains the password
+    AdminState admin = AdminState::Unknown;   // power of the account's NEW logon token (Windows); No on POSIX
 };
 // LogonUser with the password (no change to the system). Resolves the SID.
 AccountCheck check_service_account(const std::string& account, const SecretString& password);

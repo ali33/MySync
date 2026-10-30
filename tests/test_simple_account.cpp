@@ -878,21 +878,83 @@ TEST(d7d_posix_install_refuses_a_folder_of_another_account_or_with_foreign_conte
 
 // ---- d7e ----
 
-TEST(d7e_administrator_accounts_are_refused_for_the_user_service) {
-    CHECK(admin_account_refusal(false).empty());
-    std::string why = admin_account_refusal(true);
-    CHECK(!why.empty());
-    CHECK(why.find("administrator") != std::string::npos);
-    CHECK(why.find("Start when I log in") != std::string::npos);            // says what to do instead
-    CHECK(why.find("ordinary Windows account") != std::string::npos);
+
+// ---- d7e / d7f: who may get a Simple-mode service ----
+
+TEST(d7f_token_facts_decide_fail_closed) {
+    TokenFacts f;
+    CHECK(admin_state_from_facts(f) == AdminState::Unknown);                 // nothing could be read
+    f.readable = true;
+    CHECK(admin_state_from_facts(f) == AdminState::No);                      // an ordinary token
+    TokenFacts a = f; a.in_admins = true;
+    CHECK(admin_state_from_facts(a) == AdminState::Yes);                     // (deny-only / disabled is still 'in_admins')
+    TokenFacts o = f; o.in_operator_group = true;
+    CHECK(admin_state_from_facts(o) == AdminState::Yes);                     // Backup / Server / Account operators ...
+    TokenFacts p = f; p.powerful_privilege = true;
+    CHECK(admin_state_from_facts(p) == AdminState::Yes);                     // SeDebug, SeBackup ...
+    TokenFacts l = f; l.linked_elevated = true;
+    CHECK(admin_state_from_facts(l) == AdminState::Yes);                     // the elevated half of a split token
+    TokenFacts u = f; u.linked_unreadable = true;
+    CHECK(admin_state_from_facts(u) == AdminState::Unknown);                 // cannot tell: refused as well
 #ifdef _WIN32
-    // On this machine: the summary refuses exactly when the current account is an administrator.
-    bool admin = account_is_administrator(current_user_sid());
-    MigrationSummary m;
-    m.account_is_admin = admin;
-    CHECK(m.account_is_admin == admin);
+    CHECK(account_admin_state("S-1-5-21-9-9-9-1001") == AdminState::Unknown);   // not the running user: cannot be judged
+    CHECK(account_admin_state("") == AdminState::Unknown);
+    CHECK(account_is_administrator("S-1-5-21-9-9-9-1001"));                  // so it counts as an administrator
 #else
-    CHECK(!account_is_administrator("1000"));                                // never on POSIX: the unit runs as the user
+    CHECK(account_admin_state("1000") == AdminState::No);
 #endif
 }
 
+TEST(d7f_install_set_password_and_start_decisions_need_a_clear_no) {
+    const AdminState No = AdminState::No, Yes = AdminState::Yes, Unk = AdminState::Unknown;
+    CHECK(service_account_refusal(No, No).empty());
+    CHECK(!service_account_refusal(Yes, No).empty());                        // the target's NEW token says administrator
+    CHECK(!service_account_refusal(No, Yes).empty());                        // this process says so
+    CHECK(!service_account_refusal(Unk, No).empty());                        // an API failed: refused
+    CHECK(!service_account_refusal(No, Unk).empty());
+    CHECK(admin_refusal_for(Yes) != admin_refusal_for(Unk));                 // different words, both with the way out
+    CHECK(admin_refusal_for(Unk).find("Start when I log in") != std::string::npos);
+    CHECK(admin_refusal_for(Yes).find("Start when I log in") != std::string::npos);
+    CHECK(service_start_refusal(No).empty());                                // a normal start
+    CHECK(service_start_refusal(Yes).find("does not start") != std::string::npos);   // joined Administrators after the install
+    CHECK(!service_start_refusal(Unk).empty());
+}
+
+TEST(d7f_simple_service_names_are_only_valid_with_user_service) {
+    std::string good = user_service_name("PC\alice", "S-1-5-21-1-2-3-1001");
+    CHECK(looks_like_user_service_name(good));
+    CHECK(!looks_like_user_service_name("mysync-server"));
+    CHECK(!looks_like_user_service_name("mysync-client"));
+    CHECK(!looks_like_user_service_name("mysync-alice"));
+    CHECK(!looks_like_user_service_name("mysync-alice-zzzz"));
+    CHECK(!looks_like_user_service_name("other-alice-3f9a"));
+    CHECK(looks_like_user_service_name("mysync-alice-3f9a"));
+}
+
+#ifdef _WIN32
+TEST(d7f_migrate_step_refuses_administrators_and_unknowns_before_creating_anything) {
+    ATmp t;
+    std::string name = user_service_name("PC\alice", current_user_sid());
+    std::string cfg = (t.p / "config.toml").u8string();
+    std::string h64(64, 'c');
+    std::vector<std::string> args = {"--user-config", cfg, "--expect-hash", h64, "--expect-key-hash", h64, "--name", name};
+    auto run = [&](AdminState st, std::string* err) {
+        std::ostringstream cap;
+        std::streambuf* old = std::cerr.rdbuf(cap.rdbuf());
+        int code = run_migrate_from_user(args, [st](const std::string&) { return st; });
+        std::cerr.rdbuf(old);
+        *err = cap.str();
+        return code;
+    };
+    std::string err;
+    CHECK_EQ(run(AdminState::Yes, &err), int(gui::kServiceAccessDenied));
+    CHECK(err.find("administrator") != std::string::npos);
+    CHECK(!fs::exists(fs::u8path(user_service_locations(name).dir)));         // nothing created
+    CHECK_EQ(run(AdminState::Unknown, &err), int(gui::kServiceAccessDenied));
+    CHECK(err.find("could not be verified") != std::string::npos);
+    CHECK(!fs::exists(fs::u8path(user_service_locations(name).dir)));
+    // an ordinary account gets past this gate (the next refusal here is the missing elevation, a different message)
+    run(AdminState::No, &err);
+    CHECK(err.find("could not be verified") == std::string::npos && err.find("is an administrator") == std::string::npos);
+}
+#endif

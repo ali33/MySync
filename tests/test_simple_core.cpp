@@ -1229,13 +1229,9 @@ TEST(simple_service_path_allowlist_follows_links_out_of_the_home) {
     fs::remove(t.p / "home" / "lnk", rec);
 }
 
-struct NotAdminGuard {
-    NotAdminGuard() { set_admin_probe_override_for_tests(0); }
-    ~NotAdminGuard() { set_admin_probe_override_for_tests(-1); }
-};
+AdminState test_no_admin(const std::string&) { return AdminState::No; }   // these tests are about paths, not about who runs them
 
 TEST(simple_migration_plan_uses_exactly_the_summarised_bytes) {
-    NotAdminGuard not_admin;   // these tests are about the paths, not about who runs them (see the d7e test)
     STmp t;
     UserPaths up = UserPaths::for_current_user(t.sub("MySync", false));
     std::string src = t.sub("docs"), dst = t.sub("usb");
@@ -1271,7 +1267,7 @@ TEST(simple_migration_plan_uses_exactly_the_summarised_bytes) {
 #endif
         return ::mysync::simple::plan_migration(up.client_config, h, kh, r);
     };
-    MigrationSummary m = summarize_user_config(up, roots);
+    MigrationSummary m = summarize_user_config(up, roots, test_no_admin);
     CHECK(m.problems.empty());
     CHECK_EQ(m.config_hash.size(), size_t(64));
     CHECK_EQ(m.key_hash.size(), size_t(64));
@@ -1291,7 +1287,7 @@ TEST(simple_migration_plan_uses_exactly_the_summarised_bytes) {
     CHECK(refused);
     // the key changes: refused too
     write_user_config(up, src, dst);
-    MigrationSummary m2 = summarize_user_config(up, roots);
+    MigrationSummary m2 = summarize_user_config(up, roots, test_no_admin);
     CHECK_EQ(plan_migration(m2.config_hash, m2.key_hash, roots).config.watches.size(), size_t(1));
     { std::ofstream f(up.client_key, std::ios::binary | std::ios::trunc); f << std::string(64, 'b') << "\n"; }
     bool key_refused = false;
@@ -1306,7 +1302,7 @@ TEST(simple_migration_plan_uses_exactly_the_summarised_bytes) {
     PathPolicy def = default_path_policy();
     bool outside = !service_path_verdict(src, def).ok;
     if (outside) {
-        MigrationSummary s0 = summarize_user_config(up);
+        MigrationSummary s0 = summarize_user_config(up, {}, test_no_admin);
         CHECK(!s0.needs_confirmation.empty());
         CHECK(s0.problems.empty());
         bool r2 = false;
@@ -1363,13 +1359,12 @@ TEST(simple_resolve_invoking_uid_trusts_pkexec_only_in_a_root_process) {
 }
 
 TEST(simple_migration_summary_lists_what_the_service_would_touch_and_the_refusals) {
-    NotAdminGuard not_admin;
     STmp t;
     UserPaths up = UserPaths::for_current_user(t.sub("MySync", false));
     std::string src = t.sub("docs"), dst = t.sub("usb");
     write_user_config(up, src, dst);
     std::vector<std::string> roots = {t.p.u8string()};   // the temp area may be outside the home on this system
-    MigrationSummary m = summarize_user_config(up, roots);
+    MigrationSummary m = summarize_user_config(up, roots, test_no_admin);
     CHECK_EQ(m.sources.size(), size_t(1));
     CHECK(m.sources[0].find("docs") != std::string::npos);
     CHECK(m.destinations[0].find("usb") != std::string::npos);
@@ -1381,7 +1376,7 @@ TEST(simple_migration_summary_lists_what_the_service_would_touch_and_the_refusal
     std::string stray = (t.p / "stray.key").u8string();
     std::ofstream(stray) << std::string(64, 'a') << "\n";
     write_user_config(up, src, dst, stray);
-    CHECK(!summarize_user_config(up, roots).problems.empty());
+    CHECK(!summarize_user_config(up, roots, test_no_admin).problems.empty());
     // a folder inside a system area is refused
 #ifdef _WIN32
     std::string sys = std::string(std::getenv("SystemRoot") ? std::getenv("SystemRoot") : "C:\\Windows") + "\\Temp";
@@ -1389,7 +1384,7 @@ TEST(simple_migration_summary_lists_what_the_service_would_touch_and_the_refusal
     std::string sys = "/etc/mysync-test";
 #endif
     write_user_config(up, sys, dst);
-    CHECK(!summarize_user_config(up, roots).problems.empty());
+    CHECK(!summarize_user_config(up, roots, test_no_admin).problems.empty());
     // a link on the way is refused
     std::string target_real = t.sub("real"), link = (t.p / "lnk").u8string();
 #ifdef _WIN32
@@ -1402,7 +1397,7 @@ TEST(simple_migration_summary_lists_what_the_service_would_touch_and_the_refusal
 #endif
     if (linked) {
         write_user_config(up, link, dst);
-        MigrationSummary ml = summarize_user_config(up, roots);
+        MigrationSummary ml = summarize_user_config(up, roots, test_no_admin);
         CHECK(!ml.problems.empty());
         CHECK(ml.problems[0].find("link") != std::string::npos);
         std::error_code ec;
@@ -1596,20 +1591,19 @@ TEST(simple_resolve_invoking_uid_refuses_setuid_style_processes) {
     CHECK(r.error.find("setuid") != std::string::npos);
 }
 
-TEST(d7e_summary_puts_the_administrator_refusal_first_and_only_for_administrators) {
+
+TEST(d7e_summary_refuses_unless_the_account_is_positively_ordinary) {
     STmp t;
     UserPaths up = UserPaths::for_current_user(t.sub("MySync", false));
-    std::string src = t.sub("docs"), dst = t.sub("usb");
-    write_user_config(up, src, dst);
+    write_user_config(up, t.sub("docs"), t.sub("usb"));
     std::vector<std::string> roots = {t.p.u8string()};
-    struct Reset { ~Reset() { set_admin_probe_override_for_tests(-1); } } reset;
-    set_admin_probe_override_for_tests(1);
-    MigrationSummary a = summarize_user_config(up, roots);
-    CHECK(a.account_is_admin);
-    CHECK(!a.problems.empty());
-    if (!a.problems.empty()) CHECK_EQ(a.problems[0], admin_account_refusal(true));
-    set_admin_probe_override_for_tests(0);
-    MigrationSummary b = summarize_user_config(up, roots);
+    for (AdminState st : {AdminState::Yes, AdminState::Unknown}) {
+        MigrationSummary a = summarize_user_config(up, roots, [st](const std::string&) { return st; });
+        CHECK(a.account_is_admin);
+        CHECK(!a.problems.empty());
+        if (!a.problems.empty()) CHECK_EQ(a.problems[0], admin_refusal_for(st));
+    }
+    MigrationSummary b = summarize_user_config(up, roots, test_no_admin);
     CHECK(!b.account_is_admin);
     CHECK(b.problems.empty());
 }

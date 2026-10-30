@@ -125,3 +125,6 @@ Xem `docs/DESIGN.md`, mục "Đợt 7d". API mới: `MigrationSummary::account_i
 
 ## Đợt 7e
 Xem `docs/DESIGN.md`, mục "Đợt 7e". API mới: `admin_account_refusal(bool)`, `account_name_from_sid`, `service_description`; `MigrationSummary::account_is_admin` nay làm `summarize_user_config` trả lời từ chối đầu tiên trong `problems`. GUI: nút chuyển sang dịch vụ bị khoá (kèm tooltip `simple.svc.admin_refused`) với tài khoản quản trị Windows; quay về chế độ cá nhân luôn được. Giới hạn: chưa có engine chạy bằng restricted token.
+
+## Đợt 7f
+Xem `docs/DESIGN.md`, mục "Đợt 7f". API: `AdminState`, `TokenFacts`, `admin_state_from_facts`, `account_admin_state`, `AdminProbe`, `admin_refusal_for`, `service_account_refusal`, `service_start_refusal`, `looks_like_user_service_name`, `AccountCheck::admin`; `summarize_user_config(paths, roots, probe)` và `run_migrate_from_user(args, probe)` nhận hàm tra cứu (test tiêm vào); `set_admin_probe_override_for_tests` đã bỏ. Khoá chuỗi mới: `simple.svc.win_unsupported`. Trên Windows nút chuyển sang dịch vụ bị khoá cho tới đợt 8.
