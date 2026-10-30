@@ -719,20 +719,63 @@ struct ServerDaemon::Impl {
         spec.key = key;
         spec.read_only = false;  // "rw"
         spec.prefix = prefix;
+        // ATOMIC: peer_add -> reload -> trust check -> apply_config. Up to apply_config nothing is committed, so ANY failure
+        // after peer_add takes the peer out again (not revoked) and the approval fails with the verbatim reason; the request
+        // stays waiting and the sender is not told it was approved. Once apply_config succeeded the pairing is committed and
+        // nothing afterwards (the window closing, a closed IPC connection) can undo it: roll forward.
         peer_add(opts.config_path, spec);
+        try {
+            if (opts.pair_test_hook) opts.pair_test_hook("after_peer_add");
+            PeerLoad pl;
+            ServerConfig n = load_server_config_resolved(opts.config_path, &pl,
+                                                         opts.enforce_config_trust ? &opts.trusted_writers : nullptr);
+            check_trust(n, opts);
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                if (!server) throw Error("the server is not running");
+                server->apply_config(n);
+            }
+            cfg = n;
+            note_config(n, pl);
+        } catch (const std::exception& e) {
+            std::string why = e.what(), rb;
+            try {
+                if (opts.pair_test_hook) opts.pair_test_hook("rollback");
+                peer_remove(opts.config_path, key_to_hex(key), /*revoke=*/false);
+            } catch (const std::exception& e2) {
+                rb = e2.what();
+            }
+            throw Error(why + (rb.empty() ? " (the new computer was not added)"
+                                          : "; ALSO the new computer could not be taken out again (" + rb +
+                                                "): deny its request to remove it"));
+        }
+        log_info("paired machine '" + display + "' added with folder '" + prefix + "'");
+        return prefix;
+    }
+
+    // Denying a request makes sure its key is not allowed (a half-failed approval may have left it in the file): take it
+    // out now and apply, which also cuts that key's open sessions at once (no waiting for the peers.d watcher).
+    void pair_revoke(const PubKey& key) {
+        std::lock_guard<std::mutex> rl(reload_mu);
+        if (opts.config_path.empty()) return;
+        PeerEdit e = peer_remove(opts.config_path, key_to_hex(key), /*revoke=*/false);
+        bool running = false;
+        for (const ClientAcl& c : cfg.clients) {
+            PublicKey k = key;
+            if (acl_has_key(c, k)) running = true;
+        }
+        if (!e.changed && !running) return;
         PeerLoad pl;
         ServerConfig n = load_server_config_resolved(opts.config_path, &pl,
                                                      opts.enforce_config_trust ? &opts.trusted_writers : nullptr);
         check_trust(n, opts);
         {
             std::lock_guard<std::mutex> lk(mu);
-            if (!server) throw Error("the server is not running");
-            server->apply_config(n);
+            if (server) server->apply_config(n);
         }
         cfg = n;
         note_config(n, pl);
-        log_info("paired machine '" + display + "' added with folder '" + prefix + "'");
-        return prefix;
+        log_info("a denied computer was taken out of the allowlist");
     }
 
     ControlResponse pair_op(Server& srv, const ControlRequest& q) {
@@ -895,6 +938,8 @@ void ServerDaemon::run(std::atomic<bool>& stop) {
     Server srv(im.cfg);
     if (im.opts.allow_pairing)
         srv.pairing().set_approve_handler([&im](const std::string& n, const PubKey& k) { return im.pair_approve(n, k); });
+    if (im.opts.allow_pairing)
+        srv.pairing().set_revoke_handler([&im](const PubKey& k) { im.pair_revoke(k); });
     log_info("MySync server " + im.opts.version + " listening on " + im.cfg.bind + ":" + std::to_string(srv.port()) +
              ", root " + im.cfg.root + ", public key " + key_to_hex(srv.public_key()));
     {

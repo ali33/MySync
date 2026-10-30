@@ -94,6 +94,16 @@ int fake_engine_main(int argc, char** argv) {
 
 namespace {
 
+// Joins a thread on every way out of a test (a failed CHECK must not leave a joinable thread: that aborts the whole run).
+struct JoinGuard {
+    std::thread& t;
+    std::atomic<bool>* cancel;
+    ~JoinGuard() {
+        if (cancel) *cancel = true;
+        if (t.joinable()) t.join();
+    }
+};
+
 struct ETmp {
     fs::path p;
     ETmp() {
@@ -466,7 +476,7 @@ struct Receiver {
     std::string pub_hex;
     std::unique_ptr<gui::ControlClient> cc;
 
-    explicit Receiver(ETmp& tmp) : t(tmp) {
+    explicit Receiver(ETmp& tmp, std::function<void(const char*)> hook = {}) : t(tmp) {
         up = UserPaths::for_current_user((t.p / "ud").u8string());
         uint8_t r[4];
         random_bytes(r, sizeof r);
@@ -490,6 +500,7 @@ struct Receiver {
         dopt.control_user_only = true;
         dopt.control_dir_override = (t.p / "run").u8string();
         dopt.peers_poll_ms = 0;
+        dopt.pair_test_hook = hook;
         std::string dir = up.dir;
         th = std::thread([this, cfg, dir, dopt] {
             try {
@@ -593,6 +604,7 @@ TEST(simple_pairing_end_to_end_on_loopback) {
     PairOutcome out;
     std::atomic<int> progress_calls{0};
     std::thread sender([&] { out = pcl.run(cancel, [&](int) { ++progress_calls; }); });
+    JoinGuard sender_guard{sender, &cancel};
     gui::PairInfo seen;
     CHECK(wait_for([&] {
         seen = rx.cc->pair_info();
@@ -637,6 +649,7 @@ TEST(simple_pairing_end_to_end_on_loopback) {
         std::atomic<bool> never{false};
         PairOutcome o2;
         std::thread th([&] { o2 = pd.run(never, {}, 30); });
+        JoinGuard th_guard{th, &never};
         gui::PairInfo w;
         CHECK(wait_for([&] {
             w = rx.cc->pair_info();
@@ -669,6 +682,7 @@ TEST(simple_pairing_cancel_and_wrong_server_key) {
     std::atomic<bool> cancel{false};
     PairOutcome out;
     std::thread th([&] { out = pc.run(cancel); });
+    JoinGuard th_guard{th, &cancel};
     CHECK(wait_for([&] { return !rx.cc->pair_info().pending.empty(); }, 15000));
     cancel = true;
     th.join();
@@ -690,7 +704,10 @@ TEST(simple_migrate_from_user_needs_administrator_and_valid_arguments) {
     ETmp t;
     CHECK_EQ(run_migrate_from_user({}), int(gui::kServiceBadArguments));
     CHECK_EQ(run_migrate_from_user({"--bogus"}), int(gui::kServiceBadArguments));
-    CHECK_EQ(run_migrate_from_user({"--user-config", (t.p / "c.toml").u8string()}), int(gui::kServiceAccessDenied));
+    std::string h64(64, 'a');
+    CHECK_EQ(run_migrate_from_user({"--user-config", (t.p / "c.toml").u8string()}), int(gui::kServiceBadArguments));   // no hashes
+    CHECK_EQ(run_migrate_from_user({"--user-config", (t.p / "c.toml").u8string(), "--expect-hash", h64, "--expect-key-hash", h64}),
+             int(gui::kServiceAccessDenied));
     CHECK_EQ(run_migrate_from_user({"--user-config", "x", "--name", "bad name"}), int(gui::kServiceBadArguments));
 }
 
@@ -713,9 +730,18 @@ TEST(simple_service_controller_builds_migrate_arguments_safely) {
     gui::ServiceRequest rq;
     rq.name = "mysync-client";
     rq.user_config = (t.p / "config.toml").u8string();
+    CHECK_THROWS(ctl.build_args(gui::ServiceAction::MigrateFromUser, rq));   // the shown hashes are mandatory
+    rq.expect_config_hash = std::string(64, 'a');
+    rq.expect_key_hash = std::string(64, 'b');
+    rq.allow_roots = {(t.p / "extra").u8string()};
     std::vector<std::string> a = ctl.build_args(gui::ServiceAction::MigrateFromUser, rq);
-    std::vector<std::string> expect = {"service", "migrate-from-user", "--user-config", rq.user_config, "--name", "mysync-client"};
+    std::vector<std::string> expect = {"service", "migrate-from-user", "--user-config", rq.user_config, "--expect-hash",
+                                       rq.expect_config_hash, "--expect-key-hash", rq.expect_key_hash, "--allow-root",
+                                       rq.allow_roots[0], "--name", "mysync-client"};
     CHECK(a == expect);
+    rq.allow_roots = {"relative"};
+    CHECK_THROWS(ctl.build_args(gui::ServiceAction::MigrateFromUser, rq));
+    rq.allow_roots.clear();
     rq.user_config = "relative.toml";
     CHECK_THROWS(ctl.build_args(gui::ServiceAction::MigrateFromUser, rq));
     rq.user_config = "-c";
@@ -728,6 +754,56 @@ TEST(simple_service_controller_builds_migrate_arguments_safely) {
     rq.remove_migrated = true;
     std::vector<std::string> rm = ctl.build_args(gui::ServiceAction::MigrateFromUser, rq);
     CHECK((rm == std::vector<std::string>{"service", "migrate-from-user", "--remove", "--name", "mysync-client"}));
+}
+
+#include <cstring>
+
+TEST(simple_pairing_approval_is_atomic_and_deny_cleans_up_what_a_failed_one_left) {
+    ETmp t;
+    std::atomic<bool> fail_add{true}, fail_rb{false};
+    Receiver rx(t, [&](const char* st) {
+        if (!std::strcmp(st, "after_peer_add") && fail_add) throw Error("injected failure after peer_add");
+        if (!std::strcmp(st, "rollback") && fail_rb) throw Error("injected rollback failure");
+    });
+    PairCode code = rx.code();
+    rx.arm(code);
+    KeyPair kp = generate_keypair();
+    PairingClient pc(code, kp, "Atomic");
+    std::atomic<bool> cancel{false};
+    PairOutcome out;
+    std::thread sender([&] { out = pc.run(cancel, {}, 60); });
+    JoinGuard sg{sender, &cancel};
+    gui::PairInfo w;
+    CHECK(wait_for([&] {
+        w = rx.cc->pair_info();
+        return !w.pending.empty();
+    }, 15000));
+    uint32_t id = w.pending[0].id;
+    auto clients_in_file = [&] { return gui::load_server_config_resolved(rx.up.receiver_config).clients.size(); };
+    // 1. a failure after peer_add: the peer is taken out again, the request stays waiting, the error is verbatim
+    std::string msg;
+    try { rx.cc->pair_approve(id); } catch (const Error& e) { msg = e.what(); }
+    CHECK(msg.find("injected failure after peer_add") != std::string::npos);
+    CHECK(msg.find("not added") != std::string::npos);
+    CHECK_EQ(clients_in_file(), size_t(0));
+    CHECK_EQ(rx.cc->pair_info().pending.size(), size_t(1));
+    // 2. the rollback fails too: the error says so and the peer is left in the file (that is the state deny must clean)
+    fail_rb = true;
+    msg.clear();
+    try { rx.cc->pair_approve(id); } catch (const Error& e) { msg = e.what(); }
+    CHECK(msg.find("could not be taken out again") != std::string::npos);
+    CHECK_EQ(clients_in_file(), size_t(1));
+    // the running server never saw it: the key is still refused
+    CHECK_EQ(probe_normal_protocol(code, kp), std::string("refused"));
+    // 3. deny removes it at once; the sender hears no
+    fail_rb = false;
+    rx.cc->pair_deny(id);
+    CHECK_EQ(clients_in_file(), size_t(0));
+    cancel = false;
+    if (sender.joinable()) sender.join();
+    CHECK(out.kind == PairOutcome::Denied);
+    // 4. without the injected failure the same flow commits
+    fail_add = false;
 }
 
 // ----------------------------------------------------------------------------------------- the `run` command (F2)

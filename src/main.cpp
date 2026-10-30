@@ -174,6 +174,8 @@ struct Opts {
     bool once = false;
     bool service = false;
     bool exit_on_stdin_eof = false;  // parent (GUI supervisor) closes our stdin => stop cleanly
+    std::string expect_hash, expect_key_hash;
+    std::vector<std::string> allow_roots;
     bool remove_copy = false;        // service migrate-from-user --remove
     bool user_mode = false;          // engine of a plain user started by the GUI: control channel for that user only
     bool allow_pairing = false;      // receiver: enable the code-pairing mode (simple/pairing.h)
@@ -204,6 +206,9 @@ Opts parse_opts(const std::vector<std::string>& a, size_t from) {
         else if (s == "--allow-pairing") o.allow_pairing = true;
         else if (s == "--user-mode") o.user_mode = true;
         else if (s == "--remove") o.remove_copy = true;
+        else if (s == "--expect-hash") o.expect_hash = val();
+        else if (s == "--expect-key-hash") o.expect_key_hash = val();
+        else if (s == "--allow-root") o.allow_roots.push_back(val());
         else if (s == "--user-config") o.user_config = val();
         else if (s == "--foreground") {}
         else if (!s.empty() && s[0] == '-') usage("unknown option " + s);
@@ -431,6 +436,9 @@ int cmd_service_impl(const Opts& o) {
         std::vector<std::string> a;
         if (!o.user_config.empty()) { a.push_back("--user-config"); a.push_back(o.user_config); }
         if (o.remove_copy) a.push_back("--remove");
+        if (!o.expect_hash.empty()) { a.push_back("--expect-hash"); a.push_back(o.expect_hash); }
+        if (!o.expect_key_hash.empty()) { a.push_back("--expect-key-hash"); a.push_back(o.expect_key_hash); }
+        for (const auto& r : o.allow_roots) { a.push_back("--allow-root"); a.push_back(r); }
         if (!o.name.empty()) { a.push_back("--name"); a.push_back(o.name); }
         return simple::run_migrate_from_user(a);
     }

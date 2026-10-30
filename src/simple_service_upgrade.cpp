@@ -5,9 +5,11 @@
 #include "mysync/simple/service_upgrade.h"
 
 #include <cctype>
+#include <climits>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <iostream>
 #include <sstream>
 
@@ -15,6 +17,7 @@
 #include "mysync/gui/config_io.h"
 #include "mysync/gui/key_mgr.h"
 #include "mysync/gui/trust.h"
+#include "mysync/hash.h"
 #include "mysync/keys.h"
 
 #ifdef _WIN32
@@ -47,6 +50,43 @@ const char* upgrade_step_name(UpgradeStep s) {
         case UpgradeStep::Done: return "done";
     }
     return "?";
+}
+
+InvokerResult resolve_invoking_uid(const InvokerInput& in) {
+    InvokerResult r;
+    if (in.uid != 0 || in.euid != 0) {  // not root: nothing was elevated, the variables are just the caller's own text
+        r.ok = true;
+        r.uid = in.euid;
+        return r;
+    }
+    auto num = [](const std::string& t, uint32_t* v) { return !t.empty() && gui::detail::parse_numeric_id(t, *v); };
+    uint32_t pk = 0, su = 0;
+    bool have_pk = num(in.pkexec_uid, &pk), have_su = num(in.sudo_uid, &su);
+    if ((!in.pkexec_uid.empty() && !have_pk) || (!in.sudo_uid.empty() && !have_su)) {
+        r.error = "PKEXEC_UID / SUDO_UID is not a plain number: refusing";
+        return r;
+    }
+    if (have_pk && have_su && pk != su) {
+        r.error = "PKEXEC_UID and SUDO_UID disagree: refusing to guess who asked for this";
+        return r;
+    }
+    if (!have_pk && !have_su) {
+        r.error = "cannot tell which user asked for this (run it through the application, which uses pkexec)";
+        return r;
+    }
+    r.uid = have_pk ? pk : su;
+    if (r.uid == 0) {
+        r.error = "the requesting user is root: a personal configuration of root is not migrated this way";
+        return r;
+    }
+    if (in.file_owner >= 0 && static_cast<uint32_t>(in.file_owner) != r.uid) {
+        r.error = "the configuration file is not owned by the user who asked for this";
+        return r;
+    }
+    if (in.loginuid >= 0 && in.loginuid != 4294967295LL && static_cast<uint32_t>(in.loginuid) != r.uid)
+        r.warning = "the login uid (" + std::to_string(in.loginuid) + ") differs from the requesting user (su / ssh session?)";
+    r.ok = true;
+    return r;
 }
 
 namespace {
@@ -218,10 +258,12 @@ namespace {
 
 bool name_ok(const std::string& n) { return gui::ServiceController::valid_name(n); }
 
+#ifdef _WIN32
 std::string lower_s(std::string s) {
     for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
 }
+#endif
 
 std::string norm_key(const fs::path& p) {
     std::string s = p.lexically_normal().generic_u8string();
@@ -279,41 +321,36 @@ std::string env_u8(const char* n) {
     return v ? std::string(v) : std::string();
 }
 #else
-// Original (unprivileged) user behind a pkexec / sudo launch. PKEXEC_UID is believed only when our parent really is
-// pkexec; SUDO_UID is believed as is; two different answers are refused.
-bool original_uid_checked(uid_t* out, std::string* err) {
-    auto parse = [](const char* name, uid_t* v) {
-        const char* e = std::getenv(name);
-        uint32_t id = 0;
-        if (!e || !*e || !gui::detail::parse_numeric_id(e, id)) return false;
-        *v = static_cast<uid_t>(id);
-        return true;
-    };
-    uid_t sudo_uid = 0, pk_uid = 0;
-    bool have_sudo = parse("SUDO_UID", &sudo_uid);
-    bool have_pk = parse("PKEXEC_UID", &pk_uid);
-    if (have_pk) {
-        std::error_code ec;
-        fs::path comm = fs::path("/proc") / std::to_string(static_cast<long>(::getppid())) / "comm";
-        std::ifstream f(comm);
-        std::string name;
-        std::getline(f, name);
-        if (name != "pkexec") have_pk = false;  // somebody set the variable by hand
-    }
-    if (have_sudo && have_pk && sudo_uid != pk_uid) {
-        if (err) *err = "SUDO_UID and PKEXEC_UID disagree: refusing to guess who asked for this";
-        return false;
-    }
-    *out = have_sudo ? sudo_uid : have_pk ? pk_uid : ::geteuid();
-    return true;
+// The user behind a pkexec / sudo launch: resolve_invoking_uid on the real environment. `file` (optional) is the
+// configuration being migrated: its owner must be that user.
+InvokerInput invoker_input(const std::string& file) {
+    InvokerInput in;
+    const char* sp = std::getenv("SUDO_UID");
+    const char* pp = std::getenv("PKEXEC_UID");
+    in.sudo_uid = sp ? sp : "";
+    in.pkexec_uid = pp ? pp : "";
+    in.uid = ::getuid();
+    in.euid = ::geteuid();
+    std::ifstream lf("/proc/self/loginuid");
+    long long l = -1;
+    if (lf >> l) in.loginuid = l;
+    struct stat st{};
+    if (!file.empty() && ::lstat(file.c_str(), &st) == 0) in.file_owner = static_cast<int64_t>(st.st_uid);
+    return in;
 }
 
-uid_t original_uid() {
-    uid_t u = 0;
-    std::string err;
-    if (!original_uid_checked(&u, &err)) throw Error(err);
-    return u;
-}
+// Whose files the checked reads accept. In the elevated step it is the user resolved from PKEXEC_UID / SUDO_UID
+// (OwnerScope); everywhere else (the GUI building a summary, tests) it is simply this very process' user.
+thread_local bool tl_owner_set = false;
+thread_local uid_t tl_owner = 0;
+uid_t owner_uid() { return tl_owner_set ? tl_owner : ::geteuid(); }
+struct OwnerScope {
+    explicit OwnerScope(uid_t u) {
+        tl_owner_set = true;
+        tl_owner = u;
+    }
+    ~OwnerScope() { tl_owner_set = false; }
+};
 
 void make_admin_dir(const fs::path& dir) {
     std::error_code ec;
@@ -389,7 +426,7 @@ std::string read_user_file_checked(const std::string& path, size_t max) {
     struct Closer { int fd; ~Closer() { ::close(fd); } } closer{fd};
     struct stat st{};
     if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) throw Error("'" + path + "' is not a regular file");
-    if (st.st_uid != original_uid()) throw Error("'" + path + "' is not owned by the user who asked for this");
+    if (st.st_uid != owner_uid()) throw Error("'" + path + "' is not owned by the user who asked for this");
     std::string out;
     char buf[4096];
     for (;;) {
@@ -403,8 +440,19 @@ std::string read_user_file_checked(const std::string& path, size_t max) {
 #endif
 }
 
-KeyPair read_user_key(const std::string& path) {
+std::string lower_hex(std::string h) {
+    for (auto& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return h;
+}
+
+std::string hash_of(const std::string& bytes) { return hash_hex(hash_bytes(bytes.data(), bytes.size())); }
+
+KeyPair read_user_key(const std::string& path, const std::string& expect_hash) {
     std::string text = read_user_file_checked(path, 4096);
+    if (!expect_hash.empty() && lower_hex(hash_of(text)) != lower_hex(expect_hash)) {
+        secure_wipe(text.data(), text.size());
+        throw Error("the key file changed after you saw the summary: nothing was copied");
+    }
 #ifndef _WIN32
     struct stat st{};
     if (::stat(path.c_str(), &st) == 0 && (st.st_mode & 077) != 0) {
@@ -428,27 +476,35 @@ KeyPair read_user_key(const std::string& path) {
 // Everything in a user configuration that the service (a different, far more powerful account) would act on, checked.
 // `cfg` has absolute paths. Appends one sentence per problem.
 void check_for_service(const ClientConfig& cfg, const std::string& user_key, const fs::path& udir, const PathPolicy& pol,
-                       std::vector<std::string>* problems) {
+                       std::vector<std::string>* problems, std::vector<std::string>* confirm) {
     auto bad = [&](const std::string& m) { problems->push_back(m); };
+    for (const auto& r : pol.allow_roots) {
+        std::string why = allow_root_problem(r, pol);
+        if (!why.empty()) bad("the allowed folder '" + r + "' " + why);
+    }
     if (!inside_or_equal(fs::u8path(user_key), udir)) bad("the key '" + user_key + "' is not in your MySync folder");
-    for (const auto& w : cfg.watches) {
-        std::string r = forbidden_service_path_reason(w.path, pol);
-        if (r.empty()) {
-            std::string l = link_in_path(fs::u8path(w.path));
-            if (!l.empty()) r = "'" + l + "' is a link";
+    {
+        std::string l = link_in_path(fs::u8path(user_key));
+        if (!l.empty()) bad("the key path goes through a link ('" + l + "')");
+    }
+    auto check_path = [&](const char* what, const std::string& path) {
+        PathVerdict v = service_path_verdict(path, pol);
+        if (v.ok) {
+            std::string l = link_in_path(fs::u8path(path));
+            if (!l.empty()) bad(std::string(what) + " '" + path + "': '" + l + "' is a link");
+            return;
         }
-        if (!r.empty()) bad("folder '" + w.path + "': " + r);
+        if (v.confirmable && confirm) {
+            confirm->push_back(path);
+            return;
+        }
+        bad(std::string(what) + ": " + v.reason);
+    };
+    for (const auto& w : cfg.watches) {
+        check_path("folder", w.path);
         for (const auto& t : w.targets) {
-            if (t.is_local()) {
-                std::string rr = forbidden_service_path_reason(t.path, pol);
-                if (rr.empty()) {
-                    std::string l = link_in_path(fs::u8path(t.path));
-                    if (!l.empty()) rr = "'" + l + "' is a link";
-                }
-                if (!rr.empty()) bad("destination '" + t.path + "': " + rr);
-            } else if (!t.key_file.empty()) {
-                bad("a destination has its own key file, which the service does not support");
-            }
+            if (t.is_local()) check_path("destination", t.path);
+            else if (!t.key_file.empty()) bad("a destination has its own key file, which the service does not support");
         }
     }
 }
@@ -460,33 +516,145 @@ PathPolicy default_path_policy() {
 #ifdef _WIN32
     for (const char* v : {"SystemRoot", "ProgramData", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"}) {
         std::string e = env_u8(v);
-        if (!e.empty()) p.forbidden_roots.push_back(e);
+        if (!e.empty()) p.forbidden_roots.push_back(canonical_for_policy(e));
     }
     std::string home = env_u8("USERPROFILE");
-    p.own_home = home;
-    p.homes_root = home.empty() ? std::string() : fs::u8path(home).parent_path().u8string();
+    if (!home.empty()) {
+        p.own_home = canonical_for_policy(home);
+        p.homes_root = fs::u8path(p.own_home).parent_path().u8string();
+    }
 #else
-    for (const char* r : {"/etc", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/boot", "/dev", "/proc", "/sys", "/run",
-                          "/root", "/var/lib/mysync"})
-        p.forbidden_roots.push_back(r);
+    for (const char* r : {"/etc", "/usr", "/var", "/opt", "/srv", "/mnt", "/boot", "/bin", "/sbin", "/lib", "/lib32", "/lib64",
+                          "/dev", "/proc", "/sys", "/run", "/root"}) {
+        p.forbidden_roots.push_back(canonical_for_policy(r));
+    }
     struct passwd pw{}, *res = nullptr;
     char buf[4096];
-    if (::getpwuid_r(original_uid(), &pw, buf, sizeof buf, &res) == 0 && res && pw.pw_dir) p.own_home = pw.pw_dir;
+    if (::getpwuid_r(owner_uid(), &pw, buf, sizeof buf, &res) == 0 && res && pw.pw_dir)
+        p.own_home = canonical_for_policy(pw.pw_dir);
     p.homes_root = "/home";
 #endif
     return p;
 }
 
-std::string forbidden_service_path_reason(const std::string& path, const PathPolicy& pol) {
+// The path as the operating system really sees it: the deepest existing ancestor is resolved (symbolic links, junctions,
+// 8.3 names, "\\?\" prefixes), the part that does not exist yet is appended lexically.
+std::string canonical_for_policy(const std::string& path) {
     fs::path p = fs::u8path(path);
-    if (path.empty() || !p.is_absolute()) return "the path is not absolute";
-    for (const std::string& r : pol.forbidden_roots)
-        if (!r.empty() && inside_or_equal(p, fs::u8path(r))) return "it is inside a system folder (" + r + ")";
-    if (!pol.homes_root.empty() && inside_or_equal(p, fs::u8path(pol.homes_root))) {
-        if (pol.own_home.empty() || !inside_or_equal(p, fs::u8path(pol.own_home)) || norm_key(p) == norm_key(fs::u8path(pol.homes_root)))
-            return "it is in the profile folder of another user";
+    if (path.empty() || !p.is_absolute()) return path;
+    p = p.lexically_normal();
+    fs::path cur = p, rest;
+    std::error_code ec;
+    while (!fs::exists(cur, ec) && cur != cur.root_path() && cur.has_parent_path()) {
+        rest = rest.empty() ? cur.filename() : cur.filename() / rest;
+        cur = cur.parent_path();
     }
-    return {};
+    std::string resolved = cur.u8string();
+#ifdef _WIN32
+    HANDLE h = CreateFileW(cur.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        std::wstring buf(1024, L'\0');
+        DWORD n = GetFinalPathNameByHandleW(h, &buf[0], DWORD(buf.size()), VOLUME_NAME_DOS);
+        if (n >= buf.size()) {
+            buf.resize(n + 1);
+            n = GetFinalPathNameByHandleW(h, &buf[0], DWORD(buf.size()), VOLUME_NAME_DOS);
+        }
+        CloseHandle(h);
+        if (n > 0 && n < buf.size()) {
+            buf.resize(n);
+            if (buf.compare(0, 8, L"\\\\?\\UNC\\") == 0) buf = L"\\\\" + buf.substr(8);
+            else if (buf.compare(0, 4, L"\\\\?\\") == 0) buf = buf.substr(4);
+            resolved = fs::path(buf).u8string();
+        }
+    }
+#else
+    char rp[PATH_MAX];
+    if (::realpath(cur.c_str(), rp)) resolved = rp;
+#endif
+    fs::path out = fs::u8path(resolved);
+    if (!rest.empty()) out = (out / rest).lexically_normal();
+    return out.u8string();
+}
+
+namespace {
+bool is_unc(const fs::path& p) {
+#ifndef _WIN32
+    (void)p;
+    return false;
+#else
+    std::string g = p.u8string();   // native spelling: std::filesystem is vague about UNC paths
+    auto sep = [](char c) { return c == '/' || c == '\\'; };
+    return g.size() > 2 && sep(g[0]) && sep(g[1]) && !sep(g[2]) && g[2] != '?';
+#endif
+}
+bool is_fs_root(const fs::path& p) {
+    fs::path n = p.lexically_normal();
+    if (is_unc(n)) {   // \servershare is the root of a share
+        std::string g = n.u8string();
+        size_t seps = 0;
+        for (size_t i = 2; i < g.size(); ++i)
+            if (g[i] == '/' || g[i] == '\\') ++seps;
+        return seps <= 1;
+    }
+    return n == n.root_path() || n.filename().empty();
+}
+}  // namespace
+
+PathVerdict service_path_verdict(const std::string& path, const PathPolicy& pol) {
+    PathVerdict v;
+    fs::path raw = fs::u8path(path);
+    if (path.empty() || !(raw.is_absolute() || is_unc(raw))) {
+        v.reason = "the path is not absolute";
+        return v;
+    }
+    fs::path c = fs::u8path(pol.canonicalize ? canonical_for_policy(path) : raw.lexically_normal().u8string());
+    const std::string shown = "'" + path + "'" + (norm_key(c) == norm_key(raw) ? "" : " (really " + c.u8string() + ")");
+    if (is_fs_root(c) && !is_unc(c)) {
+        v.reason = shown + " is a whole drive / the root of the file system";
+        return v;
+    }
+    bool in_home = !pol.own_home.empty() && inside_or_equal(c, fs::u8path(pol.own_home));
+    if (!in_home) {
+        for (const std::string& r : pol.forbidden_roots)
+            if (!r.empty() && inside_or_equal(c, fs::u8path(r))) {
+                v.reason = shown + " is inside a system folder (" + r + ")";
+                return v;
+            }
+        if (!pol.homes_root.empty() && inside_or_equal(c, fs::u8path(pol.homes_root))) {
+            v.reason = shown + " is the profiles folder or the profile of another user";
+            return v;
+        }
+    }
+    if (in_home) {
+        v.ok = true;
+        return v;
+    }
+    for (const std::string& r : pol.allow_roots) {
+        fs::path ar = fs::u8path(pol.canonicalize ? canonical_for_policy(r) : r);
+        if (inside_or_equal(c, ar)) {
+            v.ok = true;
+            return v;
+        }
+    }
+    v.confirmable = true;
+    v.reason = shown + " is outside your home folder" + (is_unc(c) ? " (a network share)" : "") +
+               ": the service would work there with full rights; it must be confirmed explicitly";
+    return v;
+}
+
+std::string forbidden_service_path_reason(const std::string& path, const PathPolicy& pol) {
+    PathVerdict v = service_path_verdict(path, pol);
+    return v.ok ? std::string() : v.reason;
+}
+
+std::string allow_root_problem(const std::string& root, const PathPolicy& pol) {
+    PathPolicy strict = pol;
+    strict.allow_roots.clear();
+    PathVerdict v = service_path_verdict(root, strict);
+    if (v.ok) return {};
+    if (v.confirmable) return {};  // an ordinary folder outside the home: exactly what an allow root is for
+    return "cannot be allowed: " + v.reason;
 }
 
 namespace {
@@ -514,14 +682,11 @@ ClientConfig load_user_config_absolute(const std::string& config_path, std::stri
 
 }  // namespace
 
-MigrationSummary summarize_user_config(const UserPaths& paths) {
+MigrationSummary summarize_user_config(const UserPaths& paths, const std::vector<std::string>& allow_roots) {
     MigrationSummary m;
-    std::string text;
-    {
-        std::ifstream f(fs::u8path(paths.client_config), std::ios::binary);
-        if (!f) throw Error("cannot read '" + paths.client_config + "'");
-        text.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    }
+    // The same checked, single read the elevated step makes; the hash pins these exact bytes.
+    std::string text = read_user_file_checked(paths.client_config, 1 << 20);
+    m.config_hash = hash_of(text);
     std::string user_key;
     fs::path udir;
     ClientConfig c = load_user_config_absolute(paths.client_config, &user_key, &udir, text);
@@ -532,9 +697,13 @@ MigrationSummary summarize_user_config(const UserPaths& paths) {
             if (t.enabled) m.destinations.push_back(t.is_local() ? t.path : t.host + ":" + std::to_string(t.port));
     }
     try {
+        std::string kt = read_user_file_checked(user_key, 4096);
+        m.key_hash = hash_of(kt);
+        secure_wipe(kt.data(), kt.size());
         m.key_identity = gui::KeyManager::fingerprint(gui::KeyManager::public_key_of_file(user_key));
     } catch (const std::exception&) {
         m.key_identity = "(unreadable key)";
+        m.problems.push_back("the key file cannot be read");
     }
 #ifdef _WIN32
     m.service_account = "LocalSystem";
@@ -545,15 +714,68 @@ MigrationSummary summarize_user_config(const UserPaths& paths) {
                          " and will read and write the folders above with the rights of the whole computer, even when nobody is logged in.");
     m.warnings.push_back("Your key is copied to the service folder (administrators only); remove it when you go back to the personal mode if you wish.");
     PathPolicy pol = default_path_policy();
-    check_for_service(c, user_key, udir, pol, &m.problems);
+    pol.allow_roots = allow_roots;
+    check_for_service(c, user_key, udir, pol, &m.problems, &m.needs_confirmation);
     return m;
+}
+
+MigrationPlan plan_migration(const std::string& user_config, const std::string& expect_hash, const std::string& expect_key_hash,
+                             const std::vector<std::string>& allow_roots) {
+    fs::path up = fs::u8path(user_config);
+    if (!up.is_absolute()) throw Error("the user configuration path must be absolute");
+    std::string link = link_in_path(up);
+    if (!link.empty()) throw Error("'" + link + "' is a link: refusing");
+    uint32_t who_uid = 0;
+#ifndef _WIN32
+    std::optional<OwnerScope> scope;
+    {   // who asked: PKEXEC_UID is trusted only in a root process, and only if that user owns the file (resolve_invoking_uid)
+        InvokerResult who = resolve_invoking_uid(invoker_input(user_config));
+        if (!who.ok) throw Error(who.error);
+        if (!who.warning.empty()) std::cerr << "mysync: warning: " << who.warning << "\n";
+        scope.emplace(static_cast<uid_t>(who.uid));
+        who_uid = who.uid;
+    }
+#endif
+    // One open, every check on that handle (not a link, regular, owned by the user who asked).
+    std::string text = read_user_file_checked(user_config, 1 << 20);
+    // The bytes now in memory are the ONLY source of everything below (no second read of the file): they must be the
+    // bytes whose summary the user approved.
+    if (lower_hex(hash_of(text)) != lower_hex(expect_hash))
+        throw Error("the configuration was changed after you saw the summary: nothing was done. Open the window again and review it.");
+    MigrationPlan plan;
+    fs::path udir;
+    plan.config = load_user_config_absolute(user_config, &plan.user_key, &udir, text);  // throws with the line number
+    bool any = false;
+    for (const auto& w : plan.config.watches)
+        if (w.enabled && !w.targets.empty()) any = true;
+    if (!any) throw Error("the configuration has no enabled folder with a destination");
+    // The service will act on this content with far more rights than the user has: look at it again here, in the
+    // elevated process, whatever the GUI showed.
+    std::vector<std::string> problems, confirm;
+    PathPolicy policy = default_path_policy();
+    for (const auto& r : allow_roots) policy.allow_roots.push_back(r);
+    check_for_service(plan.config, plan.user_key, udir, policy, &problems, &confirm);
+    for (const auto& p : confirm) problems.push_back("'" + p + "' is outside your home folder and was not confirmed");
+    if (!problems.empty()) {
+        std::string all;
+        for (const auto& p : problems) all += (all.empty() ? "" : "; ") + p;
+        throw Error("refusing to run this configuration as a service: " + all);
+    }
+    plan.key = read_user_key(plan.user_key, expect_key_hash);
+    plan.who = who_uid;
+    return plan;
 }
 
 int run_migrate_from_user(const std::vector<std::string>& args) {
     std::string user_config, name = "mysync-client";
     bool remove = false;
+    std::string expect_hash, expect_key_hash;
+    std::vector<std::string> allow_roots;
     for (size_t i = 0; i < args.size(); ++i) {
         if (args[i] == "--user-config" && i + 1 < args.size()) user_config = args[++i];
+        else if (args[i] == "--expect-hash" && i + 1 < args.size()) expect_hash = args[++i];
+        else if (args[i] == "--expect-key-hash" && i + 1 < args.size()) expect_key_hash = args[++i];
+        else if (args[i] == "--allow-root" && i + 1 < args.size()) allow_roots.push_back(args[++i]);
         else if (args[i] == "--name" && i + 1 < args.size()) name = args[++i];
         else if (args[i] == "--remove") remove = true;
         else {
@@ -569,6 +791,9 @@ int run_migrate_from_user(const std::vector<std::string>& args) {
         if (!name_ok(name)) return bad("invalid service name", gui::kServiceBadArguments);
         if (!remove && user_config.empty())
             return bad("service migrate-from-user needs --user-config <file>", gui::kServiceBadArguments);
+        if (!remove && (expect_hash.empty() || expect_key_hash.empty()))
+            return bad("service migrate-from-user needs --expect-hash and --expect-key-hash (the hashes shown in the summary)",
+                       gui::kServiceBadArguments);
         if (!gui::ServiceController::is_elevated())
             return bad("this step needs administrator rights", gui::kServiceAccessDenied);
         ServiceLocations loc = service_locations(name);
@@ -586,33 +811,17 @@ int run_migrate_from_user(const std::vector<std::string>& args) {
             return 0;
         }
         if (user_config.empty()) return bad("service migrate-from-user needs --user-config <file>", gui::kServiceBadArguments);
-        fs::path up = fs::u8path(user_config);
-        if (!up.is_absolute()) return bad("the user configuration path must be absolute", gui::kServiceBadArguments);
-        std::string link = link_in_path(up);
-        if (!link.empty()) return bad("'" + link + "' is a link: refusing", gui::kServiceConfigError);
-        // One open, every check on that handle (not a link, regular, owned by the user who asked).
-        std::string text = read_user_file_checked(user_config, 1 << 20);
-        std::string user_key;
-        fs::path udir;
-        ClientConfig c = load_user_config_absolute(user_config, &user_key, &udir, text);  // throws with the line number
-        bool any = false;
-        for (const auto& w : c.watches)
-            if (w.enabled && !w.targets.empty()) any = true;
-        if (!any) return bad("the configuration has no enabled folder with a destination", gui::kServiceConfigError);
-
-        // The service will act on this content with far more rights than the user has: look at it again here, in the
-        // elevated process, whatever the GUI showed.
-        std::vector<std::string> problems;
-        check_for_service(c, user_key, udir, default_path_policy(), &problems);
-        if (!problems.empty()) {
-            std::string all;
-            for (const auto& p : problems) all += (all.empty() ? "" : "; ") + p;
-            return bad("refusing to run this configuration as a service: " + all, gui::kServiceConfigError);
+        MigrationPlan plan;
+        try {
+            plan = plan_migration(user_config, expect_hash, expect_key_hash, allow_roots);  // nothing is written before this passes
+        } catch (const Error& e) {
+            return bad(e.what(), gui::kServiceConfigError);
         }
-
+        ClientConfig& c = plan.config;
+        KeyPair& kp = plan.key;
         fs::path dir = fs::u8path(loc.dir);
         make_admin_dir(dir);
-        #ifndef _WIN32
+#ifndef _WIN32
         make_admin_dir(fs::u8path(loc.state).parent_path());
 #endif
         make_admin_dir(fs::u8path(loc.state));
@@ -620,7 +829,6 @@ int run_migrate_from_user(const std::vector<std::string>& args) {
         make_admin_dir(fs::u8path(loc.log).parent_path());
 #endif
         // The key: a copy under the trusted folder (the service must not depend on the user's profile).
-        KeyPair kp = read_user_key(user_key);
         std::error_code ec;
         fs::remove(fs::u8path(loc.key), ec);
         save_keypair(loc.key, kp);
@@ -634,7 +842,7 @@ int run_migrate_from_user(const std::vector<std::string>& args) {
         {   // the user may talk to the daemon through the socket group of their own (private) group
             struct passwd pw{}, *res = nullptr;
             char buf[4096];
-            if (::getpwuid_r(original_uid(), &pw, buf, sizeof buf, &res) == 0 && res) {
+            if (::getpwuid_r(static_cast<uid_t>(plan.who), &pw, buf, sizeof buf, &res) == 0 && res) {
                 struct group gr{}, *gres = nullptr;
                 char gbuf[4096];
                 if (::getgrgid_r(pw.pw_gid, &gr, gbuf, sizeof gbuf, &gres) == 0 && gres &&
@@ -668,8 +876,8 @@ namespace {
 
 class RealSteps : public UpgradeSteps {
 public:
-    RealSteps(Supervisor& sup, gui::ServiceController& ctl, UserPaths paths, std::string name)
-        : sup_(sup), ctl_(ctl), paths_(std::move(paths)), name_(std::move(name)) {}
+    RealSteps(Supervisor& sup, gui::ServiceController& ctl, UserPaths paths, std::string name, std::vector<std::string> allow)
+        : sup_(sup), ctl_(ctl), paths_(std::move(paths)), name_(std::move(name)), allow_roots_(std::move(allow)) {}
 
     std::string check_preconditions(bool to_service) override {
         if (!gui::ServiceController::valid_name(name_)) return "invalid service name";
@@ -689,8 +897,13 @@ public:
                 return std::string("the configuration cannot be used: ") + e.what();
             }
             try {
-                MigrationSummary m = summarize_user_config(paths_);
+                MigrationSummary m = summarize_user_config(paths_, allow_roots_);
                 if (!m.problems.empty()) return "the service would refuse this configuration: " + m.problems[0];
+                if (!m.needs_confirmation.empty())
+                    return "these folders are outside your home folder and need your explicit confirmation: " + m.needs_confirmation[0] +
+                           (m.needs_confirmation.size() > 1 ? " (and " + std::to_string(m.needs_confirmation.size() - 1) + " more)" : "");
+                summary_ = m;   // the migration uses exactly these bytes (hashes)
+                have_summary_ = true;
             } catch (const std::exception& e) {
                 return e.what();
             }
@@ -715,6 +928,10 @@ public:
         gui::ServiceRequest rq;
         rq.name = name_;
         rq.user_config = paths_.client_config;
+        if (!have_summary_) throw Error("the configuration was not reviewed first (no summary)");
+        rq.expect_config_hash = summary_.config_hash;
+        rq.expect_key_hash = summary_.key_hash;
+        rq.allow_roots = allow_roots_;
         done(ctl_.run(gui::ServiceAction::MigrateFromUser, rq), cancelled);
     }
     // The copy in the service folder is private to administrators and is reused by the next attempt: leaving it is
@@ -769,13 +986,17 @@ private:
     gui::ServiceController& ctl_;
     UserPaths paths_;
     std::string name_;
+    std::vector<std::string> allow_roots_;
+    MigrationSummary summary_;
+    bool have_summary_ = false;
 };
 
 }  // namespace
 
 std::unique_ptr<UpgradeSteps> make_real_upgrade_steps(Supervisor& sup, gui::ServiceController& ctl, const UserPaths& paths,
-                                                      const std::string& service_name) {
-    return std::make_unique<RealSteps>(sup, ctl, paths, service_name);
+                                                      const std::string& service_name,
+                                                      const std::vector<std::string>& allow_roots) {
+    return std::make_unique<RealSteps>(sup, ctl, paths, service_name, allow_roots);
 }
 
 }  // namespace mysync::simple

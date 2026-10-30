@@ -60,6 +60,9 @@ struct DaemonOptions {
     // Simple mode (`mysync run --user-mode`): the control channel is reachable by the current user only (see
     // IpcServerOptions::user_only).
     bool control_user_only = false;
+    // Tests only: called at named points of the pairing approval ("after_peer_add", "rollback"); an exception thrown
+    // from it simulates a failure there.
+    std::function<void(const char* stage)> pair_test_hook;
 };
 
 // Same path resolution `mysync run` applies after loading the file (relative key_file / state_dir / log_file /

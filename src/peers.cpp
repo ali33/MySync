@@ -146,7 +146,11 @@ std::vector<RevokedKey> load_revoked(const std::string& config_dir) {
     std::vector<RevokedKey> out;
     const std::string path = revoked_list_path(config_dir);
     std::error_code ec;
-    if (!fs::exists(fs::u8path(path), ec)) return out;  // no list = nothing revoked (the normal case)
+    fs::file_status st = fs::status(fs::u8path(path), ec);
+    if (st.type() == fs::file_type::not_found) return out;  // no list = nothing revoked (the normal case)
+    if (ec || st.type() != fs::file_type::regular)
+        throw Error("revoked-keys.txt cannot be examined (" + path + (ec ? ": " + ec.message() : ": not a regular file") +
+                    "): the configuration is refused");  // fail closed: any other doubt is not "nothing revoked"
     // A list that exists but cannot be used must NOT silently mean "nothing is revoked": that would re-admit a revoked
     // machine. Every problem below is an Error; the caller refuses the configuration.
     std::ifstream f(fs::u8path(path), std::ios::binary);

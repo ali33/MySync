@@ -224,6 +224,7 @@ struct PairingManager::Impl {
     std::mutex m;
     std::mutex approve_mu;  // serialises approve / deny against each other (the handler runs outside `m`)
     ApproveFn on_approve;
+    RevokeFn on_revoke;
     int64_t enabled_until = 0;   // 0 = off
     bool token_live = false;     // a one-time token exists and was not used yet
     Hash256 token_hash{};        // BLAKE2b of it (the token itself is never stored)
@@ -286,6 +287,11 @@ struct PairingManager::Impl {
 PairingManager::PairingManager(const PubKey& server_pub, ClockMs clock) : p_(std::make_shared<Impl>()) {
     p_->server_pub = server_pub;
     p_->clock = std::move(clock);
+}
+
+void PairingManager::set_revoke_handler(RevokeFn fn) {
+    std::lock_guard<std::mutex> lk(p_->m);
+    p_->on_revoke = std::move(fn);
 }
 
 void PairingManager::set_approve_handler(ApproveFn fn) {
@@ -384,14 +390,28 @@ std::string PairingManager::approve(uint32_t id) {
 
 void PairingManager::deny(uint32_t id) {
     std::lock_guard<std::mutex> ap(p_->approve_mu);
-    std::lock_guard<std::mutex> lk(p_->m);
-    int64_t t = p_->now();
-    p_->purge(t);
-    Impl::Req* r = p_->find_id(id);
-    if (!r || r->st != Impl::St::Waiting) throw Error("this pairing request no longer exists");
-    r->st = Impl::St::Denied;
-    r->keep_until = t + 30000;
-    p_->block(r->key, t);  // the same key cannot ask again for a while
+    PubKey key{};
+    RevokeFn revoke;
+    {
+        std::lock_guard<std::mutex> lk(p_->m);
+        int64_t t = p_->now();
+        p_->purge(t);
+        Impl::Req* r = p_->find_id(id);
+        if (!r || r->st != Impl::St::Waiting) throw Error("this pairing request no longer exists");
+        r->st = Impl::St::Denied;
+        r->keep_until = t + 30000;
+        p_->block(r->key, t);  // the same key cannot ask again for a while
+        key = r->key;
+        revoke = p_->on_revoke;
+    }
+    // Whatever an earlier, half-failed approval may have left in the allowlist goes now, with its open sessions.
+    if (revoke) {
+        try {
+            revoke(key);
+        } catch (const std::exception& e) {
+            log_error(std::string("could not make sure a denied computer is not in the allowlist: ") + e.what());
+        }
+    }
 }
 
 bool PairingManager::admit_handshake(const std::string& ip, const PubKey& key) {

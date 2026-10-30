@@ -167,8 +167,16 @@ struct Poke {
 
 Poke poke_daemon(const std::string& config_path, const std::string& service_name) {
     Poke out;
+    ServerConfig c;
     try {
-        ServerConfig c = gui::load_server_config_resolved(config_path);
+        c = gui::load_server_config_resolved(config_path);
+    } catch (const std::exception& e) {
+        // The file that was just written cannot be loaded here: a configuration problem, NOT "nobody is listening".
+        out.state = Poke::Refused;
+        out.note = std::string("the configuration that was just written cannot be loaded, so it is not in force: ") + e.what();
+        return out;
+    }
+    try {
         std::string name = gui::effective_control_name(c.control_name, service_name, true);
         gui::ControlClient cc(name, 4000);
         for (int attempt = 0; attempt < 4; ++attempt) {
@@ -231,13 +239,13 @@ void guard_admin(const std::string& config_path, const std::vector<std::string>&
 }
 
 void guard_server_config(const std::string& config_path) {
-    ServerConfig c = load_server_config(config_path);
     std::string dir = dir_of(config_path);
-    std::vector<std::string> dirs{dir};
+    guard_admin(config_path, {dir}, {});  // trust FIRST: an untrusted file is not even parsed
+    ServerConfig c = load_server_config(config_path);
+    std::vector<std::string> dirs;
     std::string pd = peers_dir_path(c, dir);
     if (!pd.empty()) dirs.push_back(pd);
-    std::vector<std::string> files{revoked_list_path(dir)};
-    guard_admin(config_path, dirs, files);
+    guard_admin(config_path, dirs, {revoked_list_path(dir)});
 }
 
 // ---------------------------------------------------------------------------------------------- keygen / key
@@ -399,6 +407,10 @@ int cmd_key_rotate(Args a) {
             std::string full = resolve_in(dir, rel);
             std::error_code ec;
             KeyPair kp;
+            {
+                std::string kdir = fs::u8path(full).parent_path().u8string();
+                guard_dir(kdir, "the folder of the new key");  // same trust and symlink rules as every other write
+            }
             if (fs::exists(fs::u8path(full), ec) || fs::is_symlink(fs::u8path(full), ec)) {
                 // A file that is already there is never taken over silently: it could be anyone's key (or a plant).
                 if (!adopt)

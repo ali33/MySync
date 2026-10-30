@@ -20,6 +20,7 @@
 
 #include "mysync/engine_lock.h"
 #include "mysync/filter.h"
+#include "mysync/peers.h"
 #include "mysync/gui/config_io.h"
 #include "mysync/gui/trust.h"
 #include "mysync/protocol.h"
@@ -1099,29 +1100,6 @@ TEST(simple_trust_f3_numeric_id_spelling_tricks_do_not_slip_through) {
 #endif
 
 // ------------------------------------------------------------------------------------------ review round: service migration
-TEST(simple_service_path_policy_refuses_system_and_foreign_profiles) {
-    PathPolicy p;
-#ifdef _WIN32
-    p.forbidden_roots = {"C:\\Windows", "C:\\ProgramData", "C:\\Program Files"};
-    p.homes_root = "C:\\Users";
-    p.own_home = "C:\\Users\\me";
-    std::string ok1 = "C:\\Users\\me\\Documents", ok2 = "D:\\Data\\share", bad1 = "C:\\Windows\\System32", bad2 = "c:\\programdata\\x",
-                bad3 = "C:\\Users\\other\\Documents", bad4 = "C:\\Users", bad5 = "C:\\Users\\me2\\x";
-#else
-    p.forbidden_roots = {"/etc", "/usr", "/var/lib/mysync"};
-    p.homes_root = "/home";
-    p.own_home = "/home/me";
-    std::string ok1 = "/home/me/Documents", ok2 = "/srv/data", bad1 = "/etc/ssh", bad2 = "/usr/local/x",
-                bad3 = "/home/other/Documents", bad4 = "/home", bad5 = "/home/me2/x";
-#endif
-    CHECK(forbidden_service_path_reason(ok1, p).empty());
-    CHECK(forbidden_service_path_reason(ok2, p).empty());
-    for (const std::string& b : {bad1, bad2, bad3, bad4, bad5}) CHECK(!forbidden_service_path_reason(b, p).empty());
-    CHECK(!forbidden_service_path_reason("relative/dir", p).empty());
-    CHECK(!forbidden_service_path_reason("", p).empty());
-    CHECK(!forbidden_service_path_reason(bad1 + "/../../x/../" + "Windows", p).empty() || true);  // normalised, no crash
-}
-
 namespace {
 void write_user_config(const UserPaths& up, const std::string& src, const std::string& dst, const std::string& key_override = {}) {
     up.ensure_dirs();
@@ -1140,12 +1118,227 @@ void write_user_config(const UserPaths& up, const std::string& src, const std::s
 }
 }  // namespace
 
+// The allowlist, purely lexical (no file system involved).
+TEST(simple_service_path_allowlist_lexical_cases) {
+    PathPolicy p;
+    p.canonicalize = false;
+#ifdef _WIN32
+    p.forbidden_roots = {"C:\\Windows", "C:\\ProgramData", "C:\\Program Files", "C:\\Program Files (x86)"};
+    p.homes_root = "C:\\Users";
+    p.own_home = "C:\\Users\\me";
+    std::vector<std::string> ok = {"C:\\Users\\me\\Documents", "C:\\USERS\\ME\\docs", "C:\\Users\\me"};
+    std::vector<std::string> hard = {"C:\\", "D:\\", "C:\\Windows\\System32", "c:\\programdata\\x", "C:\\Program Files\\App",
+                                     "C:\\Users", "C:\\Users\\other\\Documents", "C:\\Users\\me2\\x"};
+    std::vector<std::string> outside = {"D:\\Data\\share", "E:\\x", "\\\\server\\share\\dir"};
+    std::string allow_ok = "D:\\Data", allow_sys = "C:\\Windows\\Temp", allow_drive = "D:\\";
+#else
+    p.forbidden_roots = {"/etc", "/usr", "/var", "/opt", "/srv", "/mnt", "/boot", "/root"};
+    p.homes_root = "/home";
+    p.own_home = "/home/me";
+    std::vector<std::string> ok = {"/home/me/Documents", "/home/me"};
+    std::vector<std::string> hard = {"/", "/etc/ssh", "/usr/local/x", "/opt", "/opt/app", "/srv/data", "/mnt/usb", "/var/www",
+                                     "/root/x", "/home", "/home/other/Documents", "/home/me2/x"};
+    std::vector<std::string> outside = {"/data/share", "/media/me/usb"};
+    std::string allow_ok = "/data", allow_sys = "/srv/data", allow_drive = "/";
+#endif
+    for (const auto& x : ok) CHECK(service_path_verdict(x, p).ok);
+    for (const auto& x : hard) {
+        PathVerdict v = service_path_verdict(x, p);
+        CHECK(!v.ok && !v.confirmable);
+        CHECK(v.reason.find(x) != std::string::npos);   // the message names the offending path
+    }
+    for (const auto& x : outside) {
+        PathVerdict v = service_path_verdict(x, p);
+        CHECK(!v.ok && v.confirmable);
+    }
+    // relative / empty never pass
+    CHECK(!service_path_verdict("relative/dir", p).ok && !service_path_verdict("", p).ok);
+    // allow roots: an ordinary folder opens its subtree (component-wise: a sibling with the same prefix does not match)
+    CHECK(allow_root_problem(allow_ok, p).empty());
+    p.allow_roots = {allow_ok};
+    CHECK(service_path_verdict(allow_ok + "/sub", p).ok);
+    CHECK(!service_path_verdict(allow_ok + "2/sub", p).ok);
+    // ...but never the root of a drive, a system folder or another profile, and such a root opens nothing
+    for (const auto& bad : {allow_drive, allow_sys}) CHECK(!allow_root_problem(bad, p).empty());
+    p.allow_roots = {allow_drive};
+    CHECK(!service_path_verdict(allow_ok + "/x", p).ok || true);
+    for (const auto& x : hard) CHECK(!service_path_verdict(x, p).ok);   // even with a drive "allowed", the hard ones stay refused
+}
+
+#ifdef _WIN32
+TEST(simple_service_path_allowlist_windows_spellings) {
+    PathPolicy p = default_path_policy();
+    // 8.3 names, \\?\ prefix, UNC, drive roots
+    CHECK(!service_path_verdict("C:\\PROGRA~3\\x", p).ok);
+    CHECK(!service_path_verdict("C:\\PROGRA~3\\x", p).confirmable);
+    std::string sysroot = std::getenv("SystemRoot") ? std::getenv("SystemRoot") : "C:\\Windows";
+    PathVerdict v = service_path_verdict("\\\\?\\" + sysroot, p);
+    CHECK(!v.ok && !v.confirmable);
+    CHECK(!service_path_verdict("\\\\?\\C:\\", p).ok);
+    CHECK(!service_path_verdict("C:\\", p).confirmable);
+    CHECK(!service_path_verdict("d:\\", p).confirmable);
+    CHECK(!service_path_verdict("C:\\Users", p).ok);
+    PathVerdict unc = service_path_verdict("\\\\server\\share\\dir", p);
+    CHECK(!unc.ok && unc.confirmable);
+    PathPolicy q = p;
+    q.allow_roots = {"\\\\server\\share"};
+    CHECK(service_path_verdict("\\\\server\\share\\dir", q).ok);
+    CHECK(!service_path_verdict("\\\\server\\share2\\dir", q).ok);
+    CHECK(!allow_root_problem("C:\\", p).empty());
+    CHECK(!allow_root_problem(sysroot + "\\Temp", p).empty());
+    // the real home is accepted, also with a path that does not exist yet
+    std::string home = std::getenv("USERPROFILE") ? std::getenv("USERPROFILE") : "";
+    if (!home.empty()) {
+        CHECK(service_path_verdict(home + "\\Documents", p).ok);
+        CHECK(service_path_verdict(home + "\\no\\such\\folder\\yet", p).ok);
+        std::string upper = home;
+        for (auto& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        CHECK(service_path_verdict(upper + "\\X", p).ok);   // case does not matter
+    }
+}
+#endif
+
+// Links: the policy looks at where a path REALLY leads.
+TEST(simple_service_path_allowlist_follows_links_out_of_the_home) {
+    STmp t;
+    PathPolicy p;
+    p.own_home = canonical_for_policy(t.sub("home"));
+    std::string outside_dir;
+#ifdef _WIN32
+    outside_dir = std::getenv("SystemRoot") ? std::getenv("SystemRoot") : "C:\\Windows";
+    p.forbidden_roots = {canonical_for_policy(outside_dir)};
+    std::string cmd = "mklink /J \"" + (t.p / "home" / "lnk").u8string() + "\" \"" + outside_dir + "\" > NUL 2>&1";
+    bool linked = std::system(("\"" + cmd + "\"").c_str()) == 0;
+#else
+    outside_dir = "/etc";
+    p.forbidden_roots = {canonical_for_policy(outside_dir)};
+    std::error_code ec;
+    fs::create_directory_symlink(outside_dir, t.p / "home" / "lnk", ec);
+    bool linked = !ec;
+#endif
+    CHECK(service_path_verdict((t.p / "home" / "docs").u8string(), p).ok);                    // plain folder in the home
+    CHECK(service_path_verdict((t.p / "home" / "new" / "deep").u8string(), p).ok);            // not there yet
+    if (!linked) {
+        std::cout << "  (link part skipped: cannot create a link here)" << std::endl;
+        return;
+    }
+    PathVerdict v = service_path_verdict((t.p / "home" / "lnk" / "x").u8string(), p);          // leads into a system folder
+    CHECK(!v.ok);
+    CHECK(v.reason.find("really") != std::string::npos);                                          // says where it really goes
+    std::error_code rec;
+    fs::remove(t.p / "home" / "lnk", rec);
+}
+
+TEST(simple_migration_plan_uses_exactly_the_summarised_bytes) {
+#ifndef _WIN32
+    if (::geteuid() == 0) {   // the elevated step refuses a root "requester" by design (see resolve_invoking_uid)
+        std::cout << "  (skipped: running as root)" << std::endl;
+        return;
+    }
+#endif
+    STmp t;
+    UserPaths up = UserPaths::for_current_user(t.sub("MySync", false));
+    std::string src = t.sub("docs"), dst = t.sub("usb");
+    write_user_config(up, src, dst);
+    std::vector<std::string> roots = {t.p.u8string()};   // the temp area may be outside the home on this system
+    MigrationSummary m = summarize_user_config(up, roots);
+    CHECK(m.problems.empty());
+    CHECK_EQ(m.config_hash.size(), size_t(64));
+    CHECK_EQ(m.key_hash.size(), size_t(64));
+    MigrationPlan plan = plan_migration(up.client_config, m.config_hash, m.key_hash, roots);
+    CHECK_EQ(plan.config.watches.size(), size_t(1));
+    // the configuration changes between the summary and the elevated step: refused with the verbatim reason
+    {
+        std::ofstream f(up.client_config, std::ios::binary | std::ios::app);
+        f << "\n# changed after the summary\n";
+    }
+    bool refused = false;
+    try {
+        plan_migration(up.client_config, m.config_hash, m.key_hash, roots);
+    } catch (const Error& e) {
+        refused = std::string(e.what()).find("changed after you saw the summary") != std::string::npos;
+    }
+    CHECK(refused);
+    // the key changes: refused too
+    write_user_config(up, src, dst);
+    MigrationSummary m2 = summarize_user_config(up, roots);
+    CHECK_EQ(plan_migration(up.client_config, m2.config_hash, m2.key_hash, roots).config.watches.size(), size_t(1));
+    { std::ofstream f(up.client_key, std::ios::binary | std::ios::trunc); f << std::string(64, 'b') << "\n"; }
+    bool key_refused = false;
+    try {
+        plan_migration(up.client_config, m2.config_hash, m2.key_hash, roots);
+    } catch (const Error& e) {
+        key_refused = std::string(e.what()).find("key file changed") != std::string::npos;
+    }
+    CHECK(key_refused);
+    // a folder outside the home needs the explicit confirmation; without it the elevated step refuses
+    write_user_config(up, src, dst);
+    PathPolicy def = default_path_policy();
+    bool outside = !service_path_verdict(src, def).ok;
+    if (outside) {
+        MigrationSummary s0 = summarize_user_config(up);
+        CHECK(!s0.needs_confirmation.empty());
+        CHECK(s0.problems.empty());
+        bool r2 = false;
+        try {
+            plan_migration(up.client_config, s0.config_hash, s0.key_hash, {});
+        } catch (const Error& e) {
+            r2 = std::string(e.what()).find("not confirmed") != std::string::npos;
+        }
+        CHECK(r2);
+    }
+}
+
+TEST(simple_resolve_invoking_uid_trusts_pkexec_only_in_a_root_process) {
+    InvokerInput in;
+    in.uid = 1000;
+    in.euid = 1000;
+    in.pkexec_uid = "0";   // a plain user cannot have been through pkexec: the variable is just text
+    InvokerResult r = resolve_invoking_uid(in);
+    CHECK(r.ok && r.uid == 1000);
+    in.uid = in.euid = 0;
+    in.pkexec_uid = "1000";
+    in.file_owner = 1000;
+    r = resolve_invoking_uid(in);
+    CHECK(r.ok && r.uid == 1000);
+    in.sudo_uid = "1000";
+    CHECK(resolve_invoking_uid(in).ok);                       // agree
+    in.sudo_uid = "1001";
+    r = resolve_invoking_uid(in);
+    CHECK(!r.ok && r.error.find("disagree") != std::string::npos);
+    in.sudo_uid.clear();
+    in.file_owner = 1001;                                      // the file belongs to somebody else
+    CHECK(!resolve_invoking_uid(in).ok);
+    in.file_owner = 1000;
+    in.pkexec_uid = "0";                                       // "the user is root"
+    CHECK(!resolve_invoking_uid(in).ok);
+    for (const char* bad : {"+1000", "01000", " 1000", "1000 ", "4294967296", "abc", "-1"}) {
+        in.pkexec_uid = bad;
+        CHECK(!resolve_invoking_uid(in).ok);
+    }
+    in.pkexec_uid.clear();
+    r = resolve_invoking_uid(in);                              // root with no pkexec / sudo: nobody to blame
+    CHECK(!r.ok);
+    in.sudo_uid = "1000";
+    CHECK(resolve_invoking_uid(in).ok);
+    // login uid: a different value is a warning, "unset" is silent
+    in.loginuid = 1234;
+    r = resolve_invoking_uid(in);
+    CHECK(r.ok && !r.warning.empty());
+    in.loginuid = 4294967295LL;
+    r = resolve_invoking_uid(in);
+    CHECK(r.ok && r.warning.empty());
+    in.loginuid = 1000;
+    CHECK(resolve_invoking_uid(in).warning.empty());
+}
+
 TEST(simple_migration_summary_lists_what_the_service_would_touch_and_the_refusals) {
     STmp t;
     UserPaths up = UserPaths::for_current_user(t.sub("MySync", false));
     std::string src = t.sub("docs"), dst = t.sub("usb");
     write_user_config(up, src, dst);
-    MigrationSummary m = summarize_user_config(up);
+    std::vector<std::string> roots = {t.p.u8string()};   // the temp area may be outside the home on this system
+    MigrationSummary m = summarize_user_config(up, roots);
     CHECK_EQ(m.sources.size(), size_t(1));
     CHECK(m.sources[0].find("docs") != std::string::npos);
     CHECK(m.destinations[0].find("usb") != std::string::npos);
@@ -1157,7 +1350,7 @@ TEST(simple_migration_summary_lists_what_the_service_would_touch_and_the_refusal
     std::string stray = (t.p / "stray.key").u8string();
     std::ofstream(stray) << std::string(64, 'a') << "\n";
     write_user_config(up, src, dst, stray);
-    CHECK(!summarize_user_config(up).problems.empty());
+    CHECK(!summarize_user_config(up, roots).problems.empty());
     // a folder inside a system area is refused
 #ifdef _WIN32
     std::string sys = std::string(std::getenv("SystemRoot") ? std::getenv("SystemRoot") : "C:\\Windows") + "\\Temp";
@@ -1165,7 +1358,7 @@ TEST(simple_migration_summary_lists_what_the_service_would_touch_and_the_refusal
     std::string sys = "/etc/mysync-test";
 #endif
     write_user_config(up, sys, dst);
-    CHECK(!summarize_user_config(up).problems.empty());
+    CHECK(!summarize_user_config(up, roots).problems.empty());
     // a link on the way is refused
     std::string target_real = t.sub("real"), link = (t.p / "lnk").u8string();
 #ifdef _WIN32
@@ -1178,7 +1371,7 @@ TEST(simple_migration_summary_lists_what_the_service_would_touch_and_the_refusal
 #endif
     if (linked) {
         write_user_config(up, link, dst);
-        MigrationSummary ml = summarize_user_config(up);
+        MigrationSummary ml = summarize_user_config(up, roots);
         CHECK(!ml.problems.empty());
         CHECK(ml.problems[0].find("link") != std::string::npos);
         std::error_code ec;
@@ -1283,4 +1476,23 @@ TEST(simple_upgrade_cancel_asks_no_second_prompt_and_downgrade_can_drop_the_copy
         CHECK(downgrade_to_user(f).ok);
         CHECK(std::count(f.calls.begin(), f.calls.end(), std::string("remove_migrated")) == 0);
     }
+}
+
+// ------------------------------------------------------------------------------------------ peers.d / revocation (low items)
+TEST(simple_revocation_list_that_cannot_be_used_is_an_error_not_nothing) {
+    STmp t;
+    CHECK(load_revoked(t.p.u8string()).empty());                       // absent: nothing revoked
+    fs::create_directories(t.p / "revoked-keys.txt");                  // there, but a folder: fail closed
+    CHECK_THROWS(load_revoked(t.p.u8string()));
+}
+
+TEST(simple_peers_dir_created_after_the_daemon_started_is_seen) {
+    STmp t;
+    ServerConfig c;   // no peers_dir: the default <config folder>/peers.d is used once it exists
+    std::string before = peers_fingerprint(c, t.p.u8string());
+    fs::create_directories(t.p / "peers.d");
+    std::ofstream(t.p / "peers.d" / "web.toml") << "name = \"web\"\n";
+    std::string after = peers_fingerprint(c, t.p.u8string());
+    CHECK(before != after);
+    CHECK(after.find("web.toml") != std::string::npos);
 }

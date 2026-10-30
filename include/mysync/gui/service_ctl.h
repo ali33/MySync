@@ -59,6 +59,10 @@ struct ServiceState {
 
 struct ServiceRequest {
     std::string name;                         // service name, required
+    // migrate-from-user: the elevated step uses exactly the bytes that were summarised (BLAKE3 hex of the configuration and
+    // of the key file) and only the extra folders the user confirmed.
+    std::string expect_config_hash, expect_key_hash;
+    std::vector<std::string> allow_roots;
     bool remove_migrated = false;             // migrate-from-user: delete the service's copy instead (no user_config)
     std::string user_config;                  // migrate-from-user: absolute path of the user's configuration file
     std::string config_path;                  // install: absolute path of the config file

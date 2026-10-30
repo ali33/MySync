@@ -578,6 +578,23 @@ std::vector<std::string> ServiceController::build_args(ServiceAction act, const 
             throw Error("the user configuration path must be absolute");
         a.push_back("--user-config");
         a.push_back(rq.user_config);
+        auto hex64 = [](const std::string& h) {
+            if (h.size() != 64) return false;
+            for (char c : h)
+                if (!std::isxdigit(static_cast<unsigned char>(c))) return false;
+            return true;
+        };
+        if (!hex64(rq.expect_config_hash) || !hex64(rq.expect_key_hash))
+            throw Error("migrate-from-user needs the hashes of the configuration and of the key that were shown to the user");
+        a.push_back("--expect-hash");
+        a.push_back(rq.expect_config_hash);
+        a.push_back("--expect-key-hash");
+        a.push_back(rq.expect_key_hash);
+        for (const auto& r : rq.allow_roots) {
+            if (r.empty() || !fs::u8path(r).is_absolute() || has_ctl(r) || r[0] == '-') throw Error("an allowed folder must be an absolute path");
+            a.push_back("--allow-root");
+            a.push_back(r);
+        }
     } else if (!rq.config_path.empty() || !rq.role.empty() || !rq.run_as.empty() || !rq.control_allow.empty() ||
                !rq.trust_writers.empty()) {
         // not needed for these actions; ignoring silently would hide a caller mistake

@@ -83,6 +83,10 @@ public:
 
     explicit PairingManager(const PubKey& server_pub, ClockMs clock = {});
     void set_approve_handler(ApproveFn fn);
+    // Called by deny() (and only then) to make sure the key is NOT in the allowlist any more - e.g. an approval that failed
+    // half way and could not be rolled back. Must also cut any open session of that key. Errors are logged, not thrown.
+    using RevokeFn = std::function<void(const PubKey& key)>;
+    void set_revoke_handler(RevokeFn fn);
 
     // Operator (reached through the control channel)
     // Turns the mode on and creates a NEW one-time token (any earlier one dies). Only the BLAKE2b hash of the token is
