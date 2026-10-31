@@ -546,7 +546,7 @@ std::string read_user_file_checked(const std::string& path, size_t max, bool req
     bool same = false;
     LPWSTR s = nullptr;
     if (ConvertSidToStringSidW(owner, &s)) {
-        same = fs::path(std::wstring(s)).u8string() == current_user_sid();
+        same = fs::path(std::wstring(s)).u8string() == effective_user_sid();
         LocalFree(s);
     }
     LocalFree(psd);
@@ -652,7 +652,9 @@ void check_for_service(const ClientConfig& cfg, const std::string& user_key, con
 }  // namespace
 
 ServiceDirKind data_dir_kind_for_account(const std::string& user_sid) {
-    if (!user_sid.empty() && user_sid == current_user_sid() && !account_is_administrator(user_sid)) return ServiceDirKind::UserFull;
+    // d8: the engine runs with a restricted, medium-integrity token of the account itself - it can do no more through state/ and
+    // log/ than the user can anyway - so these two folders are the account's to write (the frame, with the fuller token, only reads).
+    if (valid_user_sid(user_sid)) return ServiceDirKind::UserFull;
     return ServiceDirKind::ServiceTop;
 }
 
@@ -697,7 +699,8 @@ PathPolicy default_path_policy() {
     }
     wchar_t sysdir[MAX_PATH] = {};
     if (GetSystemDirectoryW(sysdir, MAX_PATH)) p.forbidden_roots.push_back(canonical_for_policy(fs::path(sysdir).u8string()));
-    std::string home = known(FOLDERID_Profile);
+    // d8: the home is the REQUESTER's (the elevated process may run as another administrator, whose profile is not the user's)
+    std::string home = effective_user_sid() == current_user_sid() ? known(FOLDERID_Profile) : profile_path_for_sid(effective_user_sid());
     if (!home.empty()) {
         p.own_home = canonical_for_policy(home);
         p.homes_root = canonical_for_policy(fs::u8path(p.own_home).parent_path().u8string());
@@ -965,7 +968,8 @@ ClientConfig load_user_config_absolute(const std::string& config_path, std::stri
 
 }  // namespace
 
-MigrationSummary summarize_user_config(const UserPaths& paths, const std::vector<std::string>& allow_roots, const AdminProbe& probe) {
+MigrationSummary summarize_user_config(const UserPaths& paths, const std::vector<std::string>& allow_roots, const AdminProbe& probe,
+                                       const ExposureProbe& exposure) {
     MigrationSummary m;
     // The same checked, single read the elevated step makes; the hash pins these exact bytes.
     std::string text = read_user_file_checked(paths.client_config, 1 << 20);
@@ -990,17 +994,38 @@ MigrationSummary summarize_user_config(const UserPaths& paths, const std::vector
     }
     m.service_account = current_account_name();
     const AdminState power = probe ? probe(current_user_sid()) : account_admin_state(current_user_sid());
-    m.account_is_admin = power != AdminState::No;   // Unknown counts as an administrator (fail closed)
-    if (m.account_is_admin)
-        m.problems.insert(m.problems.begin(), admin_refusal_for(power));   // refused outright (d7e); the warning below stays for completeness
-    if (m.account_is_admin)
-        m.warnings.push_back("The service runs as " + (m.service_account.empty() ? std::string("you") : m.service_account) +
-                             ", an ADMINISTRATOR account, so it has FULL administrator rights, also when nobody is logged in. Its configuration " 
-                             "and folder can then be changed only by administrators (with the Windows confirmation). An ordinary account is safer.");
-    else
-        m.warnings.push_back("The service runs as " + (m.service_account.empty() ? std::string("you") : m.service_account) +
-                             ", with your own rights (not as the administrator), also when nobody is logged in.");
-    m.warnings.push_back("Your key is copied to the service folder (administrators only); remove it when you go back to the personal mode if you wish.");
+    m.account_is_admin = power != AdminState::No;   // shown in the confirmation (d8): no account is refused for being an administrator...
+    if (m.account_is_admin) {
+        // ...except when Windows does not filter its network logons (built-in Administrator, domain account, policy turned on)
+        std::string ex = exposure ? exposure() : account_exposure_problem_for_current_user();
+        if (!ex.empty()) {
+            m.problems.insert(m.problems.begin(), ex);
+            m.exposed = true;
+        }
+    }
+    {
+        // each note travels twice: the English text (command line, logs) and a message key + argument the GUI translates
+        auto note = [&m](const char* key, const std::string& arg, const std::string& english) {
+            m.warnings.push_back(english);
+            m.notes.push_back({key, arg});
+        };
+        const std::string who = m.service_account.empty() ? std::string("you") : m.service_account;
+        note("simple.svc.note.runs_as", who, "The service runs as " + who + ", also when nobody is logged in.");
+#ifdef _WIN32
+        m.warnings.push_back("The administrator who approves the installation only grants permission to install; the service itself runs as " + who + ".");
+        if (m.account_is_admin)
+            note("simple.svc.note.admin_acct", who,
+                 who + " is an administrator account: the synchronisation engine runs with a restricted token (administrator groups denied, "
+                       "dangerous privileges removed, Medium integrity). It shares the account's logon session, so a network folder (for example "
+                       "\\\\server\\share) is reached with your credentials; Windows filters the network logons of a local administrator.");
+#endif
+#ifdef _WIN32
+        note("simple.svc.note.netidentity", "",
+             "The restricted token does not separate the account's network identity: network folders and shares are reached with your credentials.");
+#endif
+        note("simple.svc.note.keycopy", "",
+             "Your key is copied to the service folder (administrators only); remove it when you go back to the personal mode if you wish.");
+    }
     PathPolicy pol = default_path_policy();
     pol.allow_roots = allow_roots;
     check_for_service(c, user_key, udir, pol, &m.problems, &m.needs_confirmation);
@@ -1056,9 +1081,10 @@ MigrationPlan plan_migration(const std::string& user_config, const std::string& 
     return plan;
 }
 
-int run_migrate_from_user(const std::vector<std::string>& args, const AdminProbe& probe) {
+int run_migrate_from_user(const std::vector<std::string>& args) {
     std::string user_config, name = "mysync-client";
     bool remove = false, config_only = false;
+    std::string requester;
     std::string expect_hash, expect_key_hash, account;
     std::vector<std::string> allow_roots;
     for (size_t i = 0; i < args.size(); ++i) {
@@ -1068,6 +1094,7 @@ int run_migrate_from_user(const std::vector<std::string>& args, const AdminProbe
         else if (args[i] == "--expect-key-hash" && i + 1 < args.size()) expect_key_hash = args[++i];
         else if (args[i] == "--allow-root" && i + 1 < args.size()) allow_roots.push_back(args[++i]);
         else if (args[i] == "--name" && i + 1 < args.size()) name = args[++i];
+        else if (args[i] == "--requester-sid" && i + 1 < args.size()) requester = args[++i];
         else if (args[i] == "--remove") remove = true;
         else if (args[i] == "--config-only") config_only = true;   // apply-config: new configuration, same key
         else {
@@ -1079,6 +1106,14 @@ int run_migrate_from_user(const std::vector<std::string>& args, const AdminProbe
         std::cerr << "mysync: " << m << "\n";
         return code;
     };
+    if (!requester.empty()) {   // d8: the user who asked; this process may run under the administrator who approved the prompt
+        if (!valid_user_sid(requester)) return bad("invalid --requester-sid", gui::kServiceBadArguments);
+        set_requester_sid(requester);
+#ifdef _WIN32
+        if (requester != current_user_sid())   // not blocked: this is the normal UAC-with-another-administrator case
+            std::cerr << "mysync: note: this step runs as another account than the user who asked; the service will belong to the user who asked\n";
+#endif
+    }
     try {
         if (!name_ok(name)) return bad("invalid service name", gui::kServiceBadArguments);
         if (!remove && user_config.empty())
@@ -1086,21 +1121,19 @@ int run_migrate_from_user(const std::vector<std::string>& args, const AdminProbe
         if (!remove && (expect_hash.empty() || (!config_only && expect_key_hash.empty())))
             return bad("service migrate-from-user needs --expect-hash and --expect-key-hash (the hashes shown in the summary)",
                        gui::kServiceBadArguments);
-#ifdef _WIN32
-        if (!remove) {   // before anything else: an administrator (or an account we cannot judge) never gets a service
-            std::string why = admin_refusal_for(probe ? probe(current_user_sid()) : account_admin_state(current_user_sid()));
-            if (!why.empty()) return bad(why, gui::kServiceAccessDenied);
-        }
-#endif
         if (!gui::ServiceController::is_elevated())
             return bad("this step needs administrator rights", gui::kServiceAccessDenied);
+#ifdef _WIN32
+        if (!remove && !valid_user_sid(requester))   // d8: the user who asked must be named (this process may run as another administrator)
+            return bad("the identity of the user who asked is missing (--requester-sid)", gui::kServiceBadArguments);
+#endif
         ServiceLocations loc = user_service_locations(name);
         // The account the service will run as is the REQUESTER, never somebody else: Windows compares the SID of the
         // named account with the user of this (elevated) process; POSIX uses the uid resolved from pkexec / sudo.
         DirOwner owner;
         std::string trust_entry;
 #ifdef _WIN32
-        owner.sid = current_user_sid();
+        owner.sid = effective_user_sid();
         if (!account.empty()) {
             std::string asid = account_sid(account);
             if (asid.empty() || asid != owner.sid)

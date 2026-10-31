@@ -48,6 +48,16 @@ std::string current_user_short_id();
 // Full SID text of the current user on Windows ("S-1-5-21-..."), "" elsewhere.
 std::string current_user_sid();
 
+// d8: the elevated step may run under ANOTHER account than the user who asked (UAC with an administrator's credentials). The
+// requester is named explicitly (--requester-sid) and every place of the elevated step that used to mean 'the current user'
+// uses effective_user_sid() instead. valid_user_sid accepts only a plain account SID (S-1-5-21-... or S-1-12-1-...).
+bool valid_user_sid(const std::string& sid);
+// The profile folder of the account with this SID (Windows: ProfileList in the registry); "" when there is none / elsewhere.
+// The elevated step takes the home of the REQUESTER from here, not the profile of the process it runs in.
+std::string profile_path_for_sid(const std::string& sid);
+void set_requester_sid(const std::string& sid);   // "" = none (effective_user_sid() is then the current user)
+std::string effective_user_sid();
+
 // Makes an existing file or directory owner-only (Windows: protected DACL owner+SYSTEM; POSIX: 0600 / 0700).
 void restrict_to_current_user(const std::string& utf8_path, bool is_dir);
 

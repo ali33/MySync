@@ -412,13 +412,30 @@ void WizardPage::AutoStep() {
     switch (m_.step()) {
         case WizardStep::Source:
             if (src_->GetValue().empty()) src_->SetValue(W(auto_src_));
+            if (simple_test_hooks().auto_stop == 0) {  // chụp ảnh tài liệu: dừng ở bước 1 với thư mục đã chọn
+                auto_ = false;
+                auto_timer_.Stop();
+                CheckInput(false);
+                break;
+            }
             CheckInput(true);
             break;
         case WizardStep::Dest:
             if (dst_->GetValue().empty()) dst_->SetValue(W(auto_dst_));
+            if (simple_test_hooks().auto_stop == 1) {
+                auto_ = false;
+                auto_timer_.Stop();
+                CheckInput(false);
+                break;
+            }
             CheckInput(true);
             break;
         case WizardStep::Finish:
+            if (simple_test_hooks().auto_stop == 2) {
+                auto_ = false;
+                auto_timer_.Stop();
+                break;
+            }
             auto_ = false;
             auto_timer_.Stop();
             Begin();

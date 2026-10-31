@@ -59,10 +59,14 @@ public:
         auto_req_ = true;
         if (mode_ == Mode::Simple) RunAutoDrive();
     }
-    void SimpleAutoReceive(const std::string& folder) {
-        if (simple_ && simple_->status()) simple_->status()->AutoReceive(folder);
+    void SimpleAutoReceive(const std::string& folder, bool with_code) {
+        if (simple_ && simple_->status()) simple_->status()->AutoReceive(folder, with_code);
     }
-    void Screenshot(const std::string& png);   // chụp cửa sổ (chẩn đoán / tài liệu)
+    void Screenshot(const std::string& png);
+    void SimpleShowAdvanced(bool on);
+    void SimpleAutoServiceDialog() {
+        if (simple_ && simple_->status()) simple_->status()->AutoServiceDialog();
+    }   // chụp cửa sổ (chẩn đoán / tài liệu)
     void ToggleService();                // từ menu khay
     bool IsConnected() const { return sh_.have_poll && sh_.last.connected; }
 

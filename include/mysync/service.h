@@ -8,6 +8,7 @@
 // service account needs.
 #include <atomic>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,12 @@ bool service_stop(const std::string& name, std::string* err = nullptr);      // 
 // "change the password of any service"). False + reason otherwise; always true elsewhere.
 // The description text of an installed service (Windows: SERVICE_CONFIG_DESCRIPTION; elsewhere empty). Empty when unreadable.
 std::string service_description(const std::string& name);
+// Thrown by a service body that cannot run and wants the Service Control Manager to show WHY: the service stops with
+// ERROR_SERVICE_SPECIFIC_ERROR and this specific exit code (the GUI maps it to plain words). Windows only effect.
+struct ServiceSpecificError : std::runtime_error {
+    int code;
+    ServiceSpecificError(int c, const std::string& m) : std::runtime_error(m), code(c) {}
+};
 bool service_runs_program(const std::string& name, const std::string& exe_path, std::string* err = nullptr);
 // Windows: gives an existing service a new password for its account (the user changed it). Wipes `password`.
 bool service_set_password(const std::string& name, const std::string& account, std::string& password, std::string* err = nullptr);

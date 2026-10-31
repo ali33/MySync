@@ -59,6 +59,10 @@ Dành cho người không chuyên: không cần cài dịch vụ, không cần q
 - Cài đặt riêng của GUI (lưu bằng wxConfig): `mode` (`simple`/`advanced`), `svc.mode`, `recv.on`, `recv.root`, `simple.autostart_init`.
 
 ### Mở lần đầu: màn "Bắt đầu nhanh"
+
+![Bắt đầu nhanh](images/gui-01-bat-dau-nhanh.png)
+
+(Ảnh trong tài liệu này là ảnh chụp thật của `mysync-gui` trên Windows 11, dùng thư mục mẫu `demo-*`; sinh bằng `--screenshot`, xem "Tham số dòng lệnh thêm".)
 Khi chưa có cấu hình riêng và không có dịch vụ nào trả lời, GUI không hiện màn xám mà hiện hai lựa chọn:
 
 ```
@@ -76,6 +80,10 @@ Khi chưa có cấu hình riêng và không có dịch vụ nào trả lời, GU
 Nếu có dịch vụ đang chạy và trả lời, GUI vào thẳng chế độ nâng cao như trước. Menu **Cài đặt > Về chế độ Đơn giản** đưa bạn quay lại.
 
 ### Trình hướng dẫn 3 bước
+
+| Bước 1: thư mục | Bước 2: nơi lưu | Bước 3: sẵn sàng |
+|---|---|---|
+| ![Bước 1](images/gui-02-buoc1-chon-thu-muc.png) | ![Bước 2](images/gui-03-buoc2-noi-luu.png) | ![Bước 3](images/gui-04-buoc3-xong.png) |
 1. **Thư mục nào cần được giữ bản sao?** Bấm *Chọn thư mục…*, gõ đường dẫn hoặc **kéo-thả một thư mục** từ Explorer vào cửa sổ. Lỗi hiện ngay dưới ô bằng lời dễ hiểu kèm đường dẫn/lỗi hệ thống nguyên văn (không thấy thư mục, là tệp chứ không phải thư mục, là cả ổ đĩa, nằm trong thư mục làm việc của MySync...).
 2. **Bản sao sẽ được lưu ở đâu?**
    - *Một thư mục khác, ổ USB hoặc thư mục chia sẻ trong mạng*: chọn thư mục hoặc gõ `\\tên-máy\chia-sẻ`. GUI thử ghi một tệp nhỏ để chắc chắn ghi được.
@@ -83,6 +91,12 @@ Nếu có dịch vụ đang chạy và trả lời, GUI vào thẳng chế độ
 3. **Sẵn sàng.** Một câu tóm tắt ("MySync sẽ giữ thư mục "…" luôn có bản sao ở … Tệp tạm và tệp hệ thống được bỏ qua; tệp bị xoá hoặc ghi đè được cất vào thùng rác; mọi thay đổi được gửi đi ngay"). Bấm **Bắt đầu đồng bộ**: ghi cấu hình (kèm bản sao `.bak` nếu đã có), tạo khoá, khởi động bộ đồng bộ, bật *Tự chạy khi tôi đăng nhập* (mặc định bật sau lần đầu, tắt được ở màn Trạng thái) và chuyển sang màn Trạng thái.
 
 ### Màn Trạng thái gọn
+
+![Màn Trạng thái](images/gui-05-trang-thai.png)
+
+Bấm **Chế độ nâng cao** để hiện bốn tab cũ ngay bên dưới:
+
+![Chế độ nâng cao](images/gui-07-nang-cao.png)
 
 ```
 +----------------------------------------------------------------+
@@ -106,15 +120,32 @@ Câu lớn đổi theo tình hình, màu cũng đổi (icon khay đổi theo): *
 - **Chạy cả khi chưa đăng nhập máy (cài dịch vụ)**: hỏi bằng lời thường, rồi chuyển từng bước (dừng bộ đồng bộ của bạn, chuyển cấu hình sang nơi an toàn của hệ thống, cài và chạy dịch vụ) qua hộp xin quyền quản trị; có chỉ báo động và tên bước đang chạy; lỗi hiện nguyên văn kèm bước hỏng, và hệ thống tự trả về như cũ nếu có thể (câu báo cho biết đã trả lại được hay chưa). Có chiều ngược **Quay lại chạy dưới tài khoản của tôi**. Khi đang chạy dịch vụ, nút *Thêm thư mục* tạm tắt (dùng chế độ nâng cao).
 
 ### Ghép hai máy bằng mã (không phải chép khoá)
+
+![Cho phép máy khác gửi file vào đây](images/gui-06-cho-phep-may-khac.png)
+
+(Ảnh chụp lúc đã bật nhận file nhưng **chưa có mã ghép**; bấm *Tạo mã mới* thì hiện dòng mã `MSY1-…` kèm nút *Sao chép*, danh sách địa chỉ và cổng của máy. Ảnh không chứa mã hay địa chỉ mạng thật.)
 **Máy NHẬN** (máy giữ bản sao): tại ô *Nhận file từ máy khác* bật *Cho phép máy khác gửi file vào đây*. Lần đầu GUI hỏi thư mục sẽ chứa file nhận được (mặc định `Documents\MySync-Nhan`), chạy bộ nhận, rồi mở **cửa sổ ghép 10 phút** (có đếm ngược). Màn hình hiện **mã ghép** một dòng (bắt đầu bằng `MSY1-`); mỗi lần bật là một mã MỚI có mật mã **dùng một lần** (hết hạn sau ít phút, có đếm ngược; nút *Tạo mã mới* và *Huỷ mã*): sau khi có một máy xin ghép (đồng ý hay không) mã cũ hết hiệu lực và màn hình nói rõ; máy gửi sai/thiếu mật mã hoặc dùng mã hết hạn/đã dùng chỉ thấy câu "Không ghép được…" chung và máy nhận không thấy hộp Đồng ý; nếu máy nhận cấm ghép bằng mã (`pairing = off`) công tắc báo "Máy này đang cấm ghép bằng mã" và không bật được. Mã ghép hiện ra, nút *Sao chép*, danh sách địa chỉ IP của máy này trong mạng (địa chỉ mạng nội bộ xếp đầu) và, nếu cần, nhắc mở tường lửa bằng lời thường. Khi máy kia xin ghép, hiện hộp thoại: **tên máy gửi + chuỗi xác nhận** lớn + "Hãy kiểm tra máy kia đang hiện đúng chuỗi này" + *Đồng ý* / *Từ chối*. Chỉ đồng ý khi hai chuỗi giống hệt nhau. Máy đã ghép vẫn gửi được sau khi cửa sổ ghép đóng; muốn ghép thêm máy bấm *Ghép thêm máy*.
 
 **Máy GỬI**: ở bước 2 chọn "Một máy tính khác có cài MySync", dán mã. Mã hỏng (thiếu/sai ký tự) báo bằng lời thường. Không bước nào bắt sửa danh sách khoá hay chép khoá bằng tay; **mã ghép không bao giờ chứa khoá bí mật** và GUI không bao giờ hiện khoá bí mật.
+
+### Dịch vụ Windows chạy bằng chính tài khoản của bạn
+Nút **Chạy cả khi chưa đăng nhập máy (cài dịch vụ)** hoạt động cho cả tài khoản quản trị lẫn tài khoản chuẩn:
+
+- Dịch vụ chạy bằng **tài khoản của người bấm nút**; người quản trị (nếu bạn là tài khoản chuẩn) chỉ cấp phép cài qua hộp xin quyền của Windows. Bên trong, engine luôn chạy với token hạn chế, kể cả khi tài khoản của bạn là quản trị viên.
+- Trước khi xin quyền, hộp xác nhận liệt kê thư mục dịch vụ sẽ đọc và nơi sẽ ghi, thư mục ngoài hồ sơ của bạn (cần bạn đồng ý bằng cách bấm *Tiếp tục*), vân tay ngắn của khoá, tên tài khoản chạy dịch vụ, và nói rõ bạn là quản trị viên hay tài khoản chuẩn.
+- Windows cần **mật khẩu** của tài khoản để dịch vụ đăng nhập khi chưa có ai ngồi máy (tài khoản Microsoft: mật khẩu tài khoản, không phải mã PIN Windows Hello). Mật khẩu được hỏi một lần, đi thẳng tới bước cài qua một kênh riêng, không vào tệp hay nhật ký, và bị xoá khỏi bộ nhớ ngay sau khi dùng. Nhập sai thì được hỏi lại (sai 5 lần liền thì chờ 30 giây để khỏi khoá tài khoản); tài khoản không có mật khẩu thì báo rõ không cài được và đưa sang *Tự chạy khi tôi đăng nhập*.
+- Khi bạn đổi mật khẩu Windows, dịch vụ không đăng nhập được nữa: màn Trạng thái hiện băng hổ phách với nút **Cập nhật mật khẩu**.
+- Lỗi từ khung dịch vụ (không tạo được token hạn chế, engine bị từ chối) hiện nguyên văn ở màn Trạng thái; dòng "service token: …" mà dịch vụ báo về được hiện ngay dưới câu trạng thái.
+
+![Hộp xác nhận cài dịch vụ](images/gui-08-dich-vu.png)
+
+(Ảnh chụp hộp xác nhận thật; tên tài khoản và tên máy được thay bằng tên mẫu `MAY-TINH\nguoidung` bằng `--redact-account`. Các dòng lưu ý do lõi trả về dưới dạng khoá thông điệp nên hộp hiện toàn tiếng Việt. Hộp mở được mà không cần quyền quản trị; hộp xin quyền của Windows chỉ hiện sau khi bấm Tiếp tục.)
 
 ### Quy ước đã áp dụng cho chế độ Đơn giản
 Mọi chờ có chỉ báo động (BusyIndicator, vô hiệu hoá phần nội dung để không bấm chồng); lỗi nguyên văn trên băng đỏ/hổ phách, kể cả ngoại lệ trong luồng nền (`run_async`); tiếng Việt mặc định và tiếng Anh; không thao tác UI từ luồng nền (kết quả luôn qua `CallAfter`); không hiện ID trần (hiện tên watch + nơi lưu). Logic thuần nằm ở `gui/simple_model.*` (câu trạng thái, tiến độ, trạng thái từng bước của trình hướng dẫn, kiểm mã ghép, xếp địa chỉ IP), test headless ở `tests/test_gui_simple_viewmodel.cpp`.
 
 ### Tham số dòng lệnh thêm (kiểm thử)
-`--user-dir=<thư mục>` · `--screenshot=<png>` `--shot-delay=<ms>` `--shot-exit` (chụp cửa sổ rồi thoát) · `--auto-src=<thư mục> --auto-dst=<thư mục>` (tự đi hết trình hướng dẫn bằng sự kiện giao diện thật) · `--auto-recv=<thư mục>` (bật nhận file vào thư mục đó). `--screenshot` chỉ vẽ lại chính cửa sổ MySync (PrintWindow), không chụp màn hình nên không lọt cửa sổ khác.
+`--user-dir=<thư mục>` · `--screenshot=<png>` `--shot-delay=<ms>` `--shot-exit` (chụp cửa sổ rồi thoát) · `--auto-src=<thư mục> --auto-dst=<thư mục>` (tự đi hết trình hướng dẫn bằng sự kiện giao diện thật) · `--auto-recv=<thư mục>` (bật nhận file vào thư mục đó) · `--wizard-stop=0|1|2` (dừng trình hướng dẫn tự lái ở bước đó) · `--show-advanced` · `--demo-ip=<ip>` (ảnh tài liệu: hiện địa chỉ mẫu) · `--auto-svc-dialog --dialog-shot=<png> [--redact-account]` (mở hộp xác nhận cài dịch vụ, chụp rồi tự bấm Huỷ: không cài gì). `--screenshot` chỉ vẽ lại chính cửa sổ MySync (PrintWindow), không chụp màn hình nên không lọt cửa sổ khác.
 
 ### Hạn chế của chế độ Đơn giản
 - Một GUI (một bộ engine) cho mỗi người dùng; hai thư mục đồng bộ cùng lúc bởi hai tiến trình bị chặn bằng khoá `<thư mục>/__sync/engine.lock`.
@@ -131,4 +162,4 @@ Mọi chờ có chỉ báo động (BusyIndicator, vô hiệu hoá phần nội 
 2. **Bước 1**: chọn (hoặc kéo-thả) thư mục cần giữ bản sao. **Bước 2**: chọn nơi lưu: thư mục khác, ổ USB, thư mục chia sẻ trong mạng (`\\máy\chia-sẻ`), hoặc một máy tính khác có MySync (dán mã ghép). **Bước 3**: bấm **Bắt đầu đồng bộ**.
 3. Từ đó MySync chạy dưới biểu tượng ở khay hệ thống (xanh lá = đã xong, xanh dương = đang chép, vàng/đỏ = cần chú ý). Đóng cửa sổ chỉ thu xuống khay; chọn **Thoát hẳn** ở menu khay để dừng.
 4. Gửi file sang máy khác: trên máy nhận bật **Cho phép máy khác gửi file vào đây**, sao chép **mã ghép**; trên máy gửi dán mã ở bước 2, so **chuỗi xác nhận** hai máy thấy giống nhau rồi bấm **Đồng ý** ở máy nhận.
-5. Muốn chạy cả khi chưa đăng nhập máy: ở màn Trạng thái bấm **Chạy cả khi chưa đăng nhập máy (cài dịch vụ)**. **Trên Windows nút này tạm thời bị khoá** (tài khoản quản trị bị từ chối vì dịch vụ sẽ chạy với toàn quyền; người dùng chuẩn không nâng quyền cùng tài khoản được); hãy bật **Tự chạy khi tôi đăng nhập**. Sẽ mở lại khi engine chạy bằng restricted token (đợt 8). Cần chỉnh sâu hơn: bấm **Chế độ nâng cao**.
+5. Muốn chạy cả khi chưa đăng nhập máy: ở màn Trạng thái bấm **Chạy cả khi chưa đăng nhập máy (cài dịch vụ)**. Trên Windows nút chạy được cho cả tài khoản quản trị lẫn tài khoản thường: UAC chỉ cấp phép cài (người quản trị nhập thông tin ở đó không trở thành chủ dịch vụ); dịch vụ chạy bằng tài khoản CỦA BẠN, và phần đồng bộ trong đó chạy bằng token hạn chế (bỏ nhóm quản trị và quyền nguy hiểm, mức toàn vẹn Medium). Hộp xác nhận trước UAC ghi rõ tài khoản nào sẽ chạy dịch vụ. Cần chỉnh sâu hơn: bấm **Chế độ nâng cao**.

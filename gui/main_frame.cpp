@@ -340,20 +340,13 @@ void MainFrame::DropFolders(const wxArrayString& files) {
 }
 
 void MainFrame::Screenshot(const std::string& png) {
-    // Chỉ vẽ lại CHÍNH cửa sổ này (không chụp màn hình): cửa sổ khác đè lên không lọt vào ảnh.
-    wxSize sz = GetSize();
-    wxBitmap bmp(sz.x, sz.y);
-    wxMemoryDC mem(bmp);
-    mem.SetBackground(*wxWHITE_BRUSH);
-    mem.Clear();
-#ifdef _WIN32
-    PrintWindow(reinterpret_cast<HWND>(GetHWND()), reinterpret_cast<HDC>(mem.GetHDC()), 0x2 /*PW_RENDERFULLCONTENT*/);
-#else
-    wxClientDC dc(this);
-    mem.Blit(0, 0, sz.x, sz.y, &dc, 0, 0);
-#endif
-    mem.SelectObject(wxNullBitmap);
-    if (!bmp.SaveFile(W(png), wxBITMAP_TYPE_PNG)) ReportError(BannerLevel::Warning, "shot", "cannot write " + png);
+    std::string e = save_window_png(this, png);
+    if (!e.empty()) ReportError(BannerLevel::Warning, "shot", e);
+}
+
+void MainFrame::SimpleShowAdvanced(bool on) {
+    adv_shown_ = on;
+    LayoutModes();
 }
 
 void MainFrame::SetLanguage(Lang l) {

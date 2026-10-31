@@ -360,10 +360,23 @@ TEST(simple_service_confirm_text_lists_folders_key_and_warning) {
     m.key_identity = "ab12 cd34";
     m.service_account = "LocalSystem";
     m.warnings = {"canh bao rieng"};
-    auto t = service_confirm_text(m, "PC\\Lan");
+    auto t = service_confirm_text(m, "PC\\Lan", true);
     for (const char* x : {"D:/Tài liệu", "E:/Sao-luu", "ab12 cd34", "PC\\Lan", "canh bao rieng", "có quyền cao hơn bạn", "Tiếp tục?"})
         CHECK(has(t, x));
     CHECK(!has(t, "{0}"));
+    // Windows: nói rõ ai chạy dịch vụ và ai chỉ cấp phép; khác nhau giữa tài khoản chuẩn và quản trị
+    CHECK(has(t, "người quản trị chỉ cấp phép cài"));
+    CHECK(has(t, "Windows sẽ hỏi tài khoản quản trị"));
+    m.account_is_admin = true;
+    m.needs_confirmation = {"D:/Ngoai-ho-so"};
+    auto ta = service_confirm_text(m, "PC\\Lan", true);
+    CHECK(has(ta, "là tài khoản quản trị"));
+    CHECK(has(ta, "vẫn chạy với quyền thường"));
+    CHECK(!has(ta, "Windows sẽ hỏi tài khoản quản trị"));
+    CHECK(has(ta, "D:/Ngoai-ho-so"));
+    auto tl = service_confirm_text(m, "alice", false);  // Linux: không nhắc Windows
+    CHECK(!has(tl, "Windows sẽ hỏi"));
+    CHECK(has(tl, "alice"));
 }
 
 TEST(simple_password_flow_states_retry_cancel) {
@@ -486,4 +499,24 @@ TEST(simple_password_flow_locks_after_repeated_wrong_attempts) {
     CHECK(f.state() == PwdState::Done);
     f.begin("PC\\Lan", false);
     CHECK(f.submit("PC\\Lan", true, t + 31001));
+}
+
+TEST(simple_service_confirmation_shows_the_core_notes_in_the_users_language) {
+    LangGuard g(Lang::Vi);
+    simple::MigrationSummary s;
+    s.sources = {"C:/docs"};
+    s.destinations = {"D:/usb"};
+    s.key_identity = "ab12";
+    s.warnings = {"The service runs as PC/lan, also when nobody is logged in.", "Your key is copied to the service folder."};
+    s.notes = {{"simple.svc.note.runs_as", "PC/lan"}, {"simple.svc.note.keycopy", ""}};
+    std::string vi = service_confirm_text(s, "PC/lan", false);
+    CHECK(vi.find("Dịch vụ chạy bằng tài khoản PC/lan") != std::string::npos);
+    CHECK(vi.find("Khoá của bạn được chép") != std::string::npos);
+    CHECK(vi.find("The service runs as") == std::string::npos);                 // no English left in the Vietnamese box
+    LangGuard e(Lang::En);
+    std::string en = service_confirm_text(s, "PC/lan", false);
+    CHECK(en.find("The service runs as the account PC/lan") != std::string::npos);
+    // an old summary without notes still shows its (English) warnings
+    s.notes.clear();
+    CHECK(service_confirm_text(s, "PC/lan", false).find("Your key is copied") != std::string::npos);
 }

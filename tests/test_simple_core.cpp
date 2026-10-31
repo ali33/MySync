@@ -1592,18 +1592,35 @@ TEST(simple_resolve_invoking_uid_refuses_setuid_style_processes) {
 }
 
 
-TEST(d7e_summary_refuses_unless_the_account_is_positively_ordinary) {
+
+TEST(d8_summary_informs_for_administrators_and_refuses_only_when_network_logons_are_unfiltered) {
     STmp t;
     UserPaths up = UserPaths::for_current_user(t.sub("MySync", false));
     write_user_config(up, t.sub("docs"), t.sub("usb"));
     std::vector<std::string> roots = {t.p.u8string()};
     for (AdminState st : {AdminState::Yes, AdminState::Unknown}) {
-        MigrationSummary a = summarize_user_config(up, roots, [st](const std::string&) { return st; });
+        // an administrator whose network logons Windows filters: information only
+        MigrationSummary a = summarize_user_config(up, roots, [st](const std::string&) { return st; }, [] { return std::string(); });
         CHECK(a.account_is_admin);
-        CHECK(!a.problems.empty());
-        if (!a.problems.empty()) CHECK_EQ(a.problems[0], admin_refusal_for(st));
+        CHECK(a.problems.empty());
+        CHECK(!a.exposed);
+        // ...and one whose network logons are NOT filtered (built-in Administrator, domain account, policy on): refused, first
+        MigrationSummary x = summarize_user_config(up, roots, [st](const std::string&) { return st; }, [] { return std::string("exposed: reason"); });
+        CHECK(x.exposed);
+        CHECK(!x.problems.empty());
+        if (!x.problems.empty()) CHECK_EQ(x.problems[0], std::string("exposed: reason"));
     }
-    MigrationSummary b = summarize_user_config(up, roots, test_no_admin);
-    CHECK(!b.account_is_admin);
-    CHECK(b.problems.empty());
+    // an ordinary account is never asked about its exposure
+    bool asked = false;
+    MigrationSummary b = summarize_user_config(up, roots, test_no_admin, [&] { asked = true; return std::string("x"); });
+    CHECK(!b.account_is_admin && !b.exposed && b.problems.empty() && !asked);
+    // the notes travel as message keys with their argument, next to the English text
+    CHECK(!b.notes.empty());
+    bool runs_as = false, keycopy = false;
+    for (const auto& n : b.notes) {
+        if (n.first == "simple.svc.note.runs_as") runs_as = true;
+        if (n.first == "simple.svc.note.keycopy") keycopy = true;
+    }
+    CHECK(runs_as && keycopy);
+    CHECK(b.warnings.size() >= b.notes.size());
 }

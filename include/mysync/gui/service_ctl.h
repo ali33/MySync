@@ -85,6 +85,10 @@ struct ServiceRequest {
     // flavour installed by an administrator with `mysync service install` is not touched by this.
     bool user_service = false;
     std::string password_pipe, password_nonce;   // set by run() itself (public so build_args can be tested)
+    // d8 (Windows): the account of the user who pressed the button in the GUI. The elevated step may run under another
+    // administrator's account; it takes THIS SID as the account the service belongs to and proves it (the private pipe's
+    // server process must carry it; the password must log on as it). Set by run() from the current user.
+    std::string requester_sid;
     std::vector<std::string> control_allow;   // install: SIDs / accounts to add to [control] allow (and to the trusted writers)
     std::vector<std::string> trust_writers;   // install: further accounts allowed to change the configuration (--trust-writer)
 };

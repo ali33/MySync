@@ -337,17 +337,29 @@ std::string friendly_error(const std::string& what) {
     return tr(key.c_str()) + (detail.empty() ? "" : "\n" + detail);
 }
 
-std::string service_confirm_text(const simple::MigrationSummary& s, const std::string& account) {
+std::string service_confirm_text(const simple::MigrationSummary& s, const std::string& account, bool windows) {
     auto list = [](const std::vector<std::string>& v) {
         std::string o;
         for (const auto& x : v) o += "\n  - " + x;
         return o;
     };
     std::string t = tr("simple.svc.confirm.to") + "\n\n" + tr("simple.svc.sum.sources") + list(s.sources) + "\n\n" +
-                    tr("simple.svc.sum.dests") + list(s.destinations) + "\n\n" +
-                    trf("simple.svc.sum.key", {s.key_identity.empty() ? "?" : s.key_identity}) + "\n" +
-                    trf("simple.svc.sum.account", {account.empty() ? "?" : account});
-    for (const auto& w : s.warnings) t += "\n! " + w;
+                    tr("simple.svc.sum.dests") + list(s.destinations) + "\n\n";
+    if (!s.needs_confirmation.empty())
+        t += tr("simple.svc.sum.extra") + list(s.needs_confirmation) + "\n\n";
+    t += trf("simple.svc.sum.key", {s.key_identity.empty() ? "?" : s.key_identity}) + "\n";
+    const std::string who = account.empty() ? "?" : account;
+    t += trf("simple.svc.sum.account", {who});
+    if (!s.notes.empty()) {   // the core's notes by message key, in the user's language
+        for (const auto& n : s.notes) t += "\n! " + (n.second.empty() ? tr(n.first.c_str()) : trf(n.first.c_str(), {n.second}));
+    } else {
+        for (const auto& w : s.warnings) t += "\n! " + w;
+    }
+    if (windows) {
+        // Trước hộp xin quyền: dịch vụ là của NGƯỜI BẤM NÚT; người quản trị chỉ cấp phép cài.
+        t += "\n\n" + trf("simple.svc.sum.runas", {who});
+        if (!s.account_is_admin) t += "\n" + tr("simple.svc.sum.win.standard");
+    }
     t += "\n\n" + trf(s.account_is_admin ? "simple.svc.sum.warn_admin" : "simple.svc.sum.warn", {account.empty() ? "?" : account});
     return t;
 }

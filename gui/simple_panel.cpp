@@ -5,7 +5,14 @@
 #include "simple_panel.h"
 
 #include <wx/commandlinkbutton.h>
+#include <wx/dcclient.h>
+#include <wx/dcmemory.h>
 #include <wx/gauge.h>
+
+#include <chrono>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "mysync/gui/service_ctl.h"
 #include "mysync/simple/autostart.h"
@@ -79,14 +86,91 @@ void WrapText::Rewrap() {
     if (w <= 20) return;
     SetLabelText(raw_);
     Wrap(w);
+    // Chiều cao đo trực tiếp trên chữ đã xuống dòng: GetBestSize() có thể còn là giá trị cũ và làm cụt các dòng cuối.
+    wxClientDC dc(this);
+    dc.SetFont(GetFont());
+    int h = dc.GetMultiLineTextExtent(GetLabel()).y + 2;
     int old_h = GetMinSize().y;
-    wxSize best = GetBestSize();
-    SetMinSize(wxSize(1, best.y));
-    if (best.y != old_h && GetParent()) {
+    SetMinSize(wxSize(1, h));
+    if (h != old_h && GetParent()) {
         GetParent()->Layout();
         if (GetParent()->GetParent()) GetParent()->GetParent()->Layout();
+        if (auto* d = wxDynamicCast(wxGetTopLevelParent(this), wxDialog)) d->Fit();
     }
 }
+
+SimpleTestHooks& simple_test_hooks() {
+    static SimpleTestHooks h;
+    return h;
+}
+
+std::string save_window_png(wxWindow* w, const std::string& png) {
+    wxSize sz = w->GetSize();
+    wxBitmap bmp(sz.x, sz.y);
+    wxMemoryDC mem(bmp);
+    mem.SetBackground(*wxWHITE_BRUSH);
+    mem.Clear();
+#ifdef _WIN32
+    PrintWindow(reinterpret_cast<HWND>(w->GetHWND()), reinterpret_cast<HDC>(mem.GetHDC()), 0x2 /*PW_RENDERFULLCONTENT*/);
+#else
+    wxClientDC dc(w);
+    mem.Blit(0, 0, sz.x, sz.y, &dc, 0, 0);
+#endif
+    mem.SelectObject(wxNullBitmap);
+    return bmp.SaveFile(W(png), wxBITMAP_TYPE_PNG) ? std::string() : "cannot write " + png;
+}
+
+namespace {
+// Chỉ cho ảnh tài liệu: thay tên tài khoản và tên máy THẬT trong chữ hiển thị bằng tên mẫu (không đổi gì khác).
+std::string redact_real_account(std::string t) {
+    auto all = [&t](const std::string& from, const std::string& to) {
+        if (from.empty()) return;
+        for (size_t i = t.find(from); i != std::string::npos; i = t.find(from, i + to.size())) t.replace(i, from.size(), to);
+    };
+    std::string real = simple::current_account_name();
+    size_t bs = real.find('\\');
+    all(real, "MAY-TINH\\nguoidung");
+    if (bs != std::string::npos) {
+        all(real.substr(0, bs), "MAY-TINH");
+        all(real.substr(bs + 1), "nguoidung");
+    }
+    return t;
+}
+
+// Hộp xác nhận có chữ dài (danh sách thư mục, cảnh báo): chữ tự xuống dòng, nút Tiếp tục / Huỷ.
+class TextConfirmDialog : public wxDialog {
+public:
+    TextConfirmDialog(wxWindow* parent, const std::string& text, bool warning)
+        : wxDialog(parent, wxID_ANY, L("app.title"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE), timer_(this) {
+        auto* v = new wxBoxSizer(wxVERTICAL);
+        auto* t = new WrapText(this, W(simple_test_hooks().redact_account ? redact_real_account(text) : text));
+        t->SetMinSize(wxSize(600, -1));
+        v->Add(t, 0, wxEXPAND | wxALL, 16);
+        auto* bs = new wxStdDialogButtonSizer;
+        auto* ok = new wxButton(this, wxID_OK, L("simple.svc.yes"));
+        bs->AddButton(ok);
+        bs->AddButton(new wxButton(this, wxID_CANCEL, L("btn.cancel")));
+        bs->Realize();
+        v->Add(bs, 0, wxEXPAND | wxALL, 12);
+        SetSizerAndFit(v);
+        ok->SetFocus();
+        (void)warning;
+        CentreOnParent();
+        const std::string& shot = simple_test_hooks().dialog_shot;
+        if (!shot.empty()) {
+            Bind(wxEVT_TIMER, [this, shot](wxTimerEvent&) {
+                std::string e = save_window_png(this, shot);
+                if (!e.empty()) wxLogError("%s", W(e));
+                EndModal(wxID_CANCEL);  // chụp xong thì HUỶ: không cài gì
+            });
+            timer_.StartOnce(1200);
+        }
+    }
+
+private:
+    wxTimer timer_;
+};
+}  // namespace
 
 // ---------------------------------------------------------------- Bắt đầu nhanh
 QuickStartPage::QuickStartPage(wxWindow* parent, SimpleCtx& c, std::function<void()> go_wizard)
@@ -262,10 +346,15 @@ void StatusPage::Refresh2() {
     }
     cur_ = compute_simple_status(in);
 
+    // What the service frame verified about the engine's token (Windows service): one plain line under the status.
+    std::string token_note;
+    if (c_.service_mode() && have_last_)
+        for (const auto& w : last_.snap.warnings)
+            if (w.rfind("service token:", 0) == 0) token_note = w;
     headline_->SetText(W(cur_.headline));
     headline_->SetTextColour(kind_colour(cur_.kind));
-    detail_->SetText(W(cur_.detail));
-    detail_->Show(!cur_.detail.empty() && !cur_.warn_banner);
+    detail_->SetText(W(cur_.detail + (token_note.empty() ? std::string() : (cur_.detail.empty() ? std::string() : std::string("\n")) + token_note)));
+    detail_->Show((!cur_.detail.empty() && !cur_.warn_banner) || !token_note.empty());
 
     bool starting = cur_.kind == SimpleKind::Starting || cur_.kind == SimpleKind::Restarting;
     if (starting && !starting_->IsRunning()) starting_->Start(L(cur_.kind == SimpleKind::Starting ? "simple.st.starting.b" : "simple.st.restarting.b"));
@@ -297,26 +386,9 @@ void StatusPage::Refresh2() {
 
     bool svc = c_.service_mode();
     b_svc_->SetLabel(L(svc ? "simple.svc.back" : "simple.svc.to"));
-    // Windows: the service-as-user cannot be set up for now (DESIGN.md d7f): an ordinary user is asked for ANOTHER account's
-    // credentials by UAC and the elevated step then runs as that other account, which it refuses; an administrator is refused
-    // by design. So the button is locked and says so in plain words instead of failing after a click. Going BACK to the
-    // personal mode (when a service exists) always works. On Linux (pkexec names the requester) it stays available, except for
-    // an account that cannot be shown to be ordinary.
-#ifdef _WIN32
-    const bool admin_locked = !svc;
-    const char* lock_key = "simple.svc.win_unsupported";
-#else
-    static const bool admin_acct = simple::account_is_administrator(simple::current_user_sid());
-    const bool admin_locked = !svc && admin_acct;
-    const char* lock_key = "simple.svc.admin_refused";
-#endif
-    b_svc_->Enable(!busy_op_ && !admin_locked);
-    b_svc_->SetToolTip(admin_locked ? L(lock_key) : wxString());
-    if (admin_locked && !busy_op_ && !svc_result_->IsShown()) {
-        svc_result_->SetText(L(lock_key));
-        svc_result_->SetTextColour(wxColour(0x60, 0x60, 0x60));
-        svc_result_->Show();
-    }
+    // d8: the service (a thin frame plus an engine with a restricted token) is available on Windows for every account.
+    b_svc_->Enable(!busy_op_);
+    b_svc_->SetToolTip(wxString());
     b_add_->Enable(!svc && !busy_op_);
     b_add_->SetToolTip(svc ? L("simple.add.svc") : wxString());
     content_->Layout();
@@ -328,9 +400,8 @@ void StatusPage::ToServiceClick() {
     bool to_service = !c_.service_mode();
     std::string account = simple::current_account_name();
     if (!to_service) {
-        wxMessageDialog q(this, L("simple.svc.confirm.back"), L("app.title"), wxYES_NO | wxNO_DEFAULT | wxICON_QUESTION);
-        q.SetYesNoLabels(L("simple.svc.yes"), L("btn.cancel"));
-        if (q.ShowModal() != wxID_YES) return;
+        TextConfirmDialog q(this, tr("simple.svc.confirm.back"), false);
+        if (q.ShowModal() != wxID_OK) return;
         RunUpgrade(false, account, nullptr);
         return;
     }
@@ -346,7 +417,7 @@ void StatusPage::ToServiceClick() {
             busy_op_ = false;
             content_->Enable(true);
             busy_->Stop();
-            std::string problem = !ok ? err : s.account_is_admin ? tr("simple.svc.admin_refused") : s.problems.empty() ? std::string() : s.problems.front();
+            std::string problem = !ok ? err : s.exposed ? tr("simple.svc.exposed") : s.problems.empty() ? std::string() : s.problems.front();
             if (!problem.empty()) {
                 svc_result_->SetText(W(problem));
                 svc_result_->SetTextColour(kRed);
@@ -355,12 +426,17 @@ void StatusPage::ToServiceClick() {
                 Refresh2();
                 return;
             }
-            wxMessageDialog q(this, W(service_confirm_text(s, account)), L("app.title"), wxYES_NO | wxNO_DEFAULT | wxICON_WARNING);
-            q.SetYesNoLabels(L("simple.svc.yes"), L("btn.cancel"));
-            if (q.ShowModal() != wxID_YES) {
+#ifdef _WIN32
+            const bool windows = true;
+#else
+            const bool windows = false;
+#endif
+            TextConfirmDialog q(this, service_confirm_text(s, account, windows), true);
+            if (q.ShowModal() != wxID_OK) {
                 Refresh2();
                 return;
             }
+            pending_roots_ = s.needs_confirmation;  // đồng ý bằng cách bấm Tiếp tục
             BeginPassword(false);
         });
 }
@@ -469,13 +545,14 @@ void StatusPage::RunUpgrade(bool to_service, const std::string& account, std::sh
     svc_result_->Hide();
     SimpleHost* host = c_.host;
     AliveFlag alive = alive_;
+    std::vector<std::string> roots = to_service ? pending_roots_ : std::vector<std::string>{};
     run_async<simple::UpgradeResult>(
         alive_,
-        [this, host, to_service, alive, account, pw]() {
+        [this, host, to_service, alive, account, pw, roots]() {
             simple::Supervisor* sup = host->sup();
             if (!sup) throw Error(tr("simple.svc.nosup"));
             gui::ServiceController ctl;
-            auto steps = simple::make_real_upgrade_steps(*sup, ctl, host->paths(), "", {}, account, pw.get());
+            auto steps = simple::make_real_upgrade_steps(*sup, ctl, host->paths(), "", roots, account, pw.get());
             // Gọi từ luồng nền: chỉ đẩy việc về luồng UI (CallAfter), không chạm cửa sổ ở đây.
             std::function<void(simple::UpgradeStep)> cb = [this, alive](simple::UpgradeStep s) {
                 if (!wxTheApp) return;
@@ -603,19 +680,24 @@ void StatusPage::CheckPasswordNeeded() {
     if (pwd_querying_ || busy_op_) return;
     pwd_querying_ = true;
     std::string name = SvcName();
-    run_async<bool>(
+    run_async<std::pair<bool, std::string>>(
         alive_,
         [name]() {
             gui::ServiceController ctl;
-            return ctl.query(name).needs_password_update;
+            gui::ServiceState st = ctl.query(name);
+            return std::make_pair(st.needs_password_update, st.error);
         },
-        [this](bool ok, bool& need, const std::string& err) {
+        [this](bool ok, std::pair<bool, std::string>& res, const std::string& err) {
             pwd_querying_ = false;
             if (!ok) {
                 c_.sh->report(BannerLevel::Warning, "simple.svc.query", err);
                 return;
             }
             c_.sh->clear_report("simple.svc.query");
+            // the service stopped by itself with a reason of its own (the frame refused to start the engine): verbatim
+            if (res.second.empty()) c_.sh->clear_report("simple.svc.frame");
+            else c_.sh->report(BannerLevel::Error, "simple.svc.frame", res.second);
+            bool need = res.first;
             if (pwd_panel_->IsShown() != need) {
                 pwd_panel_->Show(need);
                 content_->Layout();

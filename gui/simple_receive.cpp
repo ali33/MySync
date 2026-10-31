@@ -211,10 +211,10 @@ void ReceiveBox::RestoreAtStartup() {
     OnToggle(true);
 }
 
-void ReceiveBox::AutoEnable(const std::string& folder) {
+void ReceiveBox::AutoEnable(const std::string& folder, bool with_code) {
     c_.sh->set_setting("recv.root", folder);
     chk_->SetValue(true);
-    StartReceiving(true);
+    StartReceiving(with_code);
 }
 
 void ReceiveBox::OnToggle(bool want) {

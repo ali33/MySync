@@ -66,6 +66,9 @@ struct DaemonOptions {
     // Windows Simple-mode service (`--enforce-paths`): the daemon's own account does NOT count as trusted for the configuration
     // (it is the user; a user-level process could edit what the user can), and `state_writers` (the owner's SID, only when
     // state/ and log/ are user-writable) are trusted for the state and log folders only.
+    // The engine child of the Windows Simple-mode service: what the service frame verified about this process's token; shown in
+    // the status (warnings) so the GUI can tell the user the engine runs restricted.
+    std::string frame_note;
     bool exclude_self_from_trust = false;
     std::vector<std::string> state_writers;
     // Tests only: called at named points of the pairing approval ("after_peer_add", "rollback"); an exception thrown

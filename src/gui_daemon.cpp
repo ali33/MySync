@@ -377,6 +377,7 @@ struct ControlHost::Impl {
             std::lock_guard<std::mutex> lk(m);
             s.config_loaded_unix_ms = loaded_ms;
             s.config_error = config_error;
+            if (!opts.frame_note.empty()) s.warnings.push_back(opts.frame_note);
             break;
         }
         case ControlOp::ReloadConfig: {

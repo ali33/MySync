@@ -99,6 +99,10 @@ struct MigrationSummary {
     std::vector<std::string> destinations;  // folders / machines written to
     std::string key_identity;               // short fingerprint of the key the service would use
     std::string service_account;            // "LocalSystem" / "root"
+    // The same warnings as message keys + one argument, so the GUI can show them in its own language (the English text above is
+    // for the command line and the logs).
+    std::vector<std::pair<std::string, std::string>> notes;
+    bool exposed = false;                   // Windows: refused because the account's network logons are not restricted (problems[0] says why)
     bool account_is_admin = false;          // Windows: the account is an administrator, so the service gets FULL admin rights
     std::vector<std::string> warnings;      // plain-language cautions to show
     std::vector<std::string> problems;      // non-empty = the migration will be refused; first one is shown to the user
@@ -120,7 +124,7 @@ MigrationPlan plan_migration(const std::string& user_config, const std::string& 
                              const std::vector<std::string>& allow_roots, bool with_key = true);
 
 MigrationSummary summarize_user_config(const UserPaths& paths, const std::vector<std::string>& allow_roots = {},
-                                       const AdminProbe& probe = {});  // throws Error when the configuration cannot be read
+                                       const AdminProbe& probe = {}, const ExposureProbe& exposure = {});  // throws Error when the configuration cannot be read
 
 // ALLOWLIST of the folders a user configuration may hand to the service. After canonicalisation (links, junctions, 8.3
 // names and \\?\ resolved; a part that does not exist yet is appended to its deepest existing parent) a local folder
@@ -214,7 +218,6 @@ void install_service_files(const ServiceLocations& loc, uint32_t uid, uint32_t g
 // `mysync service migrate-from-user --user-config <path> [--name n]` (or `--remove --name n` to delete the private copy): runs ELEVATED. Verifies that the source is
 // a regular file owned by the calling (original) user and parses, then writes the copy (config, key) into the trusted
 // location with an admin-only ACL / root ownership. Returns the process exit code (ServiceExit values).
-// `probe` (default: the real token check) answers "how powerful is the requesting account"; tests inject it.
-int run_migrate_from_user(const std::vector<std::string>& args, const AdminProbe& probe = {});
+int run_migrate_from_user(const std::vector<std::string>& args);
 
 }  // namespace mysync::simple

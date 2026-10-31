@@ -78,6 +78,13 @@ int fake_engine_main(int argc, char** argv) {
         block_until_stdin_closes();
         return 0;
     }
+    if (mode == "probe-write" && argc > 3) {   // d8: can this process create a file there? 0 = yes, 3 = no
+        std::ofstream f(argv[3], std::ios::binary);
+        if (!f) return 3;
+        f << "x";
+        f.close();
+        return f ? 0 : 3;
+    }
     if (mode == "lock" && argc > 3) {
         std::string holder;
         auto l = FileLock::try_acquire(engine_lock_path_for_folder(argv[3]), &holder);

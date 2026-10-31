@@ -40,6 +40,7 @@
 #include "mysync/keys.h"
 #include "mysync/server.h"
 #include "mysync/service.h"
+#include "mysync/simple/restricted.h"
 #include "mysync/simple/service_account.h"
 #include "mysync/simple/service_upgrade.h"
 #include "mysync/util.h"
@@ -178,6 +179,8 @@ struct Opts {
     bool exit_on_stdin_eof = false;  // parent (GUI supervisor) closes our stdin => stop cleanly
     std::string expect_hash, expect_key_hash;
     std::string password_pipe, password_nonce, account;
+    std::string frame_note;      // run (engine child of the Windows Simple-mode service): what the frame verified about this process's token
+    std::string requester_sid;   // service steps (Windows, d8): the user who asked; the elevated process may run as another account
     std::vector<std::string> state_writers;   // run: SIDs trusted for state/ and log/ only (Windows Simple-mode service)
     bool enforce_paths = false;   // run: apply the Simple-mode path allowlist to every configuration load
     bool user_service = false;   // service install: the Simple-mode flavour (runs as the user, own runtime folder)
@@ -219,6 +222,8 @@ Opts parse_opts(const std::vector<std::string>& a, size_t from) {
         else if (s == "--user-service") o.user_service = true;
         else if (s == "--enforce-paths") o.enforce_paths = true;
         else if (s == "--state-writer") o.state_writers.push_back(val());
+        else if (s == "--requester-sid") o.requester_sid = val();
+        else if (s == "--frame-note") o.frame_note = val();
         else if (s == "--expect-key-hash") o.expect_key_hash = val();
         else if (s == "--allow-root") o.allow_roots.push_back(val());
         else if (s == "--user-config") o.user_config = val();
@@ -330,15 +335,6 @@ constexpr bool kWindowsHost = false;
 #endif
 
 int cmd_run(const Opts& o) {
-    if (o.service && o.enforce_paths && kWindowsHost) {
-        // The Simple-mode service checks again at EVERY start: the account may have been made an administrator after the install.
-        std::string why = simple::service_start_refusal(simple::account_admin_state(simple::current_user_sid()));
-        if (!why.empty()) {
-            log_error(why);
-            std::cerr << "mysync: " << why << "\n";
-            return 1;
-        }
-    }
     Loaded l = load_config(o);
     // Trust comes FIRST: before the log file is opened or anything is created from this configuration. With high
     // rights (elevated / SYSTEM / root / --service) the file, its folder, the state folder (the default one when
@@ -365,6 +361,26 @@ int cmd_run(const Opts& o) {
             return 1;
         }
     }
+#ifdef _WIN32
+    if (o.service && o.enforce_paths && l.role == Role::Client) {
+        // The Simple-mode service on Windows is only a FRAME (d8): the engine runs in a child with a restricted token. Everything
+        // above (trust of the configuration, state and log folders) was checked here, with the frame's own token.
+        simple::FrameParams fp;
+        fp.exe = self_exe();
+        fp.workdir = l.dir;
+        fp.temp_dir = gui::effective_client_state_dir(l.client.state_dir, l.path);
+        std::string fname = o.name.empty() ? default_service_name(l.role) : o.name;
+        fp.engine_args = {"run", "-c", l.path, "--role", "client", "--name", fname, "--enforce-paths"};
+        for (const auto& r : o.allow_roots) { fp.engine_args.push_back("--allow-root"); fp.engine_args.push_back(r); }
+        for (const auto& w : o.state_writers) { fp.engine_args.push_back("--state-writer"); fp.engine_args.push_back(w); }
+        std::function<void(std::atomic<bool>&)> frame_body = [fp](std::atomic<bool>& stop) {
+            std::string why;
+            int code = simple::run_frame(fp, stop, &why);
+            if (code != 0) throw ServiceSpecificError(code, why);
+        };
+        return run_as_service(fname, frame_body);
+    }
+#endif
     std::function<void(std::atomic<bool>&)> body;
     int rc = 0;
     if (l.role == Role::Server) {
@@ -398,6 +414,12 @@ int cmd_run(const Opts& o) {
         dopt.enforce_config_trust = gui::need_strict_trust(gui::ServiceController::is_elevated(), o.service);
         dopt.trusted_writers = o.trust_writers;
         dopt.control_user_only = o.user_mode;
+#ifdef _WIN32
+        // the engine's own token, read here - the command-line note only tells that a frame started us
+        if (!o.frame_note.empty()) dopt.frame_note = simple::describe_own_token();
+#else
+        dopt.frame_note = o.frame_note;
+#endif
         if (o.enforce_paths) {
             std::vector<std::string> roots = o.allow_roots;
             std::string cdir = dir;
@@ -475,6 +497,10 @@ int cmd_service(const Opts& o) {
 }
 
 int cmd_service_impl(const Opts& o) {
+    if (!o.requester_sid.empty()) {   // the user who asked (d8): the process may be running under the administrator who approved
+        if (!simple::valid_user_sid(o.requester_sid)) usage("invalid --requester-sid");
+        simple::set_requester_sid(o.requester_sid);
+    }
     if (o.pos.size() == 1 && (o.pos[0] == "migrate-from-user" || o.pos[0] == "apply-config")) {  // elevated helper of the GUI (simple mode)
         if (o.user_config.empty() && !o.remove_copy) usage("service migrate-from-user needs --user-config <file>");
         std::vector<std::string> a;
@@ -486,6 +512,7 @@ int cmd_service_impl(const Opts& o) {
         if (!o.expect_key_hash.empty()) { a.push_back("--expect-key-hash"); a.push_back(o.expect_key_hash); }
         for (const auto& r : o.allow_roots) { a.push_back("--allow-root"); a.push_back(r); }
         if (!o.name.empty()) { a.push_back("--name"); a.push_back(o.name); }
+        if (!o.requester_sid.empty()) { a.push_back("--requester-sid"); a.push_back(o.requester_sid); }
         return simple::run_migrate_from_user(a);
     }
     if (o.pos.size() != 1) usage("usage: mysync service install|uninstall|start|stop [options]");
@@ -508,7 +535,11 @@ int cmd_service_impl(const Opts& o) {
         if (o.user.empty() || o.password_pipe.empty()) usage("service set-password needs --user <account> and --password-pipe/--password-nonce");
 #ifdef _WIN32
         {   // only for the account of the user who asks, and only on a MySync service of this installation
-            if (simple::account_sid(o.user) != simple::current_user_sid()) {
+            if (!simple::valid_user_sid(o.requester_sid)) {
+                std::cerr << "mysync: the user who asked is not named (--requester-sid)\n";
+                return gui::kServiceBadArguments;
+            }
+            if (simple::account_sid(o.user) != simple::effective_user_sid()) {
                 std::cerr << "mysync: the password can only be changed for your own account\n";
                 return gui::kServiceAccessDenied;
             }
@@ -527,7 +558,7 @@ int cmd_service_impl(const Opts& o) {
 #endif
         simple::SecretString pw;
         std::string perr;
-        if (!simple::receive_password(o.password_pipe, o.password_nonce, &pw, &perr)) {
+        if (!simple::receive_password(o.password_pipe, o.password_nonce, &pw, &perr, o.requester_sid)) {
             std::cerr << "mysync: " << perr << "\n";
             return gui::kServiceGenericFailure;
         }
@@ -536,8 +567,8 @@ int cmd_service_impl(const Opts& o) {
             std::cerr << "mysync: " << chk.error << "\n";
             return gui::kServiceConfigError;
         }
-        {   // a password is not changed on a service whose account is (or may be) an administrator
-            std::string why = simple::service_account_refusal(chk.admin, simple::account_admin_state(chk.sid));
+        {   // the password of the REQUESTER, whoever approved the prompt
+            std::string why = simple::requester_identity_problem(simple::effective_user_sid(), chk.sid);
             if (!why.empty()) {
                 std::cerr << "mysync: " << why << "\n";
                 return gui::kServiceAccessDenied;
@@ -614,7 +645,8 @@ int cmd_service_impl(const Opts& o) {
             owner_id = std::to_string(static_cast<unsigned long>(pw.pw_uid));
             sp.display += " " + simple::owner_label(owner_id);   // the unit's Description=
 #else
-            owner_id = simple::current_user_sid();
+            if (!simple::valid_user_sid(o.requester_sid)) throw Error("--user-service needs --requester-sid (the user who asked)");
+            owner_id = simple::effective_user_sid();
             // The account's password must come through the private channel, and the account must be the requester's own,
             // whatever else the arguments say.
             if (o.password_pipe.empty()) throw Error("--user-service needs the private password channel (--password-pipe)");
@@ -629,7 +661,7 @@ int cmd_service_impl(const Opts& o) {
             // reported at once; the right to log on as a service is granted to exactly this account, only if it lacks it.
             simple::SecretString pw;
             std::string perr;
-            if (!simple::receive_password(o.password_pipe, o.password_nonce, &pw, &perr)) {
+            if (!simple::receive_password(o.password_pipe, o.password_nonce, &pw, &perr, o.requester_sid)) {
                 std::cerr << "mysync: " << perr << "\n";
                 return gui::kServiceGenericFailure;
             }
@@ -638,21 +670,21 @@ int cmd_service_impl(const Opts& o) {
                 std::cerr << "mysync: " << chk.error << "\n";
                 return gui::kServiceConfigError;
             }
-            if (o.user_service && chk.sid != simple::current_user_sid()) {
-                std::cerr << "mysync: the service must run as the account of the user who asks (" << o.user << " is not you)\n";
+            if (o.user_service && !chk.exposure_problem.empty()) {   // network logons of this account are not restricted by Windows
+                std::cerr << "mysync: " << chk.exposure_problem << "\n";
                 return gui::kServiceAccessDenied;
             }
-            if (o.user_service) {   // the account's NEW logon token AND this process must both say 'ordinary'
-                std::string why = simple::service_account_refusal(chk.admin, simple::account_admin_state(chk.sid));
+            if (o.user_service) {   // d8: the service belongs to the user who pressed the button, not to the approving administrator
+                std::string why = simple::requester_identity_problem(simple::effective_user_sid(), chk.sid);
                 if (!why.empty()) {
-                    std::cerr << "mysync: " << why << "\n";
+                    std::cerr << "mysync: " << why << " (" << o.user << ")\n";
                     return gui::kServiceAccessDenied;
                 }
             }
             std::string gerr = simple::grant_service_logon_right(chk.sid, &right_added);
             right_sid = chk.sid;
             if (right_added) right_guard.granted(chk.sid);
-            if (o.user_service && !simple::account_is_administrator(chk.sid))
+            if (o.user_service)   // the engine runs with a restricted token of this user: state/ and log/ are its own
                 sp.args.insert(sp.args.end(), {"--state-writer", chk.sid});   // ordinary account: its state/ and log/ are its own
             if (!gerr.empty()) {
                 std::cerr << "mysync: " << gerr << "\n";
@@ -738,8 +770,10 @@ int cmd_service_impl(const Opts& o) {
             std::ifstream mf(marker);
             std::string sid;
             if (mf >> sid) {
-                std::string rerr = simple::revoke_service_logon_right(sid);
-                if (!rerr.empty()) std::cerr << "mysync: warning: " << rerr << "\n";
+                if (simple::release_logon_right(simple::user_service_locations(name).dir, sid, [](const std::string& n) { return service_description(n); })) {   // no other MySync service of this account needs it
+                    std::string rerr = simple::revoke_service_logon_right(sid);
+                    if (!rerr.empty()) std::cerr << "mysync: warning: " << rerr << "\n";
+                }
                 mf.close();
                 std::error_code mec;
                 fs::remove(fs::u8path(marker), mec);

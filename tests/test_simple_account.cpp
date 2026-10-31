@@ -11,6 +11,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <thread>
 
 #include "mysync/client_engine.h"
@@ -21,6 +22,7 @@
 #include "mysync/simple/pairing.h"
 #include "mysync/simple/service_account.h"
 #include "mysync/simple/service_upgrade.h"
+#include "mysync/simple/user_paths.h"
 #include "testing.h"
 
 #ifdef _WIN32
@@ -36,6 +38,15 @@ using namespace mysync::simple;
 namespace fs = std::filesystem;
 
 namespace {
+
+// Joins the listed threads on every way out of a test: a failed CHECK throws, and a joinable std::thread destroyed then would abort the run.
+struct ThreadsJoin {
+    std::vector<std::thread*> t;
+    ~ThreadsJoin() {
+        for (auto* x : t)
+            if (x->joinable()) x->join();
+    }
+};
 
 struct ATmp {
     fs::path p;
@@ -187,6 +198,7 @@ TEST(account_user_service_locations_belong_to_the_service_not_to_the_admin_area)
 #ifdef _WIN32
 TEST(account_password_channel_hands_the_password_over_once_to_a_client_with_the_nonce) {
     auto ch = PasswordChannel::create();
+    ch->expect_client_pid(GetCurrentProcessId());   // (the 'elevated process' of this test is a thread of ours)
     CHECK(ch->pipe_name().rfind("mysync-pw-", 0) == 0);
     CHECK_EQ(ch->nonce_hex().size(), size_t(32));
     SecretString secret(std::string("Pa55w0rd-with-ünïcode"));
@@ -195,6 +207,7 @@ TEST(account_password_channel_hands_the_password_over_once_to_a_client_with_the_
     bool client_ok = false, delivered = false;
     std::thread client([&] { client_ok = receive_password(ch->pipe_name(), ch->nonce_hex(), &got, &cerr_text); });
     std::thread server([&] { delivered = ch->deliver(secret, 15000, &derr); });
+    ThreadsJoin join_all{{&client, &server}};
     client.join();
     server.join();
     CHECK(delivered && client_ok);
@@ -212,10 +225,12 @@ TEST(account_password_channel_hands_the_password_over_once_to_a_client_with_the_
 
 TEST(account_password_channel_drops_a_wrong_nonce_and_still_serves_the_right_one) {
     auto ch = PasswordChannel::create();
+    ch->expect_client_pid(GetCurrentProcessId());
     SecretString secret(std::string("correct horse"));
     std::string derr;
     bool delivered = false;
     std::thread server([&] { delivered = ch->deliver(secret, 20000, &derr); });
+    ThreadsJoin join_server{{&server}};
     std::string wrong = ch->nonce_hex();
     wrong[0] = wrong[0] == 'a' ? 'b' : 'a';
     SecretString none;
@@ -778,12 +793,15 @@ TEST(d7d_elevated_step_accepts_only_service_names_of_the_requester) {
 
 TEST(d7d_state_and_log_of_an_administrator_account_are_not_user_writable) {
     // unknown account: judged as an administrator
-    CHECK(data_dir_kind_for_account("S-1-5-21-9-9-9-1001") == ServiceDirKind::ServiceTop);
+    // d8: the engine runs with a restricted, medium-integrity token of the account, so state/ and log/ are the account's to write
+    // for ANY account; only a missing / invalid SID gets the read-only kind.
+    CHECK(data_dir_kind_for_account("S-1-5-21-9-9-9-1001") == ServiceDirKind::UserFull);
     CHECK(data_dir_kind_for_account("") == ServiceDirKind::ServiceTop);
+    CHECK(data_dir_kind_for_account("not-a-sid") == ServiceDirKind::ServiceTop);
 #ifdef _WIN32
     std::string me = current_user_sid();
-    CHECK(data_dir_kind_for_account(me) == (account_is_administrator(me) ? ServiceDirKind::ServiceTop : ServiceDirKind::UserFull));
-    // and the ACL of that kind gives the account no write access
+    CHECK(data_dir_kind_for_account(me) == ServiceDirKind::UserFull);
+    // the configuration folder itself stays read-only for the account
     CHECK(service_dir_sddl(ServiceDirKind::ServiceTop, me).find("FA;;;" + me) == std::string::npos);
 #endif
 }
@@ -905,20 +923,6 @@ TEST(d7f_token_facts_decide_fail_closed) {
 #endif
 }
 
-TEST(d7f_install_set_password_and_start_decisions_need_a_clear_no) {
-    const AdminState No = AdminState::No, Yes = AdminState::Yes, Unk = AdminState::Unknown;
-    CHECK(service_account_refusal(No, No).empty());
-    CHECK(!service_account_refusal(Yes, No).empty());                        // the target's NEW token says administrator
-    CHECK(!service_account_refusal(No, Yes).empty());                        // this process says so
-    CHECK(!service_account_refusal(Unk, No).empty());                        // an API failed: refused
-    CHECK(!service_account_refusal(No, Unk).empty());
-    CHECK(admin_refusal_for(Yes) != admin_refusal_for(Unk));                 // different words, both with the way out
-    CHECK(admin_refusal_for(Unk).find("Start when I log in") != std::string::npos);
-    CHECK(admin_refusal_for(Yes).find("Start when I log in") != std::string::npos);
-    CHECK(service_start_refusal(No).empty());                                // a normal start
-    CHECK(service_start_refusal(Yes).find("does not start") != std::string::npos);   // joined Administrators after the install
-    CHECK(!service_start_refusal(Unk).empty());
-}
 
 TEST(d7f_simple_service_names_are_only_valid_with_user_service) {
     std::string good = user_service_name("PC\alice", "S-1-5-21-1-2-3-1001");
@@ -931,30 +935,130 @@ TEST(d7f_simple_service_names_are_only_valid_with_user_service) {
     CHECK(looks_like_user_service_name("mysync-alice-3f9a"));
 }
 
+
+TEST(d8_elevated_steps_carry_the_requester_sid_and_refuse_a_bad_one) {
+    std::string self;
 #ifdef _WIN32
-TEST(d7f_migrate_step_refuses_administrators_and_unknowns_before_creating_anything) {
-    ATmp t;
-    std::string name = user_service_name("PC\alice", current_user_sid());
-    std::string cfg = (t.p / "config.toml").u8string();
-    std::string h64(64, 'c');
-    std::vector<std::string> args = {"--user-config", cfg, "--expect-hash", h64, "--expect-key-hash", h64, "--name", name};
-    auto run = [&](AdminState st, std::string* err) {
-        std::ostringstream cap;
-        std::streambuf* old = std::cerr.rdbuf(cap.rdbuf());
-        int code = run_migrate_from_user(args, [st](const std::string&) { return st; });
-        std::cerr.rdbuf(old);
-        *err = cap.str();
-        return code;
-    };
-    std::string err;
-    CHECK_EQ(run(AdminState::Yes, &err), int(gui::kServiceAccessDenied));
-    CHECK(err.find("administrator") != std::string::npos);
-    CHECK(!fs::exists(fs::u8path(user_service_locations(name).dir)));         // nothing created
-    CHECK_EQ(run(AdminState::Unknown, &err), int(gui::kServiceAccessDenied));
-    CHECK(err.find("could not be verified") != std::string::npos);
-    CHECK(!fs::exists(fs::u8path(user_service_locations(name).dir)));
-    // an ordinary account gets past this gate (the next refusal here is the missing elevation, a different message)
-    run(AdminState::No, &err);
-    CHECK(err.find("could not be verified") == std::string::npos && err.find("is an administrator") == std::string::npos);
-}
+    wchar_t buf[1024];
+    DWORD n = GetModuleFileNameW(nullptr, buf, 1024);
+    self = fs::path(std::wstring(buf, n)).u8string();
+    std::string exe = (fs::u8path(self).parent_path() / "mysync.exe").u8string();
+#else
+    self = fs::read_symlink("/proc/self/exe").string();
+    std::string exe = (fs::u8path(self).parent_path() / "mysync").u8string();
 #endif
+    std::unique_ptr<gui::ServiceController> ctl;
+    try {
+        ctl = std::make_unique<gui::ServiceController>(exe);
+    } catch (const std::exception&) {
+        SKIP_TEST("no suitable mysync next to the tests");
+    }
+    ATmp t;
+    gui::ServiceRequest rq;
+    rq.name = "mysync-alice-3f9a";
+    rq.user_config = (t.p / "config.toml").u8string();
+    rq.expect_config_hash = std::string(64, 'c');
+    rq.requester_sid = "S-1-5-21-1-2-3-1001";
+    std::vector<std::string> a = ctl->build_args(gui::ServiceAction::ApplyConfig, rq);
+    auto it = std::find(a.begin(), a.end(), "--requester-sid");
+    CHECK(it != a.end() && it + 1 != a.end() && *(it + 1) == "S-1-5-21-1-2-3-1001");
+    rq.requester_sid = "S-1-5-21-1-2-3-1001; calc";
+    CHECK_THROWS(ctl->build_args(gui::ServiceAction::ApplyConfig, rq));
+    rq.requester_sid.clear();                                                 // none named: none passed (the step itself refuses on Windows)
+    a = ctl->build_args(gui::ServiceAction::ApplyConfig, rq);
+    CHECK(std::find(a.begin(), a.end(), "--requester-sid") == a.end());
+}
+
+// ---- d8 review ----
+
+TEST(d8_remote_filtering_is_required_for_powerful_accounts) {
+    TokenFacts ordinary;
+    ordinary.readable = true;
+    TokenFacts admin = ordinary;
+    admin.in_admins = true;
+    const std::string local = "S-1-5-21-1-2-3-1001", builtin = "S-1-5-21-1-2-3-500";
+    CHECK(remote_filtering_problem(local, ordinary, false, false).empty());             // an ordinary account: nothing to protect
+    CHECK(remote_filtering_problem(local, ordinary, true, true).empty());               // (not even on a domain / with the policy on)
+    CHECK(remote_filtering_problem(local, admin, false, false).empty());                // a local administrator: Windows filters its network logons
+    CHECK(remote_filtering_problem(builtin, admin, false, false).find("built-in Administrator") != std::string::npos);
+    CHECK(remote_filtering_problem(local, admin, true, false).find("domain account") != std::string::npos);
+    CHECK(remote_filtering_problem(local, admin, false, true).find("LocalAccountTokenFilterPolicy") != std::string::npos);
+    TokenFacts ops = ordinary;
+    ops.in_operator_group = true;                                                       // Backup Operators and the like count too
+    CHECK(!remote_filtering_problem(builtin, ops, false, false).empty());
+    TokenFacts priv = ordinary;
+    priv.powerful_privilege = true;
+    CHECK(!remote_filtering_problem(local, priv, true, false).empty());
+    TokenFacts unread;                                                                  // could not be read: refused (fail closed)
+    CHECK(remote_filtering_problem(local, unread, false, false).find("could not be verified") != std::string::npos);
+    TokenFacts unlinked = ordinary;
+    unlinked.linked_unreadable = true;
+    CHECK(!remote_filtering_problem(local, unlinked, false, false).empty());
+    // every refusal says the way out
+    CHECK(remote_filtering_problem(builtin, admin, false, false).find("ordinary Windows account") != std::string::npos);
+#ifndef _WIN32
+    CHECK(account_exposure_problem_for_current_user().empty());
+#endif
+}
+
+TEST(d8_the_logon_right_goes_away_only_with_the_last_service_that_uses_it) {
+    ATmp t;
+    const std::string sid = "S-1-5-21-1-2-3-1001", other = "S-1-5-21-1-2-3-1002";
+    std::string a = t.sub("mysync-a-1111"), b = t.sub("mysync-b-2222"), c = t.sub("mysync-c-3333"), gone = t.sub("mysync-gone-4444");
+    // which services exist, and for whom (the description of a real service carries "[owner <sid>]")
+    std::map<std::string, std::string> services = {{"mysync-a-1111", "MySync " + owner_label(sid)},
+                                                   {"mysync-b-2222", "MySync " + owner_label(sid)},
+                                                   {"mysync-c-3333", "MySync " + owner_label(other)}};
+    ServiceDescribe describe = [&](const std::string& n) { return services.count(n) ? services[n] : std::string(); };
+    std::ofstream(fs::u8path(a) / ".logon-right-added") << sid;                           // a added the right
+    // removing a: b (same account, installed without any marker of ours) still needs it -> it stays, b takes over
+    CHECK(!release_logon_right(a, sid, describe));
+    std::ifstream mb(fs::u8path(b) / ".logon-right-added");
+    std::string got;
+    CHECK(mb >> got && got == sid);
+    // a folder whose service is gone does not count; c belongs to somebody else: now the right may be revoked
+    services.erase("mysync-a-1111");
+    CHECK(release_logon_right(b, sid, describe));
+    // an account nobody else uses
+    CHECK(release_logon_right(c, other, describe));
+    (void)gone;
+}
+
+TEST(d8_operators_and_strong_privileges_are_not_stripped_by_remote_filtering) {
+    TokenFacts f;
+    f.readable = true;
+    const std::string local = "S-1-5-21-1-2-3-1001";
+    TokenFacts ops = f;
+    ops.in_operator_group = true;                                                         // NOT an administrator: nothing is filtered
+    std::string why = remote_filtering_problem(local, ops, false, false);
+    CHECK(why.find("operators group") != std::string::npos);
+    TokenFacts priv = f;
+    priv.powerful_privilege = true;
+    CHECK(remote_filtering_problem(local, priv, false, false).find("strong privilege") != std::string::npos);
+    TokenFacts admin = f;
+    admin.in_admins = true;
+    admin.in_operator_group = true;                                                       // a filtered local administrator is still fine
+    CHECK(remote_filtering_problem(local, admin, false, false).empty());
+    CHECK(remote_filtering_problem(local, admin, false, true).find("EnableLUA") != std::string::npos);   // UAC off / unreadable
+}
+
+TEST(d8_profile_of_the_requester_is_looked_up_by_sid) {
+    CHECK(profile_path_for_sid("").empty());
+    CHECK(profile_path_for_sid("not-a-sid").empty());
+    CHECK(profile_path_for_sid("S-1-5-21-9-9-9-4242").empty());                         // no such profile: nothing is assumed
+#ifdef _WIN32
+    std::string mine = profile_path_for_sid(current_user_sid());
+    CHECK(!mine.empty());
+    std::error_code ec;
+    CHECK(fs::exists(fs::u8path(mine), ec));
+    // the policy follows the REQUESTER: naming somebody without a profile leaves no home at all (nothing is assumed to be "home")
+    struct Reset { ~Reset() { set_requester_sid(""); } } reset;
+    PathPolicy own = default_path_policy();
+    CHECK(!own.own_home.empty());
+    set_requester_sid("S-1-5-21-9-9-9-4242");
+    PathPolicy other = default_path_policy();
+    CHECK(other.own_home.empty());
+    PathVerdict v = service_path_verdict((fs::u8path(mine) / "Documents").u8string(), other);
+    CHECK(!v.ok);                                                                       // the elevated account's home is not the requester's
+#endif
+}

@@ -230,8 +230,14 @@ void WINAPI svc_main(DWORD, LPWSTR*) {
     report(SERVICE_START_PENDING, NO_ERROR, 10000);
     report(SERVICE_RUNNING);
     DWORD win_code = NO_ERROR;
+    DWORD specific = 1;
     try {
         g_svc.body(g_svc.stop);
+    } catch (const ServiceSpecificError& e) {
+        log_error(std::string("service body refused to run: ") + e.what());
+        g_svc.exit_code = 1;
+        win_code = ERROR_SERVICE_SPECIFIC_ERROR;
+        specific = static_cast<DWORD>(e.code);
     } catch (const std::exception& e) {
         log_error(std::string("service body failed: ") + e.what());
         g_svc.exit_code = 1;
@@ -246,7 +252,7 @@ void WINAPI svc_main(DWORD, LPWSTR*) {
     s.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     s.dwCurrentState = SERVICE_STOPPED;
     s.dwWin32ExitCode = win_code;
-    s.dwServiceSpecificExitCode = win_code == NO_ERROR ? 0 : 1;
+    s.dwServiceSpecificExitCode = win_code == NO_ERROR ? 0 : specific;
     SetServiceStatus(g_svc.h, &s);
 }
 

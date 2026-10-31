@@ -139,7 +139,7 @@ std::string friendly_error(const std::string& what);
 
 // Hộp xác nhận TRƯỚC khi xin quyền quản trị để chuyển sang dịch vụ: thư mục nguồn, nơi lưu, danh tính khoá (vân tay
 // ngắn), tài khoản chạy, các cảnh báo của lõi và lời nhắc quyền cao. Chuỗi động giữ nguyên văn.
-std::string service_confirm_text(const simple::MigrationSummary& s, const std::string& account);
+std::string service_confirm_text(const simple::MigrationSummary& s, const std::string& account, bool windows);
 
 // ---- nhập mật khẩu để dịch vụ chạy bằng chính tài khoản người dùng (Windows). Mô hình KHÔNG BAO GIỜ giữ mật khẩu:
 // mật khẩu chỉ nằm trong hộp thoại và một SecretString đi thẳng tới bước cài đặt.

@@ -124,7 +124,13 @@ std::string SimpleHost::default_receive_folder() {
 #endif
 }
 
+namespace {
+std::string g_demo_ip;
+}
+void SimpleHost::set_demo_address(const std::string& ip) { g_demo_ip = ip; }
+
 std::vector<std::string> SimpleHost::local_addresses() {
+    if (!g_demo_ip.empty()) return {g_demo_ip};
     std::vector<std::string> raw;
 #ifdef _WIN32
     WSADATA wsa;

@@ -38,6 +38,7 @@ public:
 
     // Địa chỉ IP của máy (đã xếp: mạng nội bộ trước). Có thể chậm vài trăm ms: gọi ở luồng nền.
     static std::vector<std::string> local_addresses();
+    static void set_demo_address(const std::string& ip);   // chỉ để chụp ảnh tài liệu: thay danh sách địa chỉ thật
     static std::string default_receive_folder();   // Documents\MySync-Nhan hay ~/MySync-Nhan
 
 private:

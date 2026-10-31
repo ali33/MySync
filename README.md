@@ -5,20 +5,61 @@
 - Bản quyền (C) 2026 **META.vn** · Tác giả: **Nguyễn Đức Sơn**
 - Giấy phép: **GPL-2.0-or-later** (xem `LICENSE`). Thư viện vendor đều tương thích GPLv2: Monocypher (BSD-2/CC0), BLAKE3 (CC0), LZ4 (BSD-2).
 
-## Dùng nhanh cho người mới
-1. Dựng `mysync-gui` (xem mục "Giao diện đồ hoạ" bên dưới) và mở nó. Lần đầu bạn thấy màn **Bắt đầu nhanh**: chọn **Dùng ngay, không cần cài đặt** (không cần quyền quản trị).
-2. **Bước 1**: chọn (hoặc kéo-thả) thư mục cần giữ bản sao. **Bước 2**: chọn nơi lưu: thư mục khác, ổ USB, thư mục chia sẻ trong mạng (`\máy\chia-sẻ`), hoặc một máy tính khác có MySync (dán mã ghép). **Bước 3**: bấm **Bắt đầu đồng bộ**.
-3. MySync chạy dưới biểu tượng ở khay hệ thống (xanh lá = đã xong, xanh dương = đang chép, vàng/đỏ = cần chú ý). Đóng cửa sổ chỉ thu xuống khay; **Thoát hẳn** ở menu khay để dừng. Mặc định tự chạy khi bạn đăng nhập (tắt được).
-4. Gửi file sang máy khác: máy nhận bật **Cho phép máy khác gửi file vào đây** và sao chép **mã ghép** (dùng một lần, hết hạn sau khoảng 10 phút); máy gửi dán mã ở bước 2; hai bên so **chuỗi xác nhận** giống nhau rồi bấm **Đồng ý** ở máy nhận.
-5. Muốn chạy cả khi chưa đăng nhập máy: ở màn Trạng thái bấm **Chạy cả khi chưa đăng nhập máy (cài dịch vụ)**. Cần chỉnh sâu hơn: bấm **Chế độ nâng cao**.
+## Dùng nhanh cho người mới (giao diện đồ hoạ)
+Không cần biết lập trình hay sửa tệp cấu hình. Chi tiết hơn và ảnh từng màn: `docs/GUI.md`.
 
-Dùng cho máy chủ (không GUI, ghép bằng dòng lệnh, Ansible, xoay khoá, thu hồi, giám sát): xem `docs/SERVER-TO-SERVER.md`. Ghép bằng mã **mặc định tắt** khi chạy dạng dịch vụ.
+### 1. Lấy và mở chương trình
+MySync chưa có bản cài sẵn: bạn dựng từ mã nguồn một lần (cần CMake và trình biên dịch C++; xem mục "Build" bên dưới), sau đó mở tệp `mysync-gui`. Lần dựng đầu cần mạng và hơi lâu: nếu máy chưa có thư viện giao diện wxWidgets 3.2, CMake tự tải bản đã ghim về và dựng.
+- **Windows**: `cmake -S . -B build-gui -DMYSYNC_BUILD_GUI=ON` rồi `cmake --build build-gui --target mysync-gui`. Mở `mysync-gui.exe` trong thư mục `build-gui` (với Visual Studio là `build-gui\Release`) bằng cách bấm đúp.
+- **Linux**: cần thêm gói `libgtk-3-dev` (và `libwxgtk3.2-dev` nếu muốn dùng bản có sẵn trong hệ thống). Dựng bằng hai lệnh như trên, rồi chạy `build-gui/mysync-gui`.
+Không cần quyền quản trị để dùng chế độ thường.
+
+### 2. Lần đầu: Bắt đầu nhanh và 3 bước
+Lần đầu mở, màn **Chào mừng đến với MySync** hiện hai lựa chọn: **Dùng ngay, không cần cài đặt (khuyên dùng)** và **Tôi đã có dịch vụ / cấu hình nâng cao**. Chọn lựa chọn đầu.
+
+![Màn Bắt đầu nhanh](docs/images/gui-01-bat-dau-nhanh.png)
+
+- **Bước 1 — "Thư mục nào cần được giữ bản sao?"**: bấm **Chọn thư mục…** hoặc kéo một thư mục từ cửa sổ quản lý tệp thả vào cửa sổ. Bấm **Tiếp theo**.
+- **Bước 2 — "Bản sao sẽ được lưu ở đâu?"**: chọn **Một thư mục khác, ổ USB hoặc thư mục chia sẻ trong mạng**, hoặc **Một máy tính khác có cài MySync** (xem mục 4).
+- **Bước 3 — "Sẵn sàng"**: đọc dòng tóm tắt, bấm **Bắt đầu đồng bộ**. Từ bước 2 trở đi có nút **Quay lại** để sửa lựa chọn trước; bước 1 có **Huỷ**.
+
+Mặc định an toàn: bỏ qua tệp tạm và tệp hệ thống, tệp bị xoá hoặc ghi đè được cất vào thùng rác của nơi lưu, không giới hạn tốc độ, cập nhật ngay khi có thay đổi.
+
+### 3. Đồng bộ sang thư mục khác, ổ USB hoặc thư mục chia sẻ trong mạng
+Ở bước 2, chọn thư mục đích (ví dụ `E:\Sao-luu`). Thư mục chia sẻ trong mạng gõ dạng `\\tên-máy\tên-chia-sẻ` (hai dấu gạch chéo ngược ở đầu). Nếu hiện lỗi "Không tìm thấy nơi lưu này", hãy kiểm tra ổ USB đã cắm chưa hoặc đường dẫn mạng có đúng không.
+
+### 4. Ghép hai máy bằng mã
+1. **Máy nhận**: ở màn nhận file, bật công tắc **Cho phép máy khác gửi file vào đây**, rồi bấm **Sao chép** ở dòng **Mã ghép**. Mã bắt đầu bằng `MSY1-`, **chỉ dùng được một lần và hết hạn sau khoảng 10 phút**; hết hạn thì bấm **Tạo mã mới**.
+2. **Máy gửi**: ở bước 2 chọn **Một máy tính khác có cài MySync**, dán mã vào ô, bấm **Gửi yêu cầu ghép**.
+3. Hai máy cùng hiện một **chuỗi xác nhận**. Kiểm tra giống hệt nhau, rồi ở máy nhận bấm **Đồng ý** (không giống hoặc không biết máy nào thì bấm **Từ chối**).
+4. Nếu máy gửi không nối được, tường lửa của máy nhận có thể đang chặn: khi Windows hỏi có cho MySync truy cập mạng không, chọn **Cho phép**.
+
+![Máy nhận file](docs/images/gui-06-cho-phep-may-khac.png)
+
+### 5. Đọc màn Trạng thái
+Câu lớn ở giữa cho biết tình hình: "Đang đồng bộ … tệp…", "Mọi thứ đã được đồng bộ", hoặc "Có lỗi: …" (nguyên văn nguyên nhân).
+
+![Màn Trạng thái](docs/images/gui-05-trang-thai.png)
+
+Màu biểu tượng ở khay hệ thống: xám = chưa nối được với bộ đồng bộ; xanh lá = rảnh, mọi thứ đã xong; xanh dương = đang chép; vàng = cần chú ý; đỏ = có lỗi gần đây. Băng **đỏ** là lỗi làm việc không chạy được (đọc nguyên văn, sửa theo đó, thường là đường dẫn hoặc quyền); băng **hổ phách** là cảnh báo không chặn (ví dụ chưa nối được tới nơi lưu, MySync tự thử lại). Nút **Thêm thư mục** để đồng bộ thêm một thư mục. Đóng cửa sổ chỉ thu xuống khay; **Thoát hẳn** ở menu khay mới dừng đồng bộ.
+
+### 6. Tự chạy khi đăng nhập, và chạy cả khi chưa đăng nhập
+- **Tự chạy khi tôi đăng nhập** (công tắc ở màn Trạng thái, bật mặc định): MySync tự mở khi bạn đăng nhập máy. Không cần quyền quản trị.
+- **Chạy cả khi chưa đăng nhập máy (cài dịch vụ)**: để MySync chạy nền kể cả sau khi khởi động lại mà chưa ai đăng nhập. Cần một người quản trị cấp phép cài (hộp xin phép của Windows hoặc `pkexec` trên Linux) nhưng dịch vụ chạy bằng **tài khoản của bạn** chứ không bằng tài khoản người quản trị cấp phép: nếu bạn dùng tài khoản thường, quản trị viên chỉ cấp phép cài. Trên Windows phần đồng bộ của dịch vụ chạy với quyền hạn chế (đã bỏ các nhóm quản trị và quyền nguy hiểm khỏi quyền truy cập máy này). Lưu ý: quyền hạn chế này không cô lập danh tính khi truy cập qua mạng (ví dụ thư mục chia sẻ), nên MySync từ chối cài dịch vụ cho tài khoản mà Windows không lọc quyền khi truy cập qua mạng hoặc có nhóm/quyền mạnh (tài khoản Administrator gốc, tài khoản miền thuộc nhóm quản trị, tài khoản thuộc các nhóm toán tử, máy đã tắt UAC hoặc đặt `LocalAccountTokenFilterPolicy`); MySync báo rõ lý do và gợi ý dùng "Tự chạy khi tôi đăng nhập". Trên Windows MySync hỏi **mật khẩu tài khoản** của bạn một lần (với tài khoản Microsoft đó là mật khẩu tài khoản Microsoft, **không phải mã PIN Windows Hello**). Khi bạn đổi mật khẩu Windows, dịch vụ không đăng nhập được nữa và màn Trạng thái hiện băng nhắc kèm nút **Cập nhật mật khẩu**. Tài khoản không có mật khẩu thì Windows không cho chạy dịch vụ: hãy dùng "Tự chạy khi tôi đăng nhập". Muốn quay lại: **Quay lại chạy dưới tài khoản của tôi**.
+
+### 7. Chế độ nâng cao
+Nút **Chế độ nâng cao** hiện bốn tab (Trạng thái, Cấu hình, Dịch vụ, Ghép máy và Khoá) cho người đã quen: xem `docs/GUI.md`.
+
+### 8. Hỏi nhanh
+- **Tệp bị xoá/ghi đè nằm đâu?** Không mất ngay: bản cũ được cất vào thư mục `__sync/__trash` ngay trong nơi lưu, chia theo giờ xoá.
+- **Máy kia tắt thì sao?** MySync báo "Chưa nối được tới nơi lưu…" và tự thử lại; khi máy kia bật lại, phần bị lỡ được đồng bộ bù.
+- **Gỡ một máy đã ghép?** Dùng chế độ nâng cao, tab Ghép máy và Khoá (danh sách máy được phép), hoặc dòng lệnh `mysync peer revoke <tên>` (xem `docs/SERVER-TO-SERVER.md`); phiên đang mở của máy đó bị ngắt ngay.
 
 ## Điểm chính
 - **Watch realtime**: ReadDirectoryChangesW (Windows) / inotify (Linux), gộp sự kiện theo từng tệp (mặc định 300 ms), chờ tệp hết bị khoá, tràn hàng đợi thì quét lại, quét toàn bộ định kỳ để dự phòng.
 - **Nhanh**: so size+mtime trước, chỉ băm BLAKE3 khi khác; chỉ mục hash lưu ra đĩa; tệp trùng nội dung không truyền; delta theo khối kiểu rsync cho tệp lớn sửa một phần; nén LZ4 (bỏ qua đuôi đã nén); nhiều kết nối song song, gửi OFFER theo lô không chờ từng tệp.
 - **Bảo mật**: kênh Noise_IK (X25519 + XChaCha20-Poly1305 + BLAKE2b) với khoá công khai ghim sẵn hai chiều, allowlist client + quyền ro/rw + thư mục con, chặn path traversal, ghi tệp tạm → kiểm BLAKE3 → rename nguyên tử, xoá thì chuyển vào `__sync/__trash`, không log khoá. Chi tiết và giới hạn: `docs/DESIGN.md`.
-- **Đích**: máy chủ MySync qua mạng, hoặc **copy trực tiếp** sang ổ/thư mục khác, UNC `\server\share`, điểm mount CIFS/NFS.
+- **Đích**: máy chủ MySync qua mạng, hoặc **copy trực tiếp** sang ổ/thư mục khác, UNC `\\server\share`, điểm mount CIFS/NFS.
 - **Chạy**: độc lập (foreground) hoặc dịch vụ (Windows Service / systemd). Một binary `mysync`.
 
 ## Build (một lệnh)

@@ -3,8 +3,10 @@
 // Author: Nguyễn Đức Sơn
 
 #include "mysync/simple/service_account.h"
+#include "mysync/simple/restricted.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cwchar>
 #include <chrono>
@@ -68,13 +70,6 @@ std::string user_service_name(const std::string& account, const std::string& own
     return user_service_name(account) + "-" + to_hex(h.data(), 2);
 }
 
-std::string admin_account_refusal(bool is_admin) {
-    if (!is_admin) return {};
-    return "This account is an administrator, so the service would run with full administrator rights on folders that other software "
-           "of yours can change; that is not safe. Use \"Start when I log in\" (no elevated rights needed), or create a separate "
-           "ordinary Windows account to run the service.";
-}
-
 unsigned long min_login_uid() {
 #ifdef _WIN32
     return 0;
@@ -101,22 +96,49 @@ AdminState admin_state_from_facts(const TokenFacts& f) {
 
 bool account_is_administrator(const std::string& sid) { return account_admin_state(sid) != AdminState::No; }
 
-std::string admin_refusal_for(AdminState s) {
-    if (s == AdminState::No) return {};
-    if (s == AdminState::Yes) return admin_account_refusal(true);
-    return "It could not be verified that this account is an ordinary one (the account's rights could not be read), so the service "
-           "is not set up. Use \"Start when I log in\" (no elevated rights needed), or create a separate ordinary Windows account "
-           "to run the service.";
+std::string remote_filtering_problem(const std::string& sid, const TokenFacts& f, bool domain_account, bool filter_policy_open) {
+    const std::string way =
+        " Use an ordinary Windows account to run the service, or turn on \"Start by itself when I sign in\" (no elevated rights needed).";
+    if (!f.readable || f.linked_unreadable)
+        return "It could not be verified that Windows restricts the network logons of this account (its rights could not be read), so the "
+               "service is not set up." + way;
+    if (!f.in_admins && !f.in_operator_group && !f.powerful_privilege && !f.linked_elevated) return {};   // an ordinary account
+    if (!f.in_admins && (f.in_operator_group || f.powerful_privilege))
+        return "This account is in an operators group or holds a strong privilege (for example Backup), and Windows does not remove those "
+               "from its network sign-ins, which the synchronisation engine can repeat (it shares the logon session)." + way;
+    const std::string why =
+        "This account is an administrator (or in an operators group) and the synchronisation engine shares its logon session: a "
+        "connection it makes over the network (for example to \\\\localhost\\C$) would use the account's full credentials. Windows "
+        "prevents that only through remote UAC filtering, which does not apply to ";
+    if (sid.size() >= 4 && sid.compare(sid.size() - 4, 4, "-500") == 0) return why + "the built-in Administrator account." + way;
+    if (domain_account) return why + "a domain account." + way;
+    if (filter_policy_open)
+        return why + "this computer, where remote filtering is turned off (LocalAccountTokenFilterPolicy is on, or UAC / EnableLUA is off or cannot be read)." + way;
+    return {};
 }
 
-std::string service_account_refusal(AdminState token_state, AdminState process_state) {
-    std::string a = admin_refusal_for(token_state);
-    return a.empty() ? admin_refusal_for(process_state) : a;
+bool release_logon_right(const std::string& service_dir, const std::string& sid, const ServiceDescribe& describe) {
+    std::error_code ec;
+    fs::path mine = fs::u8path(service_dir);
+    const std::string label = owner_label(sid);
+    // Every sibling folder is a MySync service folder named like its service. A service that still EXISTS (it has a description)
+    // and carries this account's label needs the right too - installed before or after the markers were invented, no file
+    // of ours needed.
+    for (fs::directory_iterator it(mine.parent_path(), ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_directory(ec) || it->path() == mine) continue;
+        std::string d = describe(it->path().filename().u8string());
+        if (d.empty() || d.find(label) == std::string::npos) continue;
+        std::ofstream m(it->path() / ".logon-right-added", std::ios::binary | std::ios::trunc);   // it becomes the one that takes it away
+        m << sid;
+        return false;
+    }
+    return true;
 }
 
-std::string service_start_refusal(AdminState now) {
-    std::string r = admin_refusal_for(now);
-    return r.empty() ? r : "the service does not start: " + r;
+std::string requester_identity_problem(const std::string& requester_sid, const std::string& logon_sid) {
+    if (!valid_user_sid(requester_sid)) return "the identity of the user who asked is missing or not valid";
+    if (logon_sid != requester_sid) return "the password does not belong to the user who asked";
+    return {};
 }
 
 bool looks_like_user_service_name(const std::string& name) {
@@ -204,11 +226,58 @@ std::string process_user_sid(HANDLE process) {
     return process_user_sid_of_token(tok);
 }
 
-std::string pid_user_sid(DWORD pid) {
+// The elevated step may run as ANOTHER account than the application it must identify, whose process token an ordinary access
+// check would not let it open. An administrator's token carries SeDebugPrivilege (disabled); turning it on is only used to READ
+// the user of a process, and the scope turns it OFF again (only if this scope turned it on). Best effort: if the privilege is
+// absent, the lookup simply fails and says why.
+struct DebugPrivilegeScope {
+    HANDLE tok = nullptr;
+    LUID luid{};
+    bool changed = false;
+    DebugPrivilegeScope() {
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return;
+        TOKEN_PRIVILEGES tp{}, prev{};
+        tp.PrivilegeCount = 1;
+        if (!LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &luid)) return;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        DWORD prev_len = 0;
+        if (AdjustTokenPrivileges(tok, FALSE, &tp, sizeof prev, &prev, &prev_len) && GetLastError() == ERROR_SUCCESS)
+            changed = prev.PrivilegeCount > 0 && !(prev.Privileges[0].Attributes & SE_PRIVILEGE_ENABLED);   // it was off: we turned it on
+    }
+    ~DebugPrivilegeScope() {
+        if (tok && changed) {
+            TOKEN_PRIVILEGES off{};
+            off.PrivilegeCount = 1;
+            off.Privileges[0].Luid = luid;
+            off.Privileges[0].Attributes = 0;
+            AdjustTokenPrivileges(tok, FALSE, &off, 0, nullptr, nullptr);
+        }
+        if (tok) CloseHandle(tok);
+    }
+};
+
+std::string pid_user_sid(DWORD pid, DWORD* error = nullptr) {
+    if (error) *error = 0;
+    std::unique_ptr<DebugPrivilegeScope> debug;   // created on first need, undone when this function returns
     HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!p) return {};
+    if (!p && GetLastError() == ERROR_ACCESS_DENIED) {
+        debug.reset(new DebugPrivilegeScope());
+        p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    }
+    if (!p) {
+        if (error) *error = GetLastError();
+        return {};
+    }
     Handle hp(p);
-    return process_user_sid(p);
+    std::string s = process_user_sid(p);
+    if (s.empty()) {
+        if (error) *error = GetLastError();
+        if (!debug) debug.reset(new DebugPrivilegeScope());
+        s = process_user_sid(p);
+        if (!s.empty() && error) *error = 0;
+    }
+    return s;
 }
 
 // Overlapped I/O with a hard deadline.
@@ -262,6 +331,7 @@ struct PasswordChannel::Impl {
     Bytes nonce;
     HANDLE pipe = INVALID_HANDLE_VALUE;
     bool used = false;
+    std::atomic<unsigned long> expect_pid{0};
     HANDLE cancel_ev = nullptr;
     ~Impl() {
         if (pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
@@ -282,7 +352,7 @@ std::unique_ptr<PasswordChannel> PasswordChannel::create() {
     c->p_->nonce.resize(16);
     random_bytes(c->p_->nonce.data(), c->p_->nonce.size());
     c->p_->nonce_hex = to_hex(c->p_->nonce.data(), c->p_->nonce.size());
-    std::wstring sddl = L"D:P(A;;GA;;;" + widen(current_user_sid()) + L")";   // the elevated step runs as this same user
+    std::wstring sddl = L"D:P(A;;GA;;;" + widen(current_user_sid()) + L")(A;;GA;;;SY)(A;;GA;;;BA)";   // this user (the requester); an administrator who approved the UAC prompt may be another account, recognised by PID + nonce
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof sa;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr))
@@ -299,6 +369,8 @@ std::unique_ptr<PasswordChannel> PasswordChannel::create() {
     return c;
 }
 
+void PasswordChannel::expect_client_pid(unsigned long pid) { p_->expect_pid = pid; }
+
 void PasswordChannel::cancel() {
     if (p_->cancel_ev) SetEvent(p_->cancel_ev);
 }
@@ -311,7 +383,6 @@ bool PasswordChannel::deliver(const SecretString& password, int timeout_ms, std:
     Impl& im = *p_;
     if (im.used || im.pipe == INVALID_HANDLE_VALUE) return fail("the private channel was already used");
     if (password.empty() || password.size() > 1000) return fail("the password has an unusable length");
-    const std::string me = current_user_sid();
     auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     for (int attempt = 0; attempt < 4; ++attempt) {
         OVERLAPPED ov{};
@@ -335,7 +406,9 @@ bool PasswordChannel::deliver(const SecretString& password, int timeout_ms, std:
         }
         // who is on the other end? It must be a process of this very user.
         ULONG pid = 0;
-        bool user_ok = GetNamedPipeClientProcessId(im.pipe, &pid) && pid_user_sid(pid) == me;
+        bool user_ok = GetNamedPipeClientProcessId(im.pipe, &pid) != 0;
+        for (int w = 0; user_ok && im.expect_pid.load() == 0 && w < 50; ++w) std::this_thread::sleep_for(std::chrono::milliseconds(100));   // the caller learns the PID right after starting the process
+        user_ok = user_ok && im.expect_pid.load() != 0 && pid == im.expect_pid.load();
         uint8_t got[16] = {};
         int left = int(std::chrono::duration_cast<std::chrono::milliseconds>(end - std::chrono::steady_clock::now()).count());
         bool nonce_ok = false;
@@ -364,7 +437,8 @@ bool PasswordChannel::deliver(const SecretString& password, int timeout_ms, std:
     return fail("too many wrong attempts on the private channel");
 }
 
-bool receive_password(const std::string& pipe_name, const std::string& nonce_hex, SecretString* out, std::string* error) {
+bool receive_password(const std::string& pipe_name, const std::string& nonce_hex, SecretString* out, std::string* error,
+                      const std::string& requester_sid) {
     auto fail = [&](const std::string& m) {
         if (error) *error = m;
         return false;
@@ -392,7 +466,15 @@ bool receive_password(const std::string& pipe_name, const std::string& nonce_hex
     }
     Handle hh(h);
     ULONG spid = 0;
-    if (!GetNamedPipeServerProcessId(h, &spid) || pid_user_sid(spid) != current_user_sid())
+    if (!requester_sid.empty() && !valid_user_sid(requester_sid)) return fail("the requester identity is not valid");
+    const std::string want_sid = requester_sid.empty() ? current_user_sid() : requester_sid;
+    DWORD sid_err = 0;
+    if (!GetNamedPipeServerProcessId(h, &spid)) return fail("cannot tell which program is on the other end of the private channel: refusing to send anything");
+    std::string server_sid = pid_user_sid(spid, &sid_err);
+    if (server_sid.empty())
+        return fail("cannot read the account of the program on the other end of the private channel (error " + std::to_string(sid_err) +
+                    "): refusing to send anything");
+    if (server_sid != want_sid)
         return fail("the other end of the private channel is not the application of this user: refusing to send anything");
     if (!write_all(h, nonce.data(), 16, 10000)) return fail("the private channel closed");
     uint8_t len[2];
@@ -410,6 +492,8 @@ bool receive_password(const std::string& pipe_name, const std::string& nonce_hex
 }
 
 AdminState admin_state_of_token(HANDLE tok);
+
+std::string exposure_problem_of_token(HANDLE tok, const std::string& sid, bool measured_network_token);
 
 AccountCheck check_service_account(const std::string& account, const SecretString& password) {
     AccountCheck r;
@@ -471,6 +555,7 @@ AccountCheck check_service_account(const std::string& account, const SecretStrin
         r.error = "The account was accepted but its identity could not be determined.";
         return r;
     }
+    r.exposure_problem = exposure_problem_of_token(tok, r.sid, /*measured_network_token=*/true);
     r.ok = true;
     return r;
 }
@@ -505,47 +590,25 @@ std::string account_sid(const std::string& account) {
 
 std::string primary_group_of_user(const std::string&) { return {}; }
 
-std::string current_owner_id() { return current_user_sid(); }
+std::string current_owner_id() { return effective_user_sid(); }
 
 // What the token tells about the account's power. EVERYTHING that cannot be read counts against the account (fail closed).
 TokenFacts read_token_facts(HANDLE tok) {
     TokenFacts f;
-    DWORD n = 0;
-    GetTokenInformation(tok, TokenGroups, nullptr, 0, &n);
-    std::vector<unsigned char> gb(n ? n : 1);
-    if (!n || !GetTokenInformation(tok, TokenGroups, gb.data(), n, &n)) return f;
-    auto* g = reinterpret_cast<TOKEN_GROUPS*>(gb.data());
-    // Groups that give administrator-like power over the machine; present in ANY state (enabled, disabled, deny-only: a
-    // UAC-filtered or a network-logon token still carries them, and a later elevation would use them).
-    struct Rid { DWORD rid; bool admins; };
-    static const Rid rids[] = {{DOMAIN_ALIAS_RID_ADMINS, true},      {DOMAIN_ALIAS_RID_BACKUP_OPS, false},
-                               {DOMAIN_ALIAS_RID_SYSTEM_OPS, false}, {DOMAIN_ALIAS_RID_ACCOUNT_OPS, false},
-                               {DOMAIN_ALIAS_RID_PRINT_OPS, false},  {DOMAIN_ALIAS_RID_NETWORK_CONFIGURATION_OPS, false}};
-    SID_IDENTIFIER_AUTHORITY nt = SECURITY_NT_AUTHORITY;
-    for (const Rid& r : rids) {
-        PSID want = nullptr;
-        if (!AllocateAndInitializeSid(&nt, 2, SECURITY_BUILTIN_DOMAIN_RID, r.rid, 0, 0, 0, 0, 0, 0, &want)) return TokenFacts{};
-        for (DWORD i = 0; i < g->GroupCount; ++i)
-            if (EqualSid(g->Groups[i].Sid, want)) (r.admins ? f.in_admins : f.in_operator_group) = true;
-        FreeSid(want);
+    // ONE list of dangerous groups and strong privileges (restricted.cpp) serves the restricted token, this and the network
+    // measurement. The groups count in ANY state (enabled, disabled, deny-only: a filtered token still carries them).
+    TokenReport rep = read_token_report(tok);
+    if (!rep.readable) return f;
+    for (const auto& g : rep.groups) {
+        if (g.sid == "S-1-5-32-544" || (g.sid.rfind("S-1-5-21-", 0) == 0 && g.sid.size() > 4 &&
+                                         (g.sid.compare(g.sid.size() - 4, 4, "-512") == 0 || g.sid.compare(g.sid.size() - 4, 4, "-519") == 0 ||
+                                          g.sid.compare(g.sid.size() - 4, 4, "-518") == 0)))
+            f.in_admins = true;
+        else if (is_dangerous_group_sid(g.sid))
+            f.in_operator_group = true;
     }
-    // Privileges that are a way to administrator power by themselves (listed even when currently disabled). SeImpersonate and
-    // the like are left out on purpose: standard service accounts have them and an ordinary user does not need them.
-    n = 0;
-    GetTokenInformation(tok, TokenPrivileges, nullptr, 0, &n);
-    std::vector<unsigned char> pb(n ? n : 1);
-    if (!n || !GetTokenInformation(tok, TokenPrivileges, pb.data(), n, &n)) return TokenFacts{};
-    auto* p = reinterpret_cast<TOKEN_PRIVILEGES*>(pb.data());
-    static const wchar_t* const strong[] = {L"SeDebugPrivilege",     L"SeTcbPrivilege",         L"SeLoadDriverPrivilege",
-                                            L"SeBackupPrivilege",    L"SeRestorePrivilege",     L"SeTakeOwnershipPrivilege",
-                                            L"SeCreateTokenPrivilege", L"SeSecurityPrivilege"};
-    for (DWORD i = 0; i < p->PrivilegeCount; ++i) {
-        wchar_t name[128];
-        DWORD len = 128;
-        if (!LookupPrivilegeNameW(nullptr, &p->Privileges[i].Luid, name, &len)) return TokenFacts{};
-        for (const wchar_t* s : strong)
-            if (std::wcscmp(name, s) == 0) f.powerful_privilege = true;
-    }
+    for (const auto& p : rep.privileges)
+        if (is_strong_privilege(p)) f.powerful_privilege = true;
     // The other half of a split (UAC) token: if it is elevated, or we cannot tell, the account is an administrator.
     TOKEN_LINKED_TOKEN lt{};
     DWORD got = 0;
@@ -572,6 +635,65 @@ AdminState account_admin_state(const std::string& sid) {
     return admin_state_of_token(tok);
 }
 
+// Domain account? (the account's domain is not this computer's name). A lookup that fails counts as a domain account.
+bool account_is_domain_account(const std::string& sid) {
+    PSID psid = nullptr;
+    if (!ConvertStringSidToSidW(widen(sid).c_str(), &psid)) return true;
+    struct Free { PSID p; ~Free() { LocalFree(p); } } fr{psid};
+    DWORD nn = 0, dn = 0;
+    SID_NAME_USE use;
+    LookupAccountSidW(nullptr, psid, nullptr, &nn, nullptr, &dn, &use);
+    if (!nn || !dn) return true;
+    std::wstring name(nn, L' '), dom(dn, L' ');
+    if (!LookupAccountSidW(nullptr, psid, &name[0], &nn, &dom[0], &dn, &use)) return true;
+    dom.resize(wcslen(dom.c_str()));
+    wchar_t comp[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD cn = MAX_COMPUTERNAME_LENGTH + 1;
+    if (!GetComputerNameW(comp, &cn)) return true;
+    return _wcsicmp(dom.c_str(), comp) != 0;
+}
+
+// One DWORD of HKLM\...\Policies\System. found=false when the value (or key) does not exist; false return = any other read error.
+bool read_system_policy_dword(const wchar_t* name, DWORD* value, bool* found) {
+    DWORD sz = sizeof *value;
+    LONG rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", name, RRF_RT_REG_DWORD,
+                           nullptr, value, &sz);
+    *found = rc == ERROR_SUCCESS;
+    return rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND;
+}
+
+// Does Windows NOT filter the network sign-ins of local administrators on this computer? Remote filtering exists only while UAC
+// is on (EnableLUA = 1) and LocalAccountTokenFilterPolicy is not 1. A missing EnableLUA, or any read error, counts as "not
+// filtered" (fail closed).
+bool local_account_filter_policy_open() {
+    DWORD lua = 0, policy = 0;
+    bool lua_found = false, policy_found = false;
+    if (!read_system_policy_dword(L"EnableLUA", &lua, &lua_found)) return true;
+    if (!lua_found || lua != 1) return true;
+    if (!read_system_policy_dword(L"LocalAccountTokenFilterPolicy", &policy, &policy_found)) return true;
+    return policy_found && policy != 0;
+}
+
+std::string exposure_problem_of_token(HANDLE tok, const std::string& sid, bool measured_network_token) {
+    if (measured_network_token) {
+        // the token of a real NETWORK sign-in of this account: whatever it still carries, the engine can get back over loopback
+        std::string m = network_token_problem(read_token_report(tok));
+        if (!m.empty()) return m;
+    }
+    TokenFacts f = read_token_facts(tok);
+    // only an account that is (or may be) powerful needs the other two lookups
+    bool powerful = !f.readable || f.linked_unreadable || f.in_admins || f.in_operator_group || f.powerful_privilege || f.linked_elevated;
+    return remote_filtering_problem(sid, f, powerful && account_is_domain_account(sid), powerful && local_account_filter_policy_open());
+}
+
+std::string account_exposure_problem_for_current_user() {
+    HANDLE tok = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok))
+        return remote_filtering_problem(current_user_sid(), TokenFacts{}, true, true);
+    Handle ht(tok);
+    return exposure_problem_of_token(tok, current_user_sid(), /*measured_network_token=*/false);
+}
+
 std::string account_name_from_sid(const std::string& sid) {
     PSID psid = nullptr;
     if (!ConvertStringSidToSidW(widen(sid).c_str(), &psid)) return {};
@@ -580,7 +702,7 @@ std::string account_name_from_sid(const std::string& sid) {
     SID_NAME_USE use;
     LookupAccountSidW(nullptr, psid, nullptr, &nn, nullptr, &dn, &use);
     if (!nn) return {};
-    std::wstring name(nn, L'\0'), dom(dn ? dn : 1, L'\0');
+    std::wstring name(nn, L' '), dom(dn ? dn : 1, L' ');
     if (!LookupAccountSidW(nullptr, psid, &name[0], &nn, &dom[0], &dn, &use)) return {};
     name.resize(wcslen(name.c_str()));
     dom.resize(wcslen(dom.c_str()));
@@ -594,7 +716,7 @@ std::string revoke_service_logon_right(const std::string& sid) {
     LSA_OBJECT_ATTRIBUTES oa{};
     LSA_HANDLE pol = nullptr;
     NTSTATUS st = LsaOpenPolicy(nullptr, &oa, POLICY_LOOKUP_NAMES | POLICY_CREATE_ACCOUNT, &pol);
-    if (st != 0) return "cannot open the local security policy";
+    if (st != 0) return "cannot open the local security policy (error " + std::to_string(LsaNtStatusToWinError(st)) + ")";
     struct Close { LSA_HANDLE h; ~Close() { LsaClose(h); } } cl{pol};
     static wchar_t right[] = L"SeServiceLogonRight";
     LSA_UNICODE_STRING us;
@@ -657,7 +779,7 @@ bool PasswordChannel::deliver(const SecretString&, int, std::string* error) {
     if (error) *error = "not supported on this system";
     return false;
 }
-bool receive_password(const std::string&, const std::string&, SecretString*, std::string* error) {
+bool receive_password(const std::string&, const std::string&, SecretString*, std::string* error, const std::string&) {
     if (error) *error = "not supported on this system";
     return false;
 }
@@ -673,8 +795,10 @@ std::string grant_service_logon_right(const std::string&, bool* added) {
 }
 std::string revoke_service_logon_right(const std::string&) { return {}; }
 void PasswordChannel::cancel() {}
+void PasswordChannel::expect_client_pid(unsigned long) {}
 std::string current_owner_id() { return std::to_string(static_cast<unsigned long>(::geteuid())); }
 AdminState account_admin_state(const std::string&) { return AdminState::No; }
+std::string account_exposure_problem_for_current_user() { return {}; }
 std::string current_account_name() {
     struct passwd pw{}, *res = nullptr;
     char buf[4096];

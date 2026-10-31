@@ -32,6 +32,16 @@ inline void sp_font(wxWindow* w, double scale, bool bold = true) {
     w->SetFont(f);
 }
 
+// Móc kiểm thử / chụp ảnh tài liệu (đặt từ dòng lệnh).
+struct SimpleTestHooks {
+    int auto_stop = -1;         // --wizard-stop: dừng trình hướng dẫn tự lái ở bước này (0..2)
+    bool redact_account = false;   // --redact-account: ảnh tài liệu thay tên người dùng/tên máy thật bằng tên mẫu
+    std::string dialog_shot;    // --dialog-shot: hộp xác nhận cài dịch vụ tự chụp ra PNG rồi tự đóng (KHÔNG cài gì)
+};
+SimpleTestHooks& simple_test_hooks();
+// Vẽ lại CHÍNH cửa sổ này ra PNG (không chụp màn hình nên cửa sổ khác đè lên không lọt vào ảnh). Trả "" nếu được.
+std::string save_window_png(wxWindow* w, const std::string& png);
+
 class WrapText : public wxStaticText {
 public:
     WrapText(wxWindow* parent, const wxString& text = "");
@@ -124,7 +134,7 @@ public:
     ~ReceiveBox() override;
     void RestoreAtStartup();   // đã bật lần trước thì chạy lại engine nhận (chưa mở cửa sổ ghép)
     bool IsOn() const { return on_; }
-    void AutoEnable(const std::string& folder);   // kiểm thử: bật nhận với thư mục này, không hỏi
+    void AutoEnable(const std::string& folder, bool with_code = true);   // kiểm thử: bật nhận với thư mục này, không hỏi
 
 private:
     void OnToggle(bool want);
@@ -179,7 +189,8 @@ public:
     void SetAdvancedShown(bool s);
     void RestoreReceiver() { if (recv_) recv_->RestoreAtStartup(); }
     void SetQuitting(bool on);
-    void AutoReceive(const std::string& folder) { if (recv_) recv_->AutoEnable(folder); }
+    void AutoServiceDialog() { ToServiceClick(); }   // kiểm thử: mở hộp xác nhận cài dịch vụ
+    void AutoReceive(const std::string& folder, bool with_code) { if (recv_) recv_->AutoEnable(folder, with_code); }
     void OnShown() { UpdateAutostart(); }   // đọc lại ô "Tự chạy khi tôi đăng nhập" từ hệ thống
 
 private:
@@ -216,6 +227,7 @@ private:
     bool busy_op_ = false;
     std::function<void()> add_folder_;
     PasswordFlow pwd_;
+    std::vector<std::string> pending_roots_;   // thư mục ngoài hồ sơ mà người dùng đã đồng ý cho dịch vụ
     wxPanel* pwd_panel_ = nullptr;
     WrapText* pwd_text_ = nullptr;
     bool pwd_querying_ = false;

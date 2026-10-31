@@ -55,7 +55,20 @@ public:
         SetTopWindow(f);
         // Tham số kiểm thử: lái trình hướng dẫn thật bằng sự kiện giao diện, chụp cửa sổ, thoát.
         if (!auto_src_.empty()) f->SimpleAutoDrive(auto_src_, auto_dst_);
-        if (!auto_recv_.empty()) f->CallAfter([f, this] { f->SimpleAutoReceive(auto_recv_); });
+        if (!demo_ip_.empty()) SimpleHost::set_demo_address(demo_ip_);
+        simple_test_hooks().auto_stop = wizard_stop_;
+        simple_test_hooks().dialog_shot = dialog_shot_;
+        simple_test_hooks().redact_account = redact_;
+        if (show_adv_) f->CallAfter([f] { f->SimpleShowAdvanced(true); });
+        if (auto_svc_dialog_) f->CallAfter([f, this] {
+            wxTimer* t = new wxTimer;
+            t->Bind(wxEVT_TIMER, [f, t](wxTimerEvent&) {
+                f->SimpleAutoServiceDialog();
+                t->Stop();
+            });
+            t->StartOnce(3000);
+        });
+        if (!auto_recv_.empty()) f->CallAfter([f, this] { f->SimpleAutoReceive(auto_recv_, !no_code_); });
         if (!shot_.empty()) {
             std::string png = shot_;
             bool ex = shot_exit_;
@@ -86,6 +99,13 @@ public:
         p.AddOption("", "shot-delay", "milliseconds before --screenshot (default 2500)", wxCMD_LINE_VAL_NUMBER);
         p.AddSwitch("", "shot-exit", "exit after the screenshot");
         p.AddOption("", "auto-src", "test: run the wizard with this source folder", wxCMD_LINE_VAL_STRING);
+        p.AddOption("", "wizard-stop", "test: stop the self-driven wizard at step 0..2", wxCMD_LINE_VAL_NUMBER);
+        p.AddOption("", "demo-ip", "documentation screenshots: show this address instead of the real ones", wxCMD_LINE_VAL_STRING);
+        p.AddSwitch("", "show-advanced", "test: show the advanced tabs under the Simple screen");
+        p.AddSwitch("", "auto-svc-dialog", "test: open the service-install confirmation (cancelled after the screenshot)");
+        p.AddSwitch("", "redact-account", "documentation screenshots: show a sample account name instead of the real one");
+        p.AddOption("", "dialog-shot", "test: PNG of that confirmation dialog", wxCMD_LINE_VAL_STRING);
+        p.AddSwitch("", "no-code", "test: with --auto-recv, receive without opening a pairing code");
         p.AddOption("", "auto-recv", "test: turn on receiving into this folder", wxCMD_LINE_VAL_STRING);
         p.AddOption("", "auto-dst", "test: run the wizard with this destination folder", wxCMD_LINE_VAL_STRING);
     }
@@ -106,6 +126,13 @@ public:
         if (p.Found("auto-src", &c)) auto_src_ = S(c);
         if (p.Found("auto-dst", &c)) auto_dst_ = S(c);
         if (p.Found("auto-recv", &c)) auto_recv_ = S(c);
+        if (p.Found("wizard-stop", &n)) wizard_stop_ = static_cast<int>(n);
+        if (p.Found("demo-ip", &c)) demo_ip_ = S(c);
+        show_adv_ = p.Found("show-advanced");
+        redact_ = p.Found("redact-account");
+        no_code_ = p.Found("no-code");
+        auto_svc_dialog_ = p.Found("auto-svc-dialog");
+        if (p.Found("dialog-shot", &c)) dialog_shot_ = S(c);
         return wxApp::OnCmdLineParsed(p);
     }
 
@@ -149,6 +176,9 @@ private:
     int page_ = -1;
     std::string config_, daemon_, lang_, dump_icons_, user_dir_, shot_, auto_src_, auto_dst_, auto_recv_;
     int shot_delay_ = 2500;
+    int wizard_stop_ = -1;
+    bool show_adv_ = false, auto_svc_dialog_ = false, redact_ = false, no_code_ = false;
+    std::string demo_ip_, dialog_shot_;
     bool shot_exit_ = false;
 
     static void DumpIcons(const std::string& path) {

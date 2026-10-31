@@ -84,9 +84,9 @@ bool user_service_name_matches_owner(const std::string& name, const std::string&
 std::string owner_label(const std::string& owner_id);   // "[owner <id>]"
 // The id of the user running this process: Windows SID text, POSIX uid.
 std::string current_owner_id();
-// Windows: how powerful is this account? Three answers, and "Unknown" is treated like "Yes" by every caller: a service is set
-// up for an account only when the answer is No (fail closed). `Yes` = member of Administrators / an operators group, holds a
-// strong privilege, or has an elevated linked token; Unknown = an API failed, the SID could not be resolved, or the SID is not
+// Windows: how powerful is this account? Information only since d8 (the engine always runs with a restricted token, so no account
+// is refused for being an administrator): shown to the user in the confirmation and in the summary (account_is_admin).
+// Unknown = an API failed, the SID could not be resolved, or the SID is not the user running this process.
 // the user running this process.
 enum class AdminState { No, Yes, Unknown };
 struct TokenFacts {   // what was read from a token (pure input of the decision, so it can be tested)
@@ -102,18 +102,31 @@ using AdminProbe = std::function<AdminState(const std::string& sid)>;   // depen
 // Evaluated on the token of THIS process (the user running it); POSIX: always No.
 AdminState account_admin_state(const std::string& sid);
 bool account_is_administrator(const std::string& sid);   // == (account_admin_state(sid) != No)
-// "" when `s` is No; otherwise the plain-language reason (different words for Yes and Unknown).
-std::string admin_refusal_for(AdminState s);
-// Install / migrate / set-password: refused unless BOTH the new token of the target account and this process say No.
-std::string service_account_refusal(AdminState token_state, AdminState process_state);
-// Service start-up check (the user may have been added to Administrators after the install): "" = start, else the reason.
-std::string service_start_refusal(AdminState now);
+// d8 (review): a restricted token does not stop NETWORK authentication - the engine shares the logon session, so a connection to
+// \\localhost\C$ or to the service manager over RPC uses the account's full network credentials. Windows protects an
+// administrator from this only through "remote UAC filtering" (network logons of a LOCAL administrator get a filtered token).
+// That protection does not exist for the built-in Administrator (RID 500), for domain accounts, nor when
+// LocalAccountTokenFilterPolicy = 1. A service for such an account that is (or may be) an administrator or in an operators
+// group is refused, with plain words and the way out. "" = fine. Pure: all inputs are given.
+std::string remote_filtering_problem(const std::string& sid, const TokenFacts& facts, bool domain_account, bool filter_policy_open);
+// The same for the account running this process (Windows: reads its token, domain and the policy value; fail closed on any
+// error; POSIX: ""). The Simple-mode service frame calls it at every start as well.
+std::string account_exposure_problem_for_current_user();
+using ExposureProbe = std::function<std::string()>;   // injectable in tests
+
+// d8: the service belongs to the REQUESTER (the user who pressed the button), whoever approved the UAC prompt. "" when the
+// identity is in order: the requester SID is a plain account SID, and the account the password logs on as IS that SID (a wrong
+// password already fails check_service_account; a right password of ANOTHER account must not pass here).
+std::string requester_identity_problem(const std::string& requester_sid, const std::string& logon_sid);
+// The logon-as-service right is shared by every MySync service of the same account. The one that ADDED it leaves
+// ".logon-right-added" (the SID) in its folder. When that one is uninstalled, release_logon_right() says whether the right may be
+// revoked now (true), or hands the marker over to another service of the same account that still exists (false). Another
+// service counts when `describe(<its name>)` (its description; "" = no such service) carries this account's owner label - so
+// services installed before the markers existed are counted as well, and folders whose service is gone are not.
+using ServiceDescribe = std::function<std::string(const std::string& service_name)>;
+bool release_logon_right(const std::string& service_dir, const std::string& sid, const ServiceDescribe& describe);
 // Does `name` have the shape of a Simple-mode service name (mysync-<account>-<4 hex>)? Such a name is only valid with --user-service.
 bool looks_like_user_service_name(const std::string& name);
-// Plain-language reason a Simple-mode service is refused for an administrator account (Windows); empty when `is_admin` is false.
-// The service token of an administrator is a full administrator token, and the source / destination trees are writable by the
-// user's other software, so a junction swapped in after the checks would let the service write or delete anywhere.
-std::string admin_account_refusal(bool is_admin);
 
 // Counts wrong passwords in a row for the GUI flow: after 5 failures further tries are refused for 30 s, so a mistyped
 // password cannot lock the Windows account out.
@@ -148,6 +161,10 @@ public:
     PasswordChannel& operator=(const PasswordChannel&) = delete;
     const std::string& pipe_name() const;
     const std::string& nonce_hex() const;
+    // d8: the elevated installer may run under another account, so the client is recognised by its PROCESS: the one the caller
+    // started (ShellExecuteEx / CreateProcess) and nobody else, besides the nonce. Must be set before the client connects
+    // (deliver() waits a few seconds for it).
+    void expect_client_pid(unsigned long pid);
     bool deliver(const SecretString& password, int timeout_ms, std::string* error);
     // Wakes a deliver() that is still waiting for the installer (it never started: UAC cancelled ...). Thread-safe.
     void cancel();
@@ -160,7 +177,10 @@ private:
 
 // Elevated side: connects, checks that the server process runs as the current user, proves the nonce, receives the
 // password. False + *error (plain words) otherwise.
-bool receive_password(const std::string& pipe_name, const std::string& nonce_hex, SecretString* out, std::string* error);
+// `requester_sid` (d8): the account whose application must be on the other end of the pipe (default: the current user). The
+// elevated step may run under another administrator account than the requester.
+bool receive_password(const std::string& pipe_name, const std::string& nonce_hex, SecretString* out, std::string* error,
+                      const std::string& requester_sid = {});
 
 // The account of the user running this process in the form a service logon wants (Windows: DOMAIN\\name from the
 // system, SAM-compatible; POSIX: the user name). "" if unknown.
@@ -178,6 +198,7 @@ struct AccountCheck {
     std::string sid;    // the account's SID ("S-1-5-21-...")
     std::string error;  // plain words, never contains the password
     AdminState admin = AdminState::Unknown;   // power of the account's NEW logon token (Windows); No on POSIX
+    std::string exposure_problem;             // remote_filtering_problem() for the account (Windows); "" = fine
 };
 // LogonUser with the password (no change to the system). Resolves the SID.
 AccountCheck check_service_account(const std::string& account, const SecretString& password);

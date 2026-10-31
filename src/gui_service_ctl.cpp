@@ -3,6 +3,8 @@
 // Author: Nguyễn Đức Sơn
 
 #include "mysync/gui/service_ctl.h"
+#include "mysync/simple/restricted.h"
+#include "mysync/simple/user_paths.h"
 
 #include "mysync/gui/trust.h"
 
@@ -175,7 +177,9 @@ struct ChildResult {
 };
 
 // Already elevated: run the child directly with stdout/stderr captured through an anonymous pipe.
-ChildResult spawn_captured(const std::string& exe, const std::vector<std::string>& args) {
+using PidSink = std::function<void(unsigned long)>;   // told the PID of the child as soon as it exists (d8)
+
+ChildResult spawn_captured(const std::string& exe, const std::vector<std::string>& args, const PidSink& on_pid) {
     ChildResult r;
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof sa;
@@ -206,6 +210,7 @@ ChildResult spawn_captured(const std::string& exe, const std::vector<std::string
         return r;
     }
     r.started = true;
+    if (on_pid) on_pid(pi.dwProcessId);
     std::string out;
     std::thread reader([&] {
         char buf[2048];
@@ -230,7 +235,7 @@ ChildResult spawn_captured(const std::string& exe, const std::vector<std::string
 }
 
 // Not elevated: UAC prompt through ShellExecuteEx "runas". Output cannot be captured: the exit code is the report.
-ChildResult spawn_elevated(const std::string& exe, const std::vector<std::string>& args) {
+ChildResult spawn_elevated(const std::string& exe, const std::vector<std::string>& args, const PidSink& on_pid) {
     ChildResult r;
     HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     std::wstring file = widen(exe), params = join_args(args), dir = widen(fs::u8path(exe).parent_path().u8string());
@@ -247,6 +252,7 @@ ChildResult spawn_elevated(const std::string& exe, const std::vector<std::string
         r.error = GetLastError();
     } else if (sei.hProcess) {
         r.started = true;
+        if (on_pid) on_pid(GetProcessId(sei.hProcess));   // the elevated process (it may run under ANOTHER administrator's account)
         DWORD w = WaitForSingleObject(sei.hProcess, kChildTimeoutS * 1000);
         if (w == WAIT_TIMEOUT) {
             r.timed_out = true;  // the elevated process cannot be terminated from here
@@ -301,6 +307,10 @@ ServiceState ServiceController::query(const std::string& name) const {
         case SERVICE_STOP_PENDING: st.detail = "STOP_PENDING"; break;
         case SERVICE_STOPPED:
             st.detail = "STOPPED";
+            if (s.dwWin32ExitCode == ERROR_SERVICE_SPECIFIC_ERROR) {   // the frame refused to run the engine (d8): say why
+                std::string why = simple::frame_refusal_text(static_cast<int>(s.dwServiceSpecificExitCode));
+                if (!why.empty()) st.error = why;
+            }
             if (s.dwWin32ExitCode == ERROR_SERVICE_LOGON_FAILED) {   // 1069: the account's password is no longer right
                 st.needs_password_update = true;
                 st.detail = "STOPPED (logon failure 1069)";
@@ -334,7 +344,7 @@ ServiceState ServiceController::query(const std::string& name) const {
 
 static std::string default_exe() { return self_dir() + "\\mysync.exe"; }
 
-static ServiceResult run_child(const std::string& exe, const std::vector<std::string>& args) {
+static ServiceResult run_child(const std::string& exe, const std::vector<std::string>& args, const PidSink& on_pid = {}) {
     ServiceResult res;
     // Held for the whole run: while this read-only handle is open nobody can write to or replace the file between
     // the trust check and the moment Windows starts it. (The folder could still be renamed away by an administrator;
@@ -349,7 +359,7 @@ static ServiceResult run_child(const std::string& exe, const std::vector<std::st
     } pin(exe);
     bool elevated_now = ServiceController::is_elevated();
     res.elevated = !elevated_now;
-    ChildResult c = elevated_now ? spawn_captured(exe, args) : spawn_elevated(exe, args);
+    ChildResult c = elevated_now ? spawn_captured(exe, args, on_pid) : spawn_elevated(exe, args, on_pid);
     if (!c.started) {
         if (c.error == ERROR_CANCELLED) {
             res.cancelled = true;
@@ -673,6 +683,11 @@ std::vector<std::string> ServiceController::build_args(ServiceAction act, const 
         // not needed for these actions; ignoring silently would hide a caller mistake
         throw Error(std::string("the options config/role/account/allow only apply to install, not ") + service_action_name(act));
     }
+    if (!rq.requester_sid.empty()) {
+        if (!simple::valid_user_sid(rq.requester_sid)) throw Error("invalid requester identity");
+        a.push_back("--requester-sid");
+        a.push_back(rq.requester_sid);
+    }
     a.push_back("--name");
     a.push_back(rq.name);
     return a;
@@ -714,6 +729,9 @@ ServiceResult ServiceController::run(ServiceAction act, const ServiceRequest& rq
         rq.password_pipe = chan->pipe_name();
         rq.password_nonce = chan->nonce_hex();
     }
+#ifdef _WIN32
+    rq.requester_sid = simple::current_user_sid();   // the user who pressed the button (not the administrator who approves the prompt)
+#endif
     std::vector<std::string> args = build_args(act, rq);
 
     // Nothing is elevated unless the program (and the folder it sits in) can only be changed by administrators.
@@ -745,7 +763,13 @@ ServiceResult ServiceController::run(ServiceAction act, const ServiceRequest& rq
     std::string deliver_err;
     bool delivered = false;
     if (chan) deliverer = std::thread([&] { delivered = chan->deliver(*rq.password, 180000, &deliver_err); });
+#ifdef _WIN32
+    ServiceResult res = run_child(exe_, args, [&](unsigned long pid) {
+        if (chan) chan->expect_client_pid(pid);
+    });
+#else
     ServiceResult res = run_child(exe_, args);
+#endif
     if (deliverer.joinable()) {
         chan->cancel();   // the child is gone: if it never came for the password, stop waiting
         deliverer.join();

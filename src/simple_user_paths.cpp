@@ -86,6 +86,25 @@ std::string current_user_short_id() {
 #endif
 }
 
+std::string profile_path_for_sid(const std::string& sid) {
+#ifdef _WIN32
+    if (!valid_user_sid(sid)) return {};
+    std::wstring key = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\" + fs::u8path(sid).wstring();
+    wchar_t buf[2048] = {};
+    DWORD sz = sizeof buf - sizeof(wchar_t);
+    // RRF_NOEXPAND is not used: the value is REG_EXPAND_SZ ("%SystemDrive%\Users\name") and is expanded here with the system's variables
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, key.c_str(), L"ProfileImagePath", RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ, nullptr, buf, &sz) != ERROR_SUCCESS)
+        return {};
+    wchar_t out[2048] = {};
+    DWORD n = ExpandEnvironmentStringsW(buf, out, 2047);
+    if (n == 0 || n > 2047) return {};
+    return fs::path(std::wstring(out)).u8string();
+#else
+    (void)sid;
+    return {};
+#endif
+}
+
 std::string current_user_sid() {
 #ifdef _WIN32
     return current_sid_text();
@@ -93,6 +112,22 @@ std::string current_user_sid() {
     return {};
 #endif
 }
+
+namespace {
+std::string g_requester_sid;
+}
+
+bool valid_user_sid(const std::string& sid) {
+    if (sid.size() < 14 || sid.size() > 90) return false;
+    if (sid.rfind("S-1-5-21-", 0) != 0 && sid.rfind("S-1-12-1-", 0) != 0) return false;
+    for (char c : sid)
+        if (!((c >= '0' && c <= '9') || c == '-' || c == 'S')) return false;
+    return sid.back() != '-';
+}
+
+void set_requester_sid(const std::string& sid) { g_requester_sid = valid_user_sid(sid) ? sid : std::string(); }
+
+std::string effective_user_sid() { return g_requester_sid.empty() ? current_user_sid() : g_requester_sid; }
 
 void restrict_to_current_user(const std::string& utf8_path, bool is_dir) {
     fs::path p = fs::u8path(utf8_path);
