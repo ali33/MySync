@@ -2,6 +2,7 @@
 // Copyright (C) 2026 META.vn
 // Author: Nguyễn Đức Sơn
 #include "main_frame.h"
+#include "server_wizard.h"
 
 #include <wx/aboutdlg.h>
 #include <wx/dnd.h>
@@ -18,7 +19,7 @@
 namespace mysync::gui {
 
 namespace {
-enum { ID_LANG_VI = 3001, ID_LANG_EN, ID_TRAY_OPEN, ID_TRAY_TOGGLE, ID_TRAY_EXIT, ID_SAVE, ID_MODE };
+enum { ID_LANG_VI = 3001, ID_LANG_EN, ID_TRAY_OPEN, ID_TRAY_TOGGLE, ID_TRAY_EXIT, ID_SAVE, ID_MODE, ID_SERVER };
 }
 
 // ---------------------------------------------------------------- khay
@@ -183,6 +184,7 @@ void MainFrame::BuildMenu() {
     (mysync::gui::lang() == Lang::Vi ? lang->FindItem(ID_LANG_VI) : lang->FindItem(ID_LANG_EN))->Check();
     set->AppendSubMenu(lang, L("menu.language"));
     mode_item_ = set->Append(ID_MODE, L(mode_ == Mode::Advanced ? "simple.menu.tosimple" : "simple.menu.advanced"));
+    set->Append(ID_SERVER, L("srv.menu"));
     auto* help = new wxMenu;
     help->Append(wxID_ABOUT, L("menu.about"));
     mb->Append(file, L("menu.file"));
@@ -193,6 +195,7 @@ void MainFrame::BuildMenu() {
     Bind(wxEVT_MENU, [this](wxCommandEvent&) { SetLanguage(Lang::En); }, ID_LANG_EN);
     Bind(wxEVT_MENU, [this](wxCommandEvent&) { Quit(); }, ID_TRAY_EXIT);
     Bind(wxEVT_MENU, [this](wxCommandEvent&) { OnModeMenu(); }, ID_MODE);
+    Bind(wxEVT_MENU, [this](wxCommandEvent&) { show_server_wizard(this); }, ID_SERVER);
     Bind(wxEVT_MENU, [this](wxCommandEvent&) { ShowAbout(); }, wxID_ABOUT);
 }
 

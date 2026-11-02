@@ -24,6 +24,31 @@ Mọi lệnh bên dưới chạy được trên Linux lẫn Windows (ví dụ vi
 Thông điệp lỗi viết ra stderr, nguyên văn, kèm tên tệp / số dòng khi có. Kết quả máy đọc được ở stdout
 (`--json` nếu lệnh hỗ trợ).
 
+## 2.0 Cách nhanh: `quick-server` / `quick-client`
+
+Thay cho việc tự `keygen` + viết `server.toml` + viết `client.toml` (các mục 2.1 và 2.2 bên dưới là cách làm tay tương đương):
+
+```sh
+# trên B (nhận). Tạo khoá nếu chưa có, ghi server.toml, in khoá công khai + client.toml + dòng peer add
+mysync quick-server --dir /srv/mysync [--port 5656] [--name a] [--config-dir /etc/mysync] [--service] [--force] [--json]
+
+# trên A (gửi). KEY_B = khoá công khai B in ra ở trên
+mysync quick-client --server b.example.net:5656 --server-key "$KEY_B" --dir /srv/du-lieu [--name a] [--config-dir D] [--service] [--force] [--json]
+# in khoá công khai của A và đúng dòng "mysync peer add <khoá A> --name a --perm rw -c server.toml" để chạy trên B
+```
+
+| Điều | Hành vi |
+|---|---|
+| Thư mục cấu hình | mặc định `<dir>.mysync` (cạnh thư mục `--dir`, **ngoài** nó: nếu ở trong thư mục được chia sẻ thì khoá và danh sách máy được phép sẽ bị phục vụ cho máy khách → lệnh từ chối). Chứa `server.toml`, `server.key`, `peers.d/` (hoặc `client.toml`, `client.key`) |
+| Mặc định an toàn | `pairing = "off"`, `max_file_size`/`max_trash_bytes` 10GB, hạn mức máy khách mặc định, tệp `0640` thư mục `0750`, `bind = "*"`, thùng rác bật; máy khách khai báo bằng `peers.d` |
+| Khoá bí mật | tạo bằng đúng hàm của `keygen` (từ chối ghi đè, `0600`/DACL chủ); **không bao giờ in**, không nằm trong snippet; chỉ in đường dẫn và khoá công khai |
+| Chạy lại | không đổi gì, báo "đã có sẵn, giữ nguyên", mã 0 (hoặc 10 với `--changed-exit` nếu có thay đổi). Cấu hình có sẵn mà không nạp được → lỗi, không bị ghi đè |
+| `--force` | ghi lại cấu hình (bản cũ thành `.bak`); **khoá không bao giờ bị thay** (muốn đổi khoá: `mysync key rotate`) |
+| `--service` | cài + bật dịch vụ qua đúng `ServiceController` mà GUI dùng (kiểm chương trình, nhóm rộng, cấu hình chỉ nhóm tin cậy được sửa…). Cấu hình nằm ở thư mục người dùng thường ghi được sẽ bị từ chối với lý do cụ thể: dùng `--config-dir` trỏ vào thư mục chỉ admin ghi được. Đã cài rồi thì để nguyên |
+| `--json` | một dòng JSON: `role, changed, dir, config_file, key_file, public_key, fingerprint, *_created/*_existed, port, pairing, client_snippet, peer_add_command, notes[]` (+ `service{ok,message}` khi có `--service`) |
+
+Đoạn `client.toml` in ra có hai chỗ giữ chỗ cần thay: `TEN-HOAC-IP-MAY-CHU` và `THU-MUC-CAN-DONG-BO`. Không có tương tác, không có câu hỏi.
+
 ## 2. Ghép hai máy chủ: A đẩy sang B
 
 A là **nguồn** (chạy client, đẩy tệp), B là **đích** (chạy server, nhận tệp). Khoá bí mật không bao giờ rời máy

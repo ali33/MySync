@@ -77,6 +77,21 @@ mysync service install -c server.toml        # cài dịch vụ (admin/root)
 ```
 Ghép máy, cấu hình mẫu và dịch vụ: `docs/SETUP.md`, `docs/SERVICE.md`, `examples/`.
 
+## Dựng máy chủ trong 2 lệnh
+
+Không cần viết `server.toml` bằng tay. Trên máy chủ:
+```
+mysync quick-server --dir /srv/mysync --port 5656          # tạo khoá + server.toml an toàn (pairing tắt), in khoá công khai
+mysync peer add <khoá công khai của máy khách> --name van-phong --perm rw -c /srv/mysync.mysync/server.toml
+```
+Lệnh đầu in sẵn: khoá công khai của máy chủ, đoạn `client.toml` để dán sang máy khách, và đúng dòng `peer add` cần chạy.
+Trên máy khách: `mysync quick-client --server may-chu:5656 --server-key <khoá công khai máy chủ> --dir /duong/dan/can/dong/bo` — lệnh này in khoá công khai của máy khách và dòng `peer add` để chạy trên máy chủ.
+
+- Chạy lại bao nhiêu lần cũng được: không ghi đè khoá hay cấu hình đã có (cần `--force` mới ghi lại cấu hình; khoá bí mật không bao giờ bị thay), và báo rõ cái gì đã có sẵn.
+- Cấu hình và khoá nằm ở `<thư mục>.mysync` cạnh thư mục dùng chung (đổi bằng `--config-dir`), không nằm trong thư mục được chia sẻ.
+- `--service` cài và bật dịch vụ qua đúng đường cài dịch vụ hiện có (mọi kiểm tin cậy giữ nguyên); `--json` cho script. Trong giao diện đồ hoạ: menu Cài đặt, mục **Dựng máy chủ…**.
+- Chi tiết: `docs/SERVER-TO-SERVER.md` mục 2.0.
+
 ## Cài làm dịch vụ (từng bước)
 
 > **Lưu ý trung thực:** việc cài dịch vụ thật (Windows SCM, systemd) **chưa được kiểm trên máy thật** (xem `docs/STATUS.md`; kịch bản kiểm tay: `docs/MANUAL-TEST.md`).

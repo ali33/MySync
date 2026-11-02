@@ -77,6 +77,11 @@ const char* kHelp =
     "                                          install/remove/start/stop the Windows service or systemd unit (admin/root)\n"
     "  mysync status -c <config> --json        the same as a stable JSON document (daemon state when it runs)\n"
     "  mysync health -c <config> [--max-lag-seconds N] [--json]   one line; exit 0 healthy, 1 warning, 2 critical\n"
+    "  mysync quick-server --dir <folder> [--port N] [--name N] [--config-dir D] [--service] [--force] [--fix-permissions] [--json]\n"
+    "                                          set up a server in one step: key (if missing) + server.toml with safe defaults (pairing off);\n"
+    "                                          prints the public key, the client.toml to paste and the 'peer add' line. Idempotent\n"
+    "  mysync quick-client --server host:port --server-key <hex> --dir <folder> [--name N] [--config-dir D] [--service] [--force] [--fix-permissions] [--json]\n"
+    "                                          the same for a client: key + client.toml; prints its public key and the 'peer add' to run on the server\n"
     "  mysync peer add <public key hex> --name N --perm ro|rw [--subdir D] [--rotate] -c <server.toml>\n"
     "  mysync peer remove|revoke <name|key> | peer retire-key <name> <key> | peer list [--json]   (server peers, idempotent)\n"
     "  mysync key show --public [-k keyfile|-c config] [--json]\n"
@@ -810,7 +815,7 @@ int dispatch(const std::vector<std::string>& a) {
         std::cout << "mysync " << kVersion << "\n";
         return 0;
     }
-    if (cmd == "keygen" || cmd == "peer" || cmd == "key" || cmd == "health" ||
+    if (cmd == "keygen" || cmd == "quick-server" || cmd == "quick-client" || cmd == "peer" || cmd == "key" || cmd == "health" ||
         (cmd == "status" && std::find(a.begin(), a.end(), "--json") != a.end()))
         return cli_ops_main(a);  // server operations: non-interactive, scriptable (see cli_ops.h)
     Opts o = parse_opts(a, 2);

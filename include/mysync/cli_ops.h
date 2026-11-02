@@ -20,4 +20,8 @@ namespace mysync {
 // args[0] = program, args[1] = the command (keygen | key | peer | status | health), the rest its arguments.
 int cli_ops_main(const std::vector<std::string>& args);
 
+// The trust check every server-configuration edit (peer add/remove/..., GUI "add client") runs first: an untrusted file or
+// folder (symlink, writable by others when elevated) is refused before it is even parsed. Throws Error.
+void guard_server_config_for_edit(const std::string& config_path);
+
 }  // namespace mysync

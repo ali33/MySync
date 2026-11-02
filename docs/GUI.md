@@ -157,6 +157,25 @@ Mọi chờ có chỉ báo động (BusyIndicator, vô hiệu hoá phần nội 
 - Cửa sổ ghép cố định 10 phút, yêu cầu chờ duyệt cố định 2 phút (đặt trong lõi, không đổi từ GUI).
 - Đổi thư mục nhận file hoặc tắt nhận không xoá các máy đã ghép (xoá ở chế độ nâng cao, tab *Ghép máy và Khoá*).
 
+## Dựng máy chủ (hộp thoại một nút)
+
+Mục **Dựng máy chủ…** (menu Cài đặt của cửa sổ chính, có trong cả chế độ Đơn giản và Nâng cao) mở một hộp thoại làm đúng việc của lệnh `mysync quick-server` — cùng một hàm lõi (`quick_server()` trong `src/quick_setup.cpp`), không chạy dòng lệnh rồi đọc chữ của nó.
+
+1. **Chọn thư mục nhận tệp** (thư mục sẽ được chia sẻ) và **cổng** (mặc định 5656; kiểm 1–65535 ngay tại ô).
+2. Bấm **Tạo**. Việc chạy ở luồng nền, có vòng quay báo đang làm; lỗi hiện nguyên văn trên màn hình. Tạo khoá nếu chưa có, ghi cấu hình với mặc định an toàn (ghép nối nhanh **tắt**), thư mục cấu hình nằm cạnh thư mục chia sẻ (`<thư mục>.mysync`), không nằm trong nó.
+3. **Màn kết quả**: đường dẫn cấu hình và tệp khoá (khoá bí mật **không bao giờ hiện** và không được chép), khoá công khai + dấu vân tay, đoạn `client.toml` cho máy khách, dòng `mysync peer add ...`; mỗi khối có nút **Chép**. Chạy lại trên thư mục đã dựng thì chỉ báo "đã có sẵn, giữ nguyên".
+4. (Tuỳ chọn) **Thêm máy khách**: dán khoá công khai của máy khách (chấp nhận khoảng trắng, xuống dòng, `0x`, dấu `:`), đặt tên, chọn đọc-ghi hoặc chỉ-đọc. Dùng cùng `peer_add` và cùng bước kiểm tin cậy tệp cấu hình như `mysync peer add`; thêm lại cùng khoá thì "không đổi".
+5. (Tuỳ chọn) **Cài thành dịch vụ**: đi qua đúng `ServiceController` của nút dịch vụ (kiểm chương trình, nhóm rộng, cấu hình chỉ nhóm tin cậy sửa được; UAC/pkexec). Nếu thư mục cấu hình mà người dùng thường ghi được bị từ chối thì thông báo nguyên văn hiện ra; đó là chủ ý, không có đường vòng.
+
+**Thư mục bị từ chối vì "người khác ghi được"**: chỉ xảy ra khi MySync chạy bằng quyền quản trị. Thư mục trên ổ D:, E:... thường thừa hưởng từ gốc ổ quyền "Users được tạo tệp/thư mục", nên hầu như thư mục nào ngoài hồ sơ người dùng cũng vướng. Hộp thoại giải thích bằng lời thường và hiện nút **Khoá quyền thư mục**: sau khi xác nhận, thư mục chỉ còn cho bạn, SYSTEM và nhóm Administrators (bỏ thừa hưởng từ ổ đĩa), rồi dựng tiếp. Thư mục do MySync **tự tạo** thì được khoá như vậy ngay từ đầu. Dòng lệnh: `--fix-permissions`. Không chạy bằng quyền quản trị thì không có bước kiểm này (dịch vụ vẫn cài qua UAC riêng).
+
+
+![Dựng máy chủ: màn kết quả](images/gui-09-dung-may-chu.png)
+
+(Ảnh chụp với dữ liệu mẫu: thư mục tạm, khoá sinh riêng cho lần chụp.) Chụp lại: `mysync-gui --server-wizard-demo <thư mục tạm> --server-wizard-shot <png>`.
+
+Chưa kiểm: cài dịch vụ thật từ hộp thoại này (cần quyền quản trị), và chạy trên Linux/GTK (chỉ dựng được; model có test headless).
+
 ## README-snippet
 
 ### Dùng nhanh cho người mới

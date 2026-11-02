@@ -21,6 +21,7 @@
 #include "mysync/gui/trust.h"
 #include "mysync/keys.h"
 #include "mysync/peers.h"
+#include "mysync/quick_setup.h"
 
 namespace fs = std::filesystem;
 
@@ -576,6 +577,121 @@ int cmd_peer(const std::vector<std::string>& v) {
     usage("unknown peer command '" + sub + "' (add, remove, revoke, retire-key, list)");
 }
 
+// ---------------------------------------------------------------------------------------------- quick-server / quick-client
+// Optional step: install + start the service through the SAME controller the GUI uses (validate_install_inputs, trust
+// checks, UAC / pkexec). Nothing is vetted here a second time and no path of its own is opened.
+std::string quick_service(const QuickResult& r, const std::string& name_opt, bool& ok, bool& warn) {
+    std::string name = name_opt.empty() ? (r.role == "server" ? "mysync-server" : "mysync-client") : name_opt;
+    ok = false;
+    gui::ServiceController ctl;
+    gui::ServiceState st = ctl.query(name);
+    std::string msg;
+    if (!st.installed) {
+        gui::ServiceRequest rq;
+        rq.name = name;
+        rq.config_path = r.config_file;
+        rq.role = r.role;
+        gui::ServiceResult res = ctl.run(gui::ServiceAction::Install, rq);
+        if (!res.ok)
+            return "service " + name + " NOT installed: " + (res.message.empty() ? gui::service_exit_message(res.exit_code) : res.message);
+        msg = "service " + name + " installed";
+        st = res.state_after;
+    } else {
+        // The installed service's configuration path cannot be read back: say so instead of claiming it is this one.
+        msg = "WARNING: service " + name + " is already installed and was left as it is; it may use a different configuration than " +
+              r.config_file + " (check with: mysync status -c " + r.config_file + " --json)";
+        warn = true;
+    }
+    if (!st.running) {
+        gui::ServiceRequest rq;
+        rq.name = name;
+        gui::ServiceResult res = ctl.run(gui::ServiceAction::Start, rq);
+        if (!res.ok) return msg + "; NOT started: " + (res.message.empty() ? gui::service_exit_message(res.exit_code) : res.message);
+        msg += "; started";
+    } else {
+        msg += "; running";
+    }
+    ok = true;
+    return msg;
+}
+
+int quick_report(const QuickResult& r, bool json, bool want_service, const std::string& svc_name, bool changed_exit) {
+    std::string svc_msg;
+    bool svc_ok = true, svc_warn = false;
+    if (want_service) svc_msg = quick_service(r, svc_name, svc_ok, svc_warn);
+    if (json) {
+        std::string j = quick_result_json(r);
+        if (want_service) {   // splice the service result in before the closing brace
+            j.erase(j.find_last_of('}'));
+            j += ",\"service\":{\"ok\":" + jb(svc_ok) + ",\"warning\":" + jb(svc_warn) + ",\"message\":" + jq(svc_msg) + "}}\n";
+        }
+        std::cout << j;
+    } else {
+        const bool server = r.role == "server";
+        std::cout << (server ? "MySync server" : "MySync client") << " - " << (server ? "shared folder: " : "synchronised folder: ") << r.dir
+                  << (r.dir_created ? " (created)" : "") << "\n";
+        std::cout << "configuration: " << r.config_file
+                  << (r.config_created ? " (written)" : r.config_replaced ? " (replaced, the old one is kept as .bak)" : " (already there, kept)") << "\n";
+        std::cout << "secret key:    " << r.key_file << (r.key_created ? " (created)" : " (already there, kept)")
+                  << "  - never copy it to another machine\n";
+        if (server) std::cout << "port:          " << r.port << "  (open it in the firewall)    pairing: " << r.pairing << "\n";
+        else std::cout << "server:        " << r.server_address << "\n";
+        std::cout << "public key:    " << r.public_key << "\n";
+        std::cout << "fingerprint:   " << r.fingerprint << "\n";
+        for (const auto& n : r.notes) std::cout << "note: " << n << "\n";
+        if (server) {
+            std::cout << "\n--- client.toml for the other machine (replace TEN-HOAC-IP-MAY-CHU and THU-MUC-CAN-DONG-BO) ---\n"
+                      << r.client_snippet << "---\n";
+            std::cout << "\nThen, on this server, allow the client (its public key comes from 'mysync keygen' on the client):\n  "
+                      << r.peer_add_command << "\n";
+        } else {
+            std::cout << "\nOn the server, allow this machine:\n  " << r.peer_add_command << "\n";
+        }
+        std::cout << "\nStart it:  mysync run -c " << r.config_file << "   (or add --service to install it as a service)\n";
+        if (want_service) std::cout << svc_msg << "\n";
+    }
+    if (want_service && !svc_ok) return 1;
+    return done(r.changed(), changed_exit);
+}
+
+int cmd_quick_server(Args a) {
+    QuickServerOptions o;
+    std::string port, svc;
+    a.value({"--dir"}, o.dir);
+    a.value({"--port"}, port);
+    a.value({"--name"}, o.name);
+    a.value({"--config-dir"}, o.config_dir);
+    a.value({"--service-name"}, svc);
+    o.force = a.flag({"--force"});
+    o.fix_permissions = a.flag({"--fix-permissions"});
+    bool want_service = a.flag({"--service"}), json = a.flag({"--json"}), changed_exit = a.flag({"--changed-exit"});
+    if (!a.positional().empty()) usage("usage: mysync quick-server --dir <folder> [--port N] [--name N] [--config-dir D] [--service] [--force] [--fix-permissions] [--json]");
+    if (o.dir.empty()) usage("--dir <folder> is required");
+    if (!port.empty()) {
+        uint32_t p = parse_u32(port, "--port");
+        if (p < 1 || p > 65535) usage("--port must be 1-65535");
+        o.port = static_cast<uint16_t>(p);
+    }
+    return quick_report(quick_server(o), json, want_service, svc, changed_exit);
+}
+
+int cmd_quick_client(Args a) {
+    QuickClientOptions o;
+    std::string svc;
+    a.value({"--server"}, o.server);
+    a.value({"--server-key"}, o.server_key);
+    a.value({"--dir"}, o.dir);
+    a.value({"--name"}, o.name);
+    a.value({"--config-dir"}, o.config_dir);
+    a.value({"--service-name"}, svc);
+    o.force = a.flag({"--force"});
+    o.fix_permissions = a.flag({"--fix-permissions"});
+    bool want_service = a.flag({"--service"}), json = a.flag({"--json"}), changed_exit = a.flag({"--changed-exit"});
+    if (!a.positional().empty()) usage("usage: mysync quick-client --server host:port --server-key <hex> --dir <folder> [--name N] [--config-dir D] [--service] [--force] [--fix-permissions] [--json]");
+    if (o.server.empty() || o.server_key.empty() || o.dir.empty()) usage("--server, --server-key and --dir are required");
+    return quick_report(quick_client(o), json, want_service, svc, changed_exit);
+}
+
 // ---------------------------------------------------------------------------------------------- status / health
 struct View {
     std::string role;  // "server" | "client"
@@ -803,11 +919,15 @@ int cmd_health(Args a) {
 
 }  // namespace
 
+void guard_server_config_for_edit(const std::string& config_path) { guard_server_config(abs_path(config_path)); }
+
 int cli_ops_main(const std::vector<std::string>& args) {
     try {
         if (args.size() < 2) usage("no command");
         const std::string& cmd = args[1];
         if (cmd == "keygen") return cmd_keygen(Args(args, 2));
+        if (cmd == "quick-server") return cmd_quick_server(Args(args, 2));
+        if (cmd == "quick-client") return cmd_quick_client(Args(args, 2));
         if (cmd == "key") return cmd_key(args);
         if (cmd == "peer") return cmd_peer(args);
         if (cmd == "status") return cmd_status_json(Args(args, 2));

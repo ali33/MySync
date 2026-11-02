@@ -7,6 +7,7 @@
 #include <wx/snglinst.h>
 
 #include "main_frame.h"
+#include "server_wizard.h"
 
 using namespace mysync::gui;
 
@@ -69,6 +70,9 @@ public:
             });
             t->StartOnce(3000);
         });
+        server_wizard_demo().folder = sw_demo_;
+        server_wizard_demo().png = sw_shot_;
+        if (!sw_demo_.empty()) f->CallAfter([f] { show_server_wizard(f); });
         if (!auto_recv_.empty()) f->CallAfter([f, this] { f->SimpleAutoReceive(auto_recv_, !no_code_); });
         if (!shot_.empty()) {
             std::string png = shot_;
@@ -107,6 +111,8 @@ public:
         p.AddSwitch("", "redact-account", "documentation screenshots: show a sample account name instead of the real one");
         p.AddOption("", "dialog-shot-open", "test: PNG of that dialog with the Details part opened", wxCMD_LINE_VAL_STRING);
         p.AddOption("", "dialog-shot", "test: PNG of that confirmation dialog", wxCMD_LINE_VAL_STRING);
+        p.AddOption("", "server-wizard-demo", "documentation: open the server wizard on this (temporary) folder, create, add a sample client", wxCMD_LINE_VAL_STRING);
+        p.AddOption("", "server-wizard-shot", "documentation: PNG of the server wizard result screen (then it closes)", wxCMD_LINE_VAL_STRING);
         p.AddSwitch("", "no-code", "test: with --auto-recv, receive without opening a pairing code");
         p.AddOption("", "auto-recv", "test: turn on receiving into this folder", wxCMD_LINE_VAL_STRING);
         p.AddOption("", "auto-dst", "test: run the wizard with this destination folder", wxCMD_LINE_VAL_STRING);
@@ -134,6 +140,8 @@ public:
         redact_ = p.Found("redact-account");
         no_code_ = p.Found("no-code");
         auto_svc_dialog_ = p.Found("auto-svc-dialog");
+        if (p.Found("server-wizard-demo", &c)) sw_demo_ = S(c);
+        if (p.Found("server-wizard-shot", &c)) sw_shot_ = S(c);
         if (p.Found("dialog-shot", &c)) dialog_shot_ = S(c);
         if (p.Found("dialog-shot-open", &c)) dialog_shot_open_ = S(c);
         return wxApp::OnCmdLineParsed(p);
@@ -181,7 +189,7 @@ private:
     int shot_delay_ = 2500;
     int wizard_stop_ = -1;
     bool show_adv_ = false, auto_svc_dialog_ = false, redact_ = false, no_code_ = false;
-    std::string demo_ip_, dialog_shot_, dialog_shot_open_;
+    std::string demo_ip_, dialog_shot_, dialog_shot_open_, sw_demo_, sw_shot_;
     bool shot_exit_ = false;
 
     static void DumpIcons(const std::string& path) {
