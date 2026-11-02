@@ -337,31 +337,52 @@ std::string friendly_error(const std::string& what) {
     return tr(key.c_str()) + (detail.empty() ? "" : "\n" + detail);
 }
 
-std::string service_confirm_text(const simple::MigrationSummary& s, const std::string& account, bool windows) {
+namespace {
+// "A" hoặc "A, B" hoặc "A, B và N mục khác" (đầy đủ nằm ở phần Chi tiết).
+std::string short_list(const std::vector<std::string>& v) {
+    if (v.empty()) return "-";
+    std::string o = v[0];
+    if (v.size() >= 2) o += ", " + v[1];
+    if (v.size() > 2) o += " " + trf("simple.svc.main.more", {std::to_string(v.size() - 2)});
+    return o;
+}
+}  // namespace
+
+ConfirmParts service_confirm_parts(const simple::MigrationSummary& s, const std::string& account, bool windows) {
+    ConfirmParts r;
     auto list = [](const std::vector<std::string>& v) {
         std::string o;
         for (const auto& x : v) o += "\n  - " + x;
         return o;
     };
-    std::string t = tr("simple.svc.confirm.to") + "\n\n" + tr("simple.svc.sum.sources") + list(s.sources) + "\n\n" +
-                    tr("simple.svc.sum.dests") + list(s.destinations) + "\n\n";
-    if (!s.needs_confirmation.empty())
-        t += tr("simple.svc.sum.extra") + list(s.needs_confirmation) + "\n\n";
-    t += trf("simple.svc.sum.key", {s.key_identity.empty() ? "?" : s.key_identity}) + "\n";
     const std::string who = account.empty() ? "?" : account;
-    t += trf("simple.svc.sum.account", {who});
-    if (!s.notes.empty()) {   // the core's notes by message key, in the user's language
+    // ---- phần CHÍNH: lời thường, 5 dòng
+    r.main = tr("simple.svc.main.runs") + "\n" +
+             (windows ? trf("simple.svc.sum.runas", {who}) : trf("simple.svc.main.runs_as", {who})) + "\n" +
+             trf("simple.svc.main.io", {short_list(s.sources), short_list(s.destinations)}) + "\n" +
+             tr(windows ? "simple.svc.main.uac" : "simple.svc.main.uac_posix") + "\n" + tr("simple.svc.main.rollback");
+    r.main_lines = 5;
+    if (!s.needs_confirmation.empty())  // cảnh báo thật sự cần người dùng đồng ý: nằm ở phần chính
+        r.main += "\n\n" + trf("simple.svc.main.outside", {short_list(s.needs_confirmation)});
+    // ---- phần CHI TIẾT (kỹ thuật)
+    std::string& t = r.detail;
+    t = tr("simple.svc.sum.sources") + list(s.sources) + "\n\n" + tr("simple.svc.sum.dests") + list(s.destinations) + "\n\n";
+    if (!s.needs_confirmation.empty()) t += tr("simple.svc.sum.extra") + list(s.needs_confirmation) + "\n\n";
+    t += trf("simple.svc.sum.key", {s.key_identity.empty() ? "?" : s.key_identity});
+    if (!s.notes.empty()) {   // ghi chú của lõi theo khoá thông điệp, đã dịch
         for (const auto& n : s.notes) t += "\n! " + (n.second.empty() ? tr(n.first.c_str()) : trf(n.first.c_str(), {n.second}));
     } else {
+        t += "\n" + trf("simple.svc.sum.account", {who});
         for (const auto& w : s.warnings) t += "\n! " + w;
     }
-    if (windows) {
-        // Trước hộp xin quyền: dịch vụ là của NGƯỜI BẤM NÚT; người quản trị chỉ cấp phép cài.
-        t += "\n\n" + trf("simple.svc.sum.runas", {who});
-        if (!s.account_is_admin) t += "\n" + tr("simple.svc.sum.win.standard");
-    }
-    t += "\n\n" + trf(s.account_is_admin ? "simple.svc.sum.warn_admin" : "simple.svc.sum.warn", {account.empty() ? "?" : account});
-    return t;
+    if (windows && !s.account_is_admin) t += "\n" + tr("simple.svc.sum.win.standard");
+    t += "\n\n" + trf(s.account_is_admin && s.notes.empty() ? "simple.svc.sum.warn_admin" : "simple.svc.sum.warn", {who});
+    return r;
+}
+
+std::string service_confirm_text(const simple::MigrationSummary& s, const std::string& account, bool windows) {
+    ConfirmParts p = service_confirm_parts(s, account, windows);
+    return p.main + "\n\n" + p.detail;
 }
 
 PwdErrorKind classify_password_error(const std::string& err) {

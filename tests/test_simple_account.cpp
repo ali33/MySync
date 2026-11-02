@@ -1062,3 +1062,9 @@ TEST(d8_profile_of_the_requester_is_looked_up_by_sid) {
     CHECK(!v.ok);                                                                       // the elevated account's home is not the requester's
 #endif
 }
+
+TEST(d9_a_network_logon_refused_by_policy_is_explained_as_such) {
+    std::string why = explain_logon_error(1385);
+    CHECK(why.find("over the network") != std::string::npos);
+    CHECK(why.find("Deny access to this computer from the network") != std::string::npos);
+}

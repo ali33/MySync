@@ -179,7 +179,7 @@ std::string explain_logon_error(unsigned long e) {
         case 1909:  // ERROR_ACCOUNT_LOCKED_OUT
             return "This account is locked out because of too many wrong passwords. Wait, or unlock it, and try again.";
         case 1385:  // ERROR_LOGON_TYPE_NOT_GRANTED
-            return "This account is not allowed to run services on this computer (a policy forbids it).";
+            return "A policy of this computer forbids this account to sign in over the network (\"Deny access to this computer from the network\"), so it cannot be checked or used for the service.";
         case 1355:  // ERROR_NO_SUCH_DOMAIN
             return "The domain of this account cannot be reached.";
         case 1789:  // ERROR_TRUSTED_RELATIONSHIP_FAILURE
@@ -656,8 +656,8 @@ bool account_is_domain_account(const std::string& sid) {
 // One DWORD of HKLM\...\Policies\System. found=false when the value (or key) does not exist; false return = any other read error.
 bool read_system_policy_dword(const wchar_t* name, DWORD* value, bool* found) {
     DWORD sz = sizeof *value;
-    LONG rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", name, RRF_RT_REG_DWORD,
-                           nullptr, value, &sz);
+    LONG rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System", name,
+                           RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, nullptr, value, &sz);   // the 64-bit view, whatever bitness we are
     *found = rc == ERROR_SUCCESS;
     return rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND;
 }

@@ -403,3 +403,34 @@ TEST(d8_the_engine_describes_its_own_token) {
 }
 
 #endif
+
+TEST(d9_more_groups_and_the_manage_volume_privilege_are_on_the_one_list) {
+    for (const char* s : {"S-1-5-32-553", "S-1-5-32-575", "S-1-5-32-576", "S-1-5-32-577", "S-1-5-32-579"}) CHECK(is_dangerous_group_sid(s));
+    CHECK(is_strong_privilege("SeManageVolumePrivilege"));
+    TokenReport r = good_report();
+    r.privileges.push_back("SeManageVolumePrivilege");
+    CHECK(!network_token_problem(r).empty());
+    CHECK(!restricted_token_problem(r).empty());
+    TokenReport g = good_report();
+    g.groups.push_back({"S-1-5-32-577", 0x7});
+    CHECK(!network_token_problem(g).empty());
+#ifdef _WIN32
+    // docker-users / DnsAdmins are found by NAME on this machine (their SID is not fixed); whichever exists is on the list
+    for (const wchar_t* name : {L"docker-users", L"DnsAdmins"}) {
+        DWORD sn = 0, dn = 0;
+        SID_NAME_USE use;
+        LookupAccountNameW(nullptr, name, nullptr, &sn, nullptr, &dn, &use);
+        if (!sn || !dn) continue;                                              // no such group here: nothing to check
+        std::vector<unsigned char> sid(sn);
+        std::wstring dom(dn, L' ');
+        if (!LookupAccountNameW(nullptr, name, sid.data(), &sn, &dom[0], &dn, &use)) continue;
+        LPWSTR s = nullptr;
+        if (!ConvertSidToStringSidW(sid.data(), &s)) continue;
+        int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, nullptr, 0, nullptr, nullptr);
+        std::string txt(static_cast<size_t>(n > 1 ? n - 1 : 0), ' ');
+        if (n > 1) WideCharToMultiByte(CP_UTF8, 0, s, -1, &txt[0], n, nullptr, nullptr);
+        LocalFree(s);
+        CHECK(is_dangerous_group_sid(txt));
+    }
+#endif
+}

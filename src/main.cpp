@@ -574,6 +574,10 @@ int cmd_service_impl(const Opts& o) {
                 return gui::kServiceAccessDenied;
             }
         }
+        if (!chk.exposure_problem.empty()) {   // as for install: an account whose network sign-ins are not restricted gets no service
+            std::cerr << "mysync: " << chk.exposure_problem << "\n";
+            return gui::kServiceAccessDenied;
+        }
         std::string pws = pw.reveal();
         pw.clear();
         std::string err;

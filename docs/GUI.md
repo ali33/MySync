@@ -132,20 +132,22 @@ Câu lớn đổi theo tình hình, màu cũng đổi (icon khay đổi theo): *
 Nút **Chạy cả khi chưa đăng nhập máy (cài dịch vụ)** hoạt động cho cả tài khoản quản trị lẫn tài khoản chuẩn:
 
 - Dịch vụ chạy bằng **tài khoản của người bấm nút**; người quản trị (nếu bạn là tài khoản chuẩn) chỉ cấp phép cài qua hộp xin quyền của Windows. Bên trong, engine luôn chạy với token hạn chế, kể cả khi tài khoản của bạn là quản trị viên.
-- Trước khi xin quyền, hộp xác nhận liệt kê thư mục dịch vụ sẽ đọc và nơi sẽ ghi, thư mục ngoài hồ sơ của bạn (cần bạn đồng ý bằng cách bấm *Tiếp tục*), vân tay ngắn của khoá, tên tài khoản chạy dịch vụ, và nói rõ bạn là quản trị viên hay tài khoản chuẩn.
+- Trước khi xin quyền, hộp xác nhận **rút gọn** chỉ nói 5 điều bằng lời thường: MySync sẽ chạy cả khi chưa ai đăng nhập; dịch vụ chạy bằng tài khoản của bạn (người quản trị chỉ cấp phép cài); sẽ đọc / sẽ ghi những thư mục nào (nhiều thì "và N mục khác"); Windows sẽ hỏi quyền quản trị, bạn bấm Có; nếu có gì sai MySync tự trả mọi thứ về như cũ. Riêng thư mục NGOÀI hồ sơ của bạn (cần bạn đồng ý bằng cách bấm *Tiếp tục*) luôn hiện ngay ở phần chính. Phần kỹ thuật (đầy đủ thư mục, vân tay khoá, token hạn chế, quyền mạng, tài khoản quản trị chạy quyền thường) nằm trong nút **Chi tiết ▾**, đóng sẵn.
 - Windows cần **mật khẩu** của tài khoản để dịch vụ đăng nhập khi chưa có ai ngồi máy (tài khoản Microsoft: mật khẩu tài khoản, không phải mã PIN Windows Hello). Mật khẩu được hỏi một lần, đi thẳng tới bước cài qua một kênh riêng, không vào tệp hay nhật ký, và bị xoá khỏi bộ nhớ ngay sau khi dùng. Nhập sai thì được hỏi lại (sai 5 lần liền thì chờ 30 giây để khỏi khoá tài khoản); tài khoản không có mật khẩu thì báo rõ không cài được và đưa sang *Tự chạy khi tôi đăng nhập*.
 - Khi bạn đổi mật khẩu Windows, dịch vụ không đăng nhập được nữa: màn Trạng thái hiện băng hổ phách với nút **Cập nhật mật khẩu**.
 - Lỗi từ khung dịch vụ (không tạo được token hạn chế, engine bị từ chối) hiện nguyên văn ở màn Trạng thái; dòng "service token: …" mà dịch vụ báo về được hiện ngay dưới câu trạng thái.
 
-![Hộp xác nhận cài dịch vụ](images/gui-08-dich-vu.png)
+![Hộp xác nhận cài dịch vụ (đóng)](images/gui-08-dich-vu.png)
 
-(Ảnh chụp hộp xác nhận thật; tên tài khoản và tên máy được thay bằng tên mẫu `MAY-TINH\nguoidung` bằng `--redact-account`. Các dòng lưu ý do lõi trả về dưới dạng khoá thông điệp nên hộp hiện toàn tiếng Việt. Hộp mở được mà không cần quyền quản trị; hộp xin quyền của Windows chỉ hiện sau khi bấm Tiếp tục.)
+![Hộp xác nhận cài dịch vụ (mở Chi tiết)](images/gui-08b-chi-tiet.png)
+
+(Ảnh chụp hộp xác nhận thật; tên tài khoản và tên máy được thay bằng tên mẫu `MAY-TINH\nguoidung` bằng `--redact-account`. Phần Chi tiết: các dòng lưu ý do lõi trả về dưới dạng khoá thông điệp nên hộp hiện toàn tiếng Việt. Hộp mở được mà không cần quyền quản trị; hộp xin quyền của Windows chỉ hiện sau khi bấm Tiếp tục.)
 
 ### Quy ước đã áp dụng cho chế độ Đơn giản
 Mọi chờ có chỉ báo động (BusyIndicator, vô hiệu hoá phần nội dung để không bấm chồng); lỗi nguyên văn trên băng đỏ/hổ phách, kể cả ngoại lệ trong luồng nền (`run_async`); tiếng Việt mặc định và tiếng Anh; không thao tác UI từ luồng nền (kết quả luôn qua `CallAfter`); không hiện ID trần (hiện tên watch + nơi lưu). Logic thuần nằm ở `gui/simple_model.*` (câu trạng thái, tiến độ, trạng thái từng bước của trình hướng dẫn, kiểm mã ghép, xếp địa chỉ IP), test headless ở `tests/test_gui_simple_viewmodel.cpp`.
 
 ### Tham số dòng lệnh thêm (kiểm thử)
-`--user-dir=<thư mục>` · `--screenshot=<png>` `--shot-delay=<ms>` `--shot-exit` (chụp cửa sổ rồi thoát) · `--auto-src=<thư mục> --auto-dst=<thư mục>` (tự đi hết trình hướng dẫn bằng sự kiện giao diện thật) · `--auto-recv=<thư mục>` (bật nhận file vào thư mục đó) · `--wizard-stop=0|1|2` (dừng trình hướng dẫn tự lái ở bước đó) · `--show-advanced` · `--demo-ip=<ip>` (ảnh tài liệu: hiện địa chỉ mẫu) · `--auto-svc-dialog --dialog-shot=<png> [--redact-account]` (mở hộp xác nhận cài dịch vụ, chụp rồi tự bấm Huỷ: không cài gì). `--screenshot` chỉ vẽ lại chính cửa sổ MySync (PrintWindow), không chụp màn hình nên không lọt cửa sổ khác.
+`--user-dir=<thư mục>` · `--screenshot=<png>` `--shot-delay=<ms>` `--shot-exit` (chụp cửa sổ rồi thoát) · `--auto-src=<thư mục> --auto-dst=<thư mục>` (tự đi hết trình hướng dẫn bằng sự kiện giao diện thật) · `--auto-recv=<thư mục>` (bật nhận file vào thư mục đó) · `--wizard-stop=0|1|2` (dừng trình hướng dẫn tự lái ở bước đó) · `--show-advanced` · `--demo-ip=<ip>` (ảnh tài liệu: hiện địa chỉ mẫu) · `--auto-svc-dialog --dialog-shot=<png> [--dialog-shot-open=<png>] [--redact-account]` (mở hộp xác nhận cài dịch vụ, chụp rồi tự bấm Huỷ: không cài gì). `--screenshot` chỉ vẽ lại chính cửa sổ MySync (PrintWindow), không chụp màn hình nên không lọt cửa sổ khác.
 
 ### Hạn chế của chế độ Đơn giản
 - Một GUI (một bộ engine) cho mỗi người dùng; hai thư mục đồng bộ cùng lúc bởi hai tiến trình bị chặn bằng khoá `<thư mục>/__sync/engine.lock`.

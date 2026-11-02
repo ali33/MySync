@@ -58,6 +58,7 @@ public:
         if (!demo_ip_.empty()) SimpleHost::set_demo_address(demo_ip_);
         simple_test_hooks().auto_stop = wizard_stop_;
         simple_test_hooks().dialog_shot = dialog_shot_;
+        simple_test_hooks().dialog_shot_open = dialog_shot_open_;
         simple_test_hooks().redact_account = redact_;
         if (show_adv_) f->CallAfter([f] { f->SimpleShowAdvanced(true); });
         if (auto_svc_dialog_) f->CallAfter([f, this] {
@@ -104,6 +105,7 @@ public:
         p.AddSwitch("", "show-advanced", "test: show the advanced tabs under the Simple screen");
         p.AddSwitch("", "auto-svc-dialog", "test: open the service-install confirmation (cancelled after the screenshot)");
         p.AddSwitch("", "redact-account", "documentation screenshots: show a sample account name instead of the real one");
+        p.AddOption("", "dialog-shot-open", "test: PNG of that dialog with the Details part opened", wxCMD_LINE_VAL_STRING);
         p.AddOption("", "dialog-shot", "test: PNG of that confirmation dialog", wxCMD_LINE_VAL_STRING);
         p.AddSwitch("", "no-code", "test: with --auto-recv, receive without opening a pairing code");
         p.AddOption("", "auto-recv", "test: turn on receiving into this folder", wxCMD_LINE_VAL_STRING);
@@ -133,6 +135,7 @@ public:
         no_code_ = p.Found("no-code");
         auto_svc_dialog_ = p.Found("auto-svc-dialog");
         if (p.Found("dialog-shot", &c)) dialog_shot_ = S(c);
+        if (p.Found("dialog-shot-open", &c)) dialog_shot_open_ = S(c);
         return wxApp::OnCmdLineParsed(p);
     }
 
@@ -178,7 +181,7 @@ private:
     int shot_delay_ = 2500;
     int wizard_stop_ = -1;
     bool show_adv_ = false, auto_svc_dialog_ = false, redact_ = false, no_code_ = false;
-    std::string demo_ip_, dialog_shot_;
+    std::string demo_ip_, dialog_shot_, dialog_shot_open_;
     bool shot_exit_ = false;
 
     static void DumpIcons(const std::string& path) {

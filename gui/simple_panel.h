@@ -36,7 +36,8 @@ inline void sp_font(wxWindow* w, double scale, bool bold = true) {
 struct SimpleTestHooks {
     int auto_stop = -1;         // --wizard-stop: dừng trình hướng dẫn tự lái ở bước này (0..2)
     bool redact_account = false;   // --redact-account: ảnh tài liệu thay tên người dùng/tên máy thật bằng tên mẫu
-    std::string dialog_shot;    // --dialog-shot: hộp xác nhận cài dịch vụ tự chụp ra PNG rồi tự đóng (KHÔNG cài gì)
+    std::string dialog_shot;
+    std::string dialog_shot_open;   // --dialog-shot-open: PNG của hộp khi đã mở phần Chi tiết    // --dialog-shot: hộp xác nhận cài dịch vụ tự chụp ra PNG rồi tự đóng (KHÔNG cài gì)
 };
 SimpleTestHooks& simple_test_hooks();
 // Vẽ lại CHÍNH cửa sổ này ra PNG (không chụp màn hình nên cửa sổ khác đè lên không lọt vào ảnh). Trả "" nếu được.

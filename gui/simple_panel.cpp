@@ -140,12 +140,24 @@ std::string redact_real_account(std::string t) {
 // Hộp xác nhận có chữ dài (danh sách thư mục, cảnh báo): chữ tự xuống dòng, nút Tiếp tục / Huỷ.
 class TextConfirmDialog : public wxDialog {
 public:
-    TextConfirmDialog(wxWindow* parent, const std::string& text, bool warning)
+    // main: phần chính; detail: phần kỹ thuật (rỗng = không có nút Chi tiết). Chi tiết đóng sẵn.
+    TextConfirmDialog(wxWindow* parent, const std::string& main, const std::string& detail = "")
         : wxDialog(parent, wxID_ANY, L("app.title"), wxDefaultPosition, wxDefaultSize, wxDEFAULT_DIALOG_STYLE), timer_(this) {
+        const bool redact = simple_test_hooks().redact_account;
         auto* v = new wxBoxSizer(wxVERTICAL);
-        auto* t = new WrapText(this, W(simple_test_hooks().redact_account ? redact_real_account(text) : text));
-        t->SetMinSize(wxSize(600, -1));
+        auto* t = new WrapText(this, W(redact ? redact_real_account(main) : main));
+        t->SetMinSize(wxSize(560, -1));
         v->Add(t, 0, wxEXPAND | wxALL, 16);
+        if (!detail.empty()) {
+            more_ = new wxButton(this, wxID_ANY, L("simple.svc.details.show"), wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+            v->Add(more_, 0, wxLEFT | wxRIGHT, 16);
+            detail_ = new WrapText(this, W(redact ? redact_real_account(detail) : detail));
+            detail_->SetTextColour(wxColour(0x44, 0x44, 0x44));
+            detail_->SetMinSize(wxSize(560, -1));
+            detail_->Hide();
+            v->Add(detail_, 0, wxEXPAND | wxALL, 16);
+            more_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ToggleDetail(); });
+        }
         auto* bs = new wxStdDialogButtonSizer;
         auto* ok = new wxButton(this, wxID_OK, L("simple.svc.yes"));
         bs->AddButton(ok);
@@ -154,13 +166,24 @@ public:
         v->Add(bs, 0, wxEXPAND | wxALL, 12);
         SetSizerAndFit(v);
         ok->SetFocus();
-        (void)warning;
         CentreOnParent();
         const std::string& shot = simple_test_hooks().dialog_shot;
         if (!shot.empty()) {
             Bind(wxEVT_TIMER, [this, shot](wxTimerEvent&) {
-                std::string e = save_window_png(this, shot);
-                if (!e.empty()) wxLogError("%s", W(e));
+                const std::string& open_shot = simple_test_hooks().dialog_shot_open;
+                if (step_ == 0) {
+                    std::string e = save_window_png(this, shot);
+                    if (!e.empty()) wxLogError("%s", W(e));
+                    if (!open_shot.empty() && detail_) {  // chụp thêm bản mở Chi tiết
+                        ToggleDetail();
+                        step_ = 1;
+                        timer_.StartOnce(1200);
+                        return;
+                    }
+                } else {
+                    std::string e = save_window_png(this, open_shot);
+                    if (!e.empty()) wxLogError("%s", W(e));
+                }
                 EndModal(wxID_CANCEL);  // chụp xong thì HUỶ: không cài gì
             });
             timer_.StartOnce(1200);
@@ -168,7 +191,18 @@ public:
     }
 
 private:
+    void ToggleDetail() {
+        bool show = !detail_->IsShown();
+        detail_->Show(show);
+        more_->SetLabel(L(show ? "simple.svc.details.hide" : "simple.svc.details.show"));
+        Layout();
+        Fit();
+        CentreOnParent();
+    }
     wxTimer timer_;
+    wxButton* more_ = nullptr;
+    WrapText* detail_ = nullptr;
+    int step_ = 0;
 };
 }  // namespace
 
@@ -400,7 +434,7 @@ void StatusPage::ToServiceClick() {
     bool to_service = !c_.service_mode();
     std::string account = simple::current_account_name();
     if (!to_service) {
-        TextConfirmDialog q(this, tr("simple.svc.confirm.back"), false);
+        TextConfirmDialog q(this, tr("simple.svc.confirm.back"));
         if (q.ShowModal() != wxID_OK) return;
         RunUpgrade(false, account, nullptr);
         return;
@@ -431,7 +465,8 @@ void StatusPage::ToServiceClick() {
 #else
             const bool windows = false;
 #endif
-            TextConfirmDialog q(this, service_confirm_text(s, account, windows), true);
+            ConfirmParts parts = service_confirm_parts(s, account, windows);
+            TextConfirmDialog q(this, parts.main, parts.detail);
             if (q.ShowModal() != wxID_OK) {
                 Refresh2();
                 return;

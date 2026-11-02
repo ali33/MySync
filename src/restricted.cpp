@@ -33,6 +33,35 @@ unsigned long last_rid(const std::string& sid) {
 
 }  // namespace
 
+// Local groups known only by NAME (their SID differs from machine to machine): docker-users and DnsAdmins. Looked up once; a name
+// that does not exist here is simply skipped. Not Windows: none.
+const std::vector<std::string>& named_dangerous_sids() {
+    static const std::vector<std::string> v = [] {
+        std::vector<std::string> out;
+#ifdef _WIN32
+        for (const wchar_t* name : {L"docker-users", L"DnsAdmins"}) {
+            DWORD sn = 0, dn = 0;
+            SID_NAME_USE use;
+            LookupAccountNameW(nullptr, name, nullptr, &sn, nullptr, &dn, &use);
+            if (!sn || !dn) continue;
+            std::vector<unsigned char> sid(sn);
+            std::wstring dom(dn, L' ');
+            if (!LookupAccountNameW(nullptr, name, sid.data(), &sn, &dom[0], &dn, &use)) continue;
+            LPWSTR s = nullptr;
+            if (ConvertSidToStringSidW(sid.data(), &s)) {
+                int n = WideCharToMultiByte(CP_UTF8, 0, s, -1, nullptr, 0, nullptr, nullptr);
+                std::string txt(n > 1 ? static_cast<size_t>(n - 1) : 0, ' ');
+                if (n > 1) WideCharToMultiByte(CP_UTF8, 0, s, -1, &txt[0], n, nullptr, nullptr);
+                out.push_back(txt);
+                LocalFree(s);
+            }
+        }
+#endif
+        return out;
+    }();
+    return v;
+}
+
 bool is_dangerous_group_sid(const std::string& sid) {
     static const char* const builtin[] = {
         "S-1-5-32-544",   // Administrators
@@ -44,6 +73,11 @@ bool is_dangerous_group_sid(const std::string& sid) {
         "S-1-5-32-552",   // Replicator
         "S-1-5-32-556",   // Network Configuration Operators
         "S-1-5-32-569",   // Cryptographic Operators
+        "S-1-5-32-553",   // RAS and IAS Servers
+        "S-1-5-32-575",   // RDS Remote Access Servers
+        "S-1-5-32-576",   // RDS Endpoint Servers
+        "S-1-5-32-577",   // RDS Management Servers
+        "S-1-5-32-579",   // Access Control Assistance Operators
         "S-1-5-32-562",   // Distributed COM Users
         "S-1-5-32-573",   // Event Log Readers
         "S-1-5-32-574",   // Certificate Service DCOM Access
@@ -55,6 +89,8 @@ bool is_dangerous_group_sid(const std::string& sid) {
     };
     for (const char* b : builtin)
         if (sid == b) return true;
+    for (const std::string& n : named_dangerous_sids())
+        if (sid == n) return true;
     if (starts_with(sid, "S-1-5-21-")) {
         unsigned long rid = last_rid(sid);
         // Cert Publishers 517, Domain / Schema / Enterprise admins 512 / 518 / 519, Policy creators 520, Key Admins 526 / 527
@@ -65,7 +101,8 @@ bool is_dangerous_group_sid(const std::string& sid) {
 
 bool is_strong_privilege(const std::string& name) {
     static const char* const strong[] = {"SeDebugPrivilege",   "SeTcbPrivilege",           "SeLoadDriverPrivilege", "SeBackupPrivilege",
-                                         "SeRestorePrivilege", "SeTakeOwnershipPrivilege", "SeCreateTokenPrivilege", "SeSecurityPrivilege"};
+                                         "SeRestorePrivilege", "SeTakeOwnershipPrivilege", "SeCreateTokenPrivilege", "SeSecurityPrivilege",
+                                         "SeManageVolumePrivilege"};
     for (const char* s : strong)
         if (name == s) return true;
     return false;

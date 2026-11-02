@@ -79,7 +79,7 @@ Ghép máy, cấu hình mẫu và dịch vụ: `docs/SETUP.md`, `docs/SERVICE.md
 
 ## Cài làm dịch vụ (từng bước)
 
-> **Lưu ý trung thực:** việc cài dịch vụ thật (Windows SCM, systemd) **chưa được kiểm trên máy thật** (xem `docs/STATUS.md`).
+> **Lưu ý trung thực:** việc cài dịch vụ thật (Windows SCM, systemd) **chưa được kiểm trên máy thật** (xem `docs/STATUS.md`; kịch bản kiểm tay: `docs/MANUAL-TEST.md`).
 > Đã kiểm: sinh tham số/unit, kiểm tên dịch vụ, chặn chèn lệnh, biên dịch. Hãy thử trên máy thử trước khi triển khai.
 > Chi tiết quyền và hành vi: `docs/SERVICE.md`.
 
@@ -131,3 +131,4 @@ Bốn tab: **Trạng thái** (kèm icon khay đổi màu), **Cấu hình** (sử
 - `docs/SERVER-TO-SERVER.md` — ghép/vận hành giữa các máy chủ bằng CLI (peer, peers.d, xoay khoá, thu hồi, health)
 - `docs/GUI.md`, `docs/GUI-CORE.md` — giao diện đồ hoạ và kênh điều khiển cục bộ
 - `docs/STATUS.md` — đã kiểm gì, chưa kiểm gì, hạn chế đã biết
+- `docs/MANUAL-TEST.md` — kịch bản kiểm tay trên VM/máy phụ (dịch vụ, UAC, khởi động lại, ghép cặp, ca bảo mật) với ô ✅/❌

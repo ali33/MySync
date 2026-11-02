@@ -501,6 +501,50 @@ TEST(simple_password_flow_locks_after_repeated_wrong_attempts) {
     CHECK(f.submit("PC\\Lan", true, t + 31001));
 }
 
+TEST(simple_service_confirm_is_short_and_technical_part_is_in_details) {
+    LangGuard g(Lang::Vi);
+    simple::MigrationSummary m;
+    m.sources = {"D:/A", "D:/B", "D:/C", "D:/D"};
+    m.destinations = {"E:/Sao-luu"};
+    m.key_identity = "ab12 cd34";
+    m.account_is_admin = true;
+    m.notes = {{"simple.svc.note.runs_as", "PC\\Lan"}, {"simple.svc.note.admin_acct", "PC\\Lan"}, {"simple.svc.note.keycopy", ""}};
+    auto p = service_confirm_parts(m, "PC\\Lan", true);
+    // phần chính: đúng 5 dòng, không thuật ngữ, không vân tay
+    int lines = 1;
+    for (char c : p.main) lines += c == '\n';
+    CHECK_EQ(lines, 5);
+    CHECK_EQ(p.main_lines, 5);
+    CHECK(has(p.main, "chạy cả khi chưa ai đăng nhập"));
+    CHECK(has(p.main, "người quản trị chỉ cấp phép cài"));
+    CHECK(has(p.main, "PC\\Lan"));
+    CHECK(has(p.main, "Windows sẽ hỏi quyền quản trị"));
+    CHECK(has(p.main, "tự trả mọi thứ về như cũ"));
+    CHECK(has(p.main, "D:/A, D:/B và 2 mục khác"));   // danh sách rút gọn
+    for (const char* jargon : {"token", "toàn vẹn", "Medium", "ab12 cd34", "nhóm quản trị"}) CHECK(!has(p.main, jargon));
+    // phần chi tiết: đầy đủ, kỹ thuật
+    CHECK(has(p.detail, "ab12 cd34"));
+    CHECK(has(p.detail, "D:/D"));
+    CHECK(has(p.detail, "token"));
+    // không có thư mục ngoài hồ sơ -> không có đoạn cảnh báo ngoài hồ sơ ở phần chính
+    CHECK(!has(p.main, "ngoài hồ sơ"));
+    // CÓ thư mục ngoài hồ sơ -> hiện ở phần chính bằng lời thường (người dùng phải đồng ý)
+    m.needs_confirmation = {"D:/Ngoai"};
+    auto q = service_confirm_parts(m, "PC\\Lan", true);
+    CHECK(has(q.main, "ngoài hồ sơ của bạn"));
+    CHECK(has(q.main, "D:/Ngoai"));
+    CHECK(has(q.main, "Chỉ bấm Tiếp tục nếu đây đúng là thư mục của bạn"));
+    CHECK_EQ(q.main_lines, 5);
+    // tiếng Anh cũng có đủ
+    LangGuard e(Lang::En);
+    auto pe = service_confirm_parts(m, "PC\\Lan", true);
+    CHECK(has(pe.main, "even when nobody is signed in"));
+    CHECK(!has(pe.main, "?simple."));
+    // Linux: không nhắc Windows
+    auto pl = service_confirm_parts(m, "alice", false);
+    CHECK(!has(pl.main, "Windows"));
+}
+
 TEST(simple_service_confirmation_shows_the_core_notes_in_the_users_language) {
     LangGuard g(Lang::Vi);
     simple::MigrationSummary s;

@@ -140,6 +140,13 @@ std::string friendly_error(const std::string& what);
 // Hộp xác nhận TRƯỚC khi xin quyền quản trị để chuyển sang dịch vụ: thư mục nguồn, nơi lưu, danh tính khoá (vân tay
 // ngắn), tài khoản chạy, các cảnh báo của lõi và lời nhắc quyền cao. Chuỗi động giữ nguyên văn.
 std::string service_confirm_text(const simple::MigrationSummary& s, const std::string& account, bool windows);
+// Hộp xác nhận rút gọn: `main` = 5 dòng lời thường (+ đoạn cảnh báo thư mục ngoài hồ sơ nếu có, vì đó là việc người dùng
+// thật sự phải đồng ý); `detail` = phần kỹ thuật (đầy đủ thư mục, vân tay khoá, ghi chú về token / quyền / mạng), hộp để đóng sẵn.
+struct ConfirmParts {
+    std::string main, detail;
+    int main_lines = 0;   // số dòng mục chính (không tính đoạn cảnh báo ngoài hồ sơ)
+};
+ConfirmParts service_confirm_parts(const simple::MigrationSummary& s, const std::string& account, bool windows);
 
 // ---- nhập mật khẩu để dịch vụ chạy bằng chính tài khoản người dùng (Windows). Mô hình KHÔNG BAO GIỜ giữ mật khẩu:
 // mật khẩu chỉ nằm trong hộp thoại và một SecretString đi thẳng tới bước cài đặt.
