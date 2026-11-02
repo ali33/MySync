@@ -3,3 +3,5 @@
 // Author: Nguyễn Đức Sơn
 #include <winuser.h>
 1 RT_MANIFEST "mysync-gui.manifest"
+// Biểu tượng của tệp .exe (Explorer, lối tắt, thanh tác vụ khi chưa có biểu tượng trạng thái).
+appicon ICON "mysync.ico"

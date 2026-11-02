@@ -43,7 +43,9 @@ else()
   set(wxBUILD_INSTALL OFF CACHE BOOL "" FORCE)
   set(wxBUILD_PRECOMP ON CACHE STRING "" FORCE)
   set(wxUSE_DPI_AWARE_MANIFEST "none" CACHE STRING "" FORCE) # manifest riêng của mysync-gui
-  foreach(_o HTML RICHTEXT AUI PROPGRID RIBBON STC XRC WEBVIEW MEDIACTRL OPENGL XML WEBREQUEST DEBUGREPORT SOUND WXHTML_HELP HELP)
+  # Cũng tắt: mạng (wxnet), regex, ảnh JPEG/TIFF — GUI không dùng (icon là PNG, mạng đi qua lõi MySync).
+  foreach(_o HTML RICHTEXT AUI PROPGRID RIBBON STC XRC WEBVIEW MEDIACTRL OPENGL XML WEBREQUEST DEBUGREPORT SOUND WXHTML_HELP HELP
+             SOCKETS PROTOCOL URL FS_INET IPC REGEX LIBJPEG LIBTIFF)
     set(wxUSE_${_o} OFF CACHE BOOL "" FORCE)
   endforeach()
   if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
@@ -54,6 +56,17 @@ else()
   endif()
   FetchContent_MakeAvailable(wxWidgets)
   set(MYSYNC_WX_LIBS wx::adv wx::core wx::base)
+  # Giao diện không cần -O3: tối ưu theo cỡ cho riêng wx (lõi đồng bộ của MySync vẫn giữ -O2/-O3).
+  # wx dựng KHÔNG LTO: MinGW GCC 15.2 gãy (internal compiler error ở bookctrl.cpp) khi LTO cả wx; LTO chỉ cho mã MySync.
+  foreach(_t wxbase wxcore wxadv wxpng wxzlib wxexpat)
+    if(TARGET ${_t})
+      set_target_properties(${_t} PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF
+                            INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL OFF)
+      if(NOT MSVC)
+        target_compile_options(${_t} PRIVATE "$<$<OR:$<CONFIG:Release>,$<CONFIG:MinSizeRel>>:-Os>")
+      endif()
+    endif()
+  endforeach()
 endif()
 
 file(GLOB GUI_APP_SRC CONFIGURE_DEPENDS gui/*.cpp)
@@ -63,6 +76,10 @@ if(WIN32)
   list(APPEND GUI_EXTRA gui/mysync-gui.rc)
 endif()
 add_executable(mysync-gui WIN32 ${GUI_APP_SRC} ${GUI_EXTRA})
+# Mã có header wx cũng không LTO: trộn object LTO (thunk của lớp wx) với wx không LTO làm ld MinGW báo
+# "defined in discarded section". Lõi mysync_core (không dùng wx) vẫn LTO.
+set_target_properties(mysync-gui PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF
+                      INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL OFF)
 target_link_libraries(mysync-gui PRIVATE mysync_gui_model mysync_core ${MYSYNC_WX_LIBS})
 target_include_directories(mysync-gui PRIVATE gui)
 if(MINGW)
