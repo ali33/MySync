@@ -168,11 +168,12 @@ void SecureChannel::wipe() {
     secure_wipe(send_key_, sizeof send_key_);
     secure_wipe(recv_key_, sizeof recv_key_);
     send_ctr_ = recv_ctr_ = 0;
+    secure_wipe(hh_.data(), hh_.size());
     dead_ = true;
 }
 
 SecureChannel::SecureChannel(SecureChannel&& o) noexcept
-    : sock_(std::move(o.sock_)), send_ctr_(o.send_ctr_), recv_ctr_(o.recv_ctr_), peer_(o.peer_), dead_(o.dead_) {
+    : sock_(std::move(o.sock_)), send_ctr_(o.send_ctr_), recv_ctr_(o.recv_ctr_), peer_(o.peer_), hh_(o.hh_), dead_(o.dead_) {
     std::memcpy(send_key_, o.send_key_, 32);
     std::memcpy(recv_key_, o.recv_key_, 32);
     o.wipe();
@@ -187,6 +188,7 @@ SecureChannel& SecureChannel::operator=(SecureChannel&& o) noexcept {
         send_ctr_ = o.send_ctr_;
         recv_ctr_ = o.recv_ctr_;
         peer_ = o.peer_;
+        hh_ = o.hh_;
         dead_ = o.dead_;
         o.wipe();
     }
@@ -194,12 +196,19 @@ SecureChannel& SecureChannel::operator=(SecureChannel&& o) noexcept {
 }
 
 SecureChannel SecureChannel::make(net::Socket&& s, const uint8_t send_key[32], const uint8_t recv_key[32],
-                                  const PubKey& peer) {
+                                  const PubKey& peer, const uint8_t sym_hash[32]) {
     SecureChannel ch;
     ch.sock_ = std::move(s);
     std::memcpy(ch.send_key_, send_key, 32);
     std::memcpy(ch.recv_key_, recv_key, 32);
     ch.peer_ = peer;
+    {   // 64 bytes out of the 32-byte Noise hash: BLAKE2b-512("MySync-handshake-hash-v1" || h)
+        static const char kTag[] = "MySync-handshake-hash-v1";
+        uint8_t in[sizeof kTag - 1 + 32];
+        std::memcpy(in, kTag, sizeof kTag - 1);
+        std::memcpy(in + sizeof kTag - 1, sym_hash, 32);
+        crypto_blake2b(ch.hh_.data(), 64, in, sizeof in);
+    }
     ch.dead_ = false;
     ch.sock_.set_timeouts(0, 0);
     return ch;
@@ -243,7 +252,7 @@ SecureChannel SecureChannel::client(net::Socket&& s, const KeyPair& self, const 
         st.decrypt_and_hash(m2 + 32, 16);
 
         st.split(k_send, k_recv);
-        SecureChannel ch = make(std::move(s), k_send, k_recv, server_pub);
+        SecureChannel ch = make(std::move(s), k_send, k_recv, server_pub, st.h);
         wipe_all();
         return ch;
     } catch (const AuthFailed&) {
@@ -336,7 +345,7 @@ SecureChannel SecureChannel::server(net::Socket&& s, const std::vector<const Key
         send_by(s, m2.data(), m2.size(), deadline);
 
         st.split(k_recv, k_send);
-        SecureChannel ch = make(std::move(s), k_send, k_recv, rs);
+        SecureChannel ch = make(std::move(s), k_send, k_recv, rs, st.h);
         wipe_all();
         return ch;
     } catch (...) {

@@ -6,12 +6,24 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <thread>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#endif
 
 #include "mysync/config.h"
 #include "mysync/gui/config_io.h"
@@ -20,8 +32,12 @@
 #include "mysync/gui/service_ctl.h"
 #include "mysync/gui/trust.h"
 #include "mysync/keys.h"
+#include "mysync/linkcheck.h"
 #include "mysync/peers.h"
 #include "mysync/quick_setup.h"
+#include "mysync/simple/invite.h"
+#include "mysync/simple/pair_code.h"
+#include "mysync/simple/pairing.h"
 
 namespace fs = std::filesystem;
 
@@ -69,6 +85,20 @@ public:
             }
         }
         return hit;
+    }
+    // Every occurrence of the option, in order.
+    std::vector<std::string> values(std::initializer_list<const char*> names) {
+        std::vector<std::string> out;
+        for (size_t i = 0; i < v_.size();) {
+            if (is_one_of(v_[i], names)) {
+                if (i + 1 >= v_.size()) usage("option " + v_[i] + " needs a value");
+                out.push_back(v_[i + 1]);
+                v_.erase(v_.begin() + static_cast<std::ptrdiff_t>(i), v_.begin() + static_cast<std::ptrdiff_t>(i) + 2);
+            } else {
+                ++i;
+            }
+        }
+        return out;
     }
     // What is left: positional words. Anything that still looks like an option is an error.
     std::vector<std::string> positional() const {
@@ -481,7 +511,7 @@ int cmd_peer(const std::vector<std::string>& v) {
     if (v.size() < 3) usage("usage: mysync peer add|remove|revoke|retire-key|list ...");
     const std::string sub = v[2];
     Args a(v, 3);
-    std::string config, name, perm, subdir, svc, ms, mb;
+    std::string config, name, perm, subdir, root, svc, ms, mb;
     a.value({"-c", "--config", "--server-config"}, config);
     a.value({"--service-name"}, svc);
     bool changed_exit = a.flag({"--changed-exit"}), no_reload = a.flag({"--no-reload"}), json = a.flag({"--json"});
@@ -512,6 +542,7 @@ int cmd_peer(const std::vector<std::string>& v) {
         a.value({"--name"}, name);
         a.value({"--perm"}, perm);
         bool have_subdir = a.value({"--subdir", "--prefix"}, subdir);
+        bool have_root = a.value({"--root"}, root);
         a.value({"--max-sessions"}, ms);
         a.value({"--max-bandwidth-kbps"}, mb);
         PeerSpec s;
@@ -528,6 +559,7 @@ int cmd_peer(const std::vector<std::string>& v) {
         }
         s.name = name;
         s.read_only = perm == "ro";
+        if (have_root) s.root = root;  // an absolute folder this peer is confined to (instead of the server root)
         if (have_subdir) s.prefix = subdir;  // not given: an existing peer keeps its folder, a new one gets the whole root
         if (!ms.empty()) s.max_sessions = parse_u32(ms, "--max-sessions");
         if (!mb.empty()) s.max_bandwidth_kbps = parse_u32(mb, "--max-bandwidth-kbps");
@@ -560,7 +592,7 @@ int cmd_peer(const std::vector<std::string>& v) {
                 ks.push_back(jq(key_to_hex(c.public_key)));
                 for (const auto& k : c.extra_keys) ks.push_back(jq(key_to_hex(k)));
                 items.push_back("{\"name\":" + jq(c.name) + ",\"access\":" + jq(c.read_only ? "ro" : "rw") + ",\"subdir\":" +
-                                jq(c.prefix) + ",\"public_key\":" + jq(key_to_hex(c.public_key)) + ",\"keys\":" + jarr(ks) +
+                                jq(c.prefix) + ",\"root\":" + jq(c.root) + ",\"public_key\":" + jq(key_to_hex(c.public_key)) + ",\"keys\":" + jarr(ks) +
                                 ",\"max_sessions\":" + jn(c.max_sessions) + ",\"source\":" + jq(c.source.empty() ? "main" : "peers.d/" + c.source) + "}");
             }
             std::cout << "{\"peers\":" << jarr(items) << ",\"peer_file_errors\":" << jn(rep.bad) << ",\"warnings\":" << jstrs(rep.warnings) << "}\n";
@@ -690,6 +722,362 @@ int cmd_quick_client(Args a) {
     if (!a.positional().empty()) usage("usage: mysync quick-client --server host:port --server-key <hex> --dir <folder> [--name N] [--config-dir D] [--service] [--force] [--fix-permissions] [--json]");
     if (o.server.empty() || o.server_key.empty() || o.dir.empty()) usage("--server, --server-key and --dir are required");
     return quick_report(quick_client(o), json, want_service, svc, changed_exit);
+}
+
+// ---------------------------------------------------------------------------------------------- invite
+// `mysync invite create|list|revoke`: the single invitation code (simple/invite.h) made by the administrator of a server.
+// An invite made here always redeems without anybody confirming (ask = false) and is not affected by [server] pairing.
+
+// JSON string with every non-ASCII character as \uXXXX (UTF-16 surrogate pairs above U+FFFF), like quick_result_json.
+std::string jq_ascii(const std::string& s) {
+    std::string r = "\"";
+    auto u = [&](unsigned v) {
+        char b[8];
+        std::snprintf(b, sizeof b, "\\u%04x", v);
+        r += b;
+    };
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80) {
+            if (c == '"') r += "\\\"";
+            else if (c == '\\') r += "\\\\";
+            else if (c < 0x20 || c == 0x7F) u(c);
+            else r += static_cast<char>(c);
+            ++i;
+            continue;
+        }
+        size_t n = (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+        uint32_t cp = n == 1 ? 0xFFFD : (c & (0xFFu >> (n + 1)));
+        for (size_t k = 1; k < n; ++k) cp = (cp << 6) | (i + k < s.size() ? (static_cast<unsigned char>(s[i + k]) & 0x3Fu) : 0u);
+        i += n;
+        if (cp >= 0x10000) {
+            cp -= 0x10000;
+            u(0xD800 + (cp >> 10));
+            u(0xDC00 + (cp & 0x3FF));
+        } else {
+            u(cp);
+        }
+    }
+    return r + "\"";
+}
+
+int parse_ttl_seconds(const std::string& t) {
+    if (t.empty()) usage("--ttl needs a value such as 90m, 24h, 3d or a number of seconds");
+    char unit = t.back();
+    std::string digits = t;
+    uint64_t mul = 1;
+    if (unit == 's' || unit == 'm' || unit == 'h' || unit == 'd') {
+        digits = t.substr(0, t.size() - 1);
+        mul = unit == 's' ? 1 : unit == 'm' ? 60 : unit == 'h' ? 3600 : 86400;
+    }
+    uint64_t secs = uint64_t(parse_u32(digits, "--ttl")) * mul;
+    if (secs < 1 || secs > uint64_t(simple::kInviteMaxTtlSeconds)) usage("--ttl must be between 1 second and 30 days");
+    return int(secs);
+}
+
+std::vector<std::string> local_ipv4_addresses() {
+    std::vector<std::string> out;
+    auto keep = [&](const char* ip) {
+        std::string s = ip;
+        if (s.rfind("127.", 0) == 0 || s.rfind("169.254.", 0) == 0 || s == "0.0.0.0") return;
+        if (std::find(out.begin(), out.end(), s) == out.end()) out.push_back(s);
+    };
+#ifdef _WIN32
+    WSADATA wsa;
+    bool started = WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+    char host[256] = {};
+    if (gethostname(host, sizeof host - 1) == 0) {
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        addrinfo* res = nullptr;
+        if (getaddrinfo(host, nullptr, &hints, &res) == 0) {
+            for (auto* p = res; p; p = p->ai_next) {
+                char b[INET_ADDRSTRLEN] = {};
+                inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(p->ai_addr)->sin_addr, b, sizeof b);
+                if (b[0]) keep(b);
+            }
+            freeaddrinfo(res);
+        }
+    }
+    if (started) WSACleanup();
+#else
+    ifaddrs* ifa = nullptr;
+    if (getifaddrs(&ifa) == 0) {
+        for (auto* p = ifa; p; p = p->ifa_next) {
+            if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+            char b[INET_ADDRSTRLEN] = {};
+            inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(p->ifa_addr)->sin_addr, b, sizeof b);
+            if (b[0]) keep(b);
+        }
+        freeifaddrs(ifa);
+    }
+#endif
+    return out;
+}
+
+std::string machine_host_name() {
+    char buf[256] = {};
+#ifdef _WIN32
+    WSADATA wsa;
+    bool started = WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+#endif
+    if (::gethostname(buf, sizeof buf - 1) != 0) buf[0] = 0;
+#ifdef _WIN32
+    if (started) WSACleanup();
+#endif
+    std::string h = buf;
+    return simple::valid_pair_host(h) ? h : std::string();
+}
+
+std::string local_time_text(int64_t unix_s) {
+    std::time_t t = static_cast<std::time_t>(unix_s);
+    std::tm tmv{};
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char b[64];
+    std::strftime(b, sizeof b, "%a %Y-%m-%d %H:%M", &tmv);
+    return b;
+}
+
+const char* invite_state_name(simple::InviteRecord::State s) {
+    switch (s) {
+    case simple::InviteRecord::State::Live: return "live";
+    case simple::InviteRecord::State::Expired: return "expired";
+    case simple::InviteRecord::State::UsedUp: return "used-up";
+    case simple::InviteRecord::State::Revoked: return "revoked";
+    }
+    return "live";
+}
+
+std::string invite_store_dir(const std::string& config_path) { return (fs::u8path(dir_of(config_path)) / "invites.d").u8string(); }
+
+// The server configuration for a command: -c, else <dir>.mysync/server.toml (where quick-server puts it). "" = none.
+std::string find_server_config(const std::string& config, const std::string& dir) {
+    std::error_code ec;
+    if (!config.empty()) return abs_path(config);
+    if (dir.empty()) return {};
+    try {
+        fs::path cand = fs::u8path(default_quick_config_dir(abs_path(dir))) / "server.toml";
+        if (fs::is_regular_file(cand, ec)) return cand.u8string();
+    } catch (const Error&) {   // a drive / filesystem root has no sibling to put a configuration in
+    }
+    return {};
+}
+
+int cmd_invite_create(Args a) {
+    std::string dir, config, ttl, uses, port, label, svc;
+    std::vector<std::string> addr_opts = a.values({"--address"});
+    a.value({"--dir"}, dir);
+    a.value({"-c", "--config"}, config);
+    a.value({"--ttl"}, ttl);
+    a.value({"--uses"}, uses);
+    a.value({"--port"}, port);
+    a.value({"--name"}, label);
+    a.value({"--service-name"}, svc);
+    bool rw = a.flag({"--rw"}), ro = a.flag({"--ro"}), json = a.flag({"--json"}), want_service = a.flag({"--service"});
+    bool fix_permissions = a.flag({"--fix-permissions"});
+    if (!a.positional().empty())
+        usage("usage: mysync invite create --dir <folder> [--rw|--ro] [--ttl 24h] [--uses N] [--address host:port]... [--name label] [--json] [-c server.toml] [--service] [--port N] [--fix-permissions]");
+    if (dir.empty()) usage("--dir <folder> is required");
+    if (rw && ro) usage("--rw and --ro exclude each other");
+    simple::InviteNew n;
+    n.perm = ro ? simple::InvitePerm::ReadOnly : simple::InvitePerm::ReadWrite;
+    n.created_by = "cli";
+    n.ask = false;
+    n.ttl_seconds = ttl.empty() ? simple::kInviteDefaultTtlSeconds : parse_ttl_seconds(ttl);
+    if (!uses.empty()) {
+        uint32_t u = parse_u32(uses, "--uses");
+        if (u < 1 || u > uint32_t(simple::kInviteMaxUses)) usage("--uses must be 1 to 100");
+        n.uses = int(u);
+    }
+    uint32_t port_opt = 0;
+    if (!port.empty()) {
+        port_opt = parse_u32(port, "--port");
+        if (port_opt < 1 || port_opt > 65535) usage("--port must be 1-65535");
+    }
+    if (addr_opts.size() > simple::kInviteMaxAddrs) usage("at most 3 --address");
+    if (!label.empty()) {
+        n.label = simple::clean_display_name(label);
+        if (n.label.empty()) usage("--name cannot be used (empty, longer than 40 characters, or has control characters)");
+    }
+
+    // 1) the server: an existing configuration (-c, or the default place beside --dir), or a new one with the safe defaults of
+    //    quick-server. In the second case --dir is only used to place the configuration and the key BESIDE it, never inside it.
+    std::string cfg_path = find_server_config(config, dir);
+    std::error_code ec;
+    QuickResult qr;
+    qr.role = "server";
+    if (!config.empty() && !fs::is_regular_file(fs::u8path(cfg_path), ec)) throw Error("configuration file not found: " + cfg_path);
+    if (cfg_path.empty()) {
+        QuickServerOptions o;
+        // Every machine gets an invitation folder of its own, so the server's own root is a separate (empty) folder inside its
+        // configuration folder: the shared folder is never the server root, which an invitation may not overlap.
+        o.config_dir = default_quick_config_dir(abs_path(dir));
+        o.dir = (fs::u8path(o.config_dir) / "root").u8string();
+        prepare_shared_folder(o.config_dir, fix_permissions);   // created PRIVATE before its child, so the child does not create it with default permissions
+        if (port_opt) o.port = static_cast<uint16_t>(port_opt);
+        o.fix_permissions = fix_permissions;
+        qr = quick_server(o);
+        cfg_path = qr.config_file;
+        std::cerr << "no server configuration found: created one at " << cfg_path << " (pairing off)\n";
+    }
+    qr.config_file = cfg_path;
+    guard_server_config(cfg_path);
+    ServerConfig sc = gui::load_server_config_resolved(cfg_path);
+    simple::InviteStore store(invite_store_dir(cfg_path));
+
+    // 2) the folder: ANY absolute folder; each machine that redeems the invite is confined to exactly it
+    if (!simple::valid_invite_folder(abs_path(dir)))
+        throw Error("the folder '" + dir + "' cannot be used in an invitation (an absolute path without '..', control characters or __sync)");
+    const std::string folder = simple::canonical_folder(abs_path(dir));
+    {
+        std::vector<ClientAcl> peers = sc.clients;
+        for (const ClientAcl& c : peer_list(cfg_path)) peers.push_back(c);
+        std::vector<simple::FolderUse> use = simple::folders_in_use(sc, peers, store.list(), store.now());
+        std::vector<std::string> prot{store.dir(), sc.key_file, sc.key_file_next, gui::effective_server_state_dir(sc.state_dir, sc.root), sc.log_file, dir_of(cfg_path)};
+        std::string why = simple::folder_conflict(folder, use, prot);
+        if (!why.empty()) throw Error(why);
+    }
+    prepare_shared_folder(folder, fix_permissions);   // links refused, created private, untrusted folders refused when elevated
+    n.folder = folder;
+    if (n.label.empty()) {
+        n.label = simple::clean_display_name(fs::u8path(folder).filename().u8string());
+        if (n.label.empty()) n.label = "MySync";
+    }
+    n.machine = simple::default_device_name();
+
+    // 3) the addresses
+    uint16_t cport = port_opt ? static_cast<uint16_t>(port_opt) : sc.port;
+    for (const std::string& t : addr_opts) {
+        simple::InviteAddr ia;
+        parse_host_port(t, ia.host, ia.port);
+        if (!simple::valid_pair_host(ia.host)) usage("--address " + t + " is not a valid host");
+        n.addrs.push_back(ia);
+    }
+    if (n.addrs.empty()) {
+        auto add = [&](const std::string& h) {
+            if (h.empty() || n.addrs.size() >= simple::kInviteMaxAddrs || !simple::valid_pair_host(h)) return;
+            for (const auto& x : n.addrs)
+                if (x.host == h) return;
+            simple::InviteAddr ia;
+            ia.host = h;
+            ia.port = cport;
+            n.addrs.push_back(ia);
+        };
+        const bool wildcard = sc.bind.empty() || sc.bind == "*" || sc.bind == "0.0.0.0" || sc.bind == "::";
+        if (!wildcard) add(sc.bind);
+        add(machine_host_name());
+        if (wildcard)
+            for (const std::string& ip : local_ipv4_addresses()) add(ip);
+        if (n.addrs.empty()) throw Error("cannot work out an address for this machine: give --address host:port");
+    }
+
+    // 4) the invite
+    KeyPair kp = load_keypair(sc.key_file);   // only the public half is used
+    n.server_key = kp.pub;
+    simple::InviteCode code = store.create(n);
+    const std::string text = simple::encode_invite_code(code);
+    const std::string id = simple::invite_id_hex(code.id);
+    const std::string fp = simple::invite_fingerprint(kp.pub);
+
+    std::string svc_msg;
+    bool svc_ok = true, svc_warn = false;
+    if (want_service) svc_msg = quick_service(qr, svc, svc_ok, svc_warn);
+
+    if (json) {
+        std::vector<std::string> ad;
+        for (const auto& x : n.addrs) ad.push_back(jq_ascii(x.host + ":" + std::to_string(x.port)));
+        std::cout << "{\"id\":" << jq_ascii(id) << ",\"code\":" << jq_ascii(text) << ",\"expires_unix\":" << code.expires_unix
+                  << ",\"perm\":" << jq_ascii(simple::invite_perm_name(n.perm)) << ",\"uses\":" << n.uses
+                  << ",\"folder\":" << jq_ascii(n.folder) << ",\"label\":" << jq_ascii(n.label) << ",\"addresses\":" << jarr(ad)
+                  << ",\"config\":" << jq_ascii(cfg_path) << ",\"key_fingerprint\":" << jq_ascii(fp);
+        if (want_service)
+            std::cout << ",\"service\":{\"ok\":" << jb(svc_ok) << ",\"warning\":" << jb(svc_warn) << ",\"message\":" << jq_ascii(svc_msg) << "}";
+        std::cout << "}\n";
+    } else {
+        std::cout << "Invitation code (give it to the other machine; it is not shown again):\n\n  " << text << "\n\n";
+        std::cout << "valid until:   " << local_time_text(code.expires_unix) << " (this computer's time)\n";
+        std::cout << "access:        " << (n.perm == simple::InvitePerm::ReadOnly ? "read only" : "read and write") << "\n";
+        std::cout << "uses:          " << n.uses << "\n";
+        std::cout << "folder:        " << n.folder << "  (each machine that joins sees only this folder)" << "\n";
+        std::string al;
+        for (const auto& x : n.addrs) al += (al.empty() ? "" : ", ") + x.host + ":" + std::to_string(x.port);
+        std::cout << "addresses:     " << al << "\n";
+        std::cout << "key fingerprint: " << fp << "\n";
+        std::cout << "invite id:     " << id << "   (to cancel: mysync invite revoke " << id.substr(0, 8) << " -c " << cfg_path << ")\n";
+        if (want_service) std::cout << svc_msg << "\n";
+        else std::cout << "The server must be running to accept it:  mysync run -c " << cfg_path << "\n";
+    }
+    if (want_service && !svc_ok) return 1;
+    return 0;
+}
+
+int cmd_invite_list(Args a) {
+    std::string config, dir;
+    a.value({"-c", "--config"}, config);
+    a.value({"--dir"}, dir);
+    bool json = a.flag({"--json"});
+    if (!a.positional().empty()) usage("usage: mysync invite list [--json] -c <server.toml>");
+    std::string cfg_path = find_server_config(config, dir);
+    if (cfg_path.empty()) usage("-c <server.toml> is required");
+    simple::InviteStore store(invite_store_dir(cfg_path));
+    std::vector<simple::InviteRecord> all = store.list();
+    const int64_t now = store.now();
+    if (json) {
+        std::vector<std::string> items;
+        for (const auto& r : all) {
+            std::vector<std::string> joined;
+            for (const auto& j : r.joined)
+                joined.push_back("{\"name\":" + jq_ascii(j.name) + ",\"key\":" + jq_ascii(j.key_hex) + ",\"when_utc\":" + jq_ascii(j.when_utc) + "}");
+            items.push_back("{\"id\":" + jq_ascii(r.id_hex) + ",\"state\":" + jq_ascii(invite_state_name(r.state(now))) +
+                            ",\"perm\":" + jq_ascii(simple::invite_perm_name(r.perm)) + ",\"uses_left\":" + std::to_string(r.uses_left) +
+                            ",\"uses_total\":" + std::to_string(r.uses_total) + ",\"created_unix\":" + std::to_string(r.created_unix) +
+                            ",\"expires_unix\":" + std::to_string(r.expires_unix) + ",\"folder\":" + jq_ascii(r.folder) +
+                            ",\"label\":" + jq_ascii(r.label) + ",\"created_by\":" + jq_ascii(r.created_by) + ",\"ask\":" + jb(r.ask) +
+                            ",\"joined\":" + jarr(joined) + "}");
+        }
+        std::cout << "{\"invites\":" << jarr(items) << "}\n";
+        return 0;
+    }
+    if (all.empty()) {
+        std::cout << "no invitations\n";
+        return 0;
+    }
+    for (const auto& r : all) {
+        std::cout << r.id_hex << "  " << invite_state_name(r.state(now)) << "  " << simple::invite_perm_name(r.perm) << "  uses "
+                  << r.uses_left << "/" << r.uses_total << "  until " << local_time_text(r.expires_unix) << "  folder "
+                  << r.folder << "  \"" << r.label << "\"  by " << r.created_by << "\n";
+        for (const auto& j : r.joined)
+            std::cout << "    joined: " << j.name << "  " << j.key_hex.substr(0, 12) << "...  " << j.when_utc << " UTC\n";
+    }
+    return 0;
+}
+
+int cmd_invite_revoke(Args a) {
+    std::string config, dir;
+    a.value({"-c", "--config"}, config);
+    a.value({"--dir"}, dir);
+    std::vector<std::string> pos = a.positional();
+    if (pos.size() != 1) usage("usage: mysync invite revoke <id|prefix> -c <server.toml>");
+    std::string cfg_path = find_server_config(config, dir);
+    if (cfg_path.empty()) usage("-c <server.toml> is required");
+    guard_server_config(cfg_path);
+    simple::InviteStore store(invite_store_dir(cfg_path));
+    if (!store.revoke(pos[0])) throw Error("no invitation matches '" + pos[0] + "'");
+    std::cout << "revoked " << pos[0] << "\n";
+    return 0;
+}
+
+int cmd_invite(const std::vector<std::string>& v) {
+    if (v.size() < 3) usage("usage: mysync invite create|list|revoke ...");
+    if (v[2] == "create") return cmd_invite_create(Args(v, 3));
+    if (v[2] == "list") return cmd_invite_list(Args(v, 3));
+    if (v[2] == "revoke") return cmd_invite_revoke(Args(v, 3));
+    usage("unknown invite command '" + v[2] + "' (create, list, revoke)");
 }
 
 // ---------------------------------------------------------------------------------------------- status / health
@@ -930,6 +1318,7 @@ int cli_ops_main(const std::vector<std::string>& args) {
         if (cmd == "quick-client") return cmd_quick_client(Args(args, 2));
         if (cmd == "key") return cmd_key(args);
         if (cmd == "peer") return cmd_peer(args);
+        if (cmd == "invite") return cmd_invite(args);
         if (cmd == "status") return cmd_status_json(Args(args, 2));
         if (cmd == "health") {
             try {

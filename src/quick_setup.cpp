@@ -239,6 +239,15 @@ std::string make_peer_add_command(const std::string& client_public, const std::s
            shell_quote_if_needed(server_config_path);
 }
 
+bool prepare_shared_folder(const std::string& dir, bool fix_permissions) {
+    std::error_code ec;
+    if (fix_permissions && fs::is_directory(fs::u8path(dir), ec)) make_folder_private(dir);
+    guard_dir(dir, "the shared folder");
+    bool created = ensure_dir(dir, "the shared folder");
+    guard_dir(dir, "the shared folder");   // judged again now that it exists
+    return created;
+}
+
 void make_folder_private(const std::string& dir) {
     refuse_symlink(dir);
     fs::path p = fs::u8path(dir);

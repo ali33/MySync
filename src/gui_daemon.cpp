@@ -4,6 +4,9 @@
 
 #include "mysync/gui/daemon.h"
 #include "mysync/gui/config_io.h"
+#include "mysync/linkcheck.h"
+#include "mysync/quick_setup.h"
+#include "mysync/simple/invite.h"
 #include "mysync/simple/pairing.h"
 
 #include "mysync/gui/trust.h"
@@ -100,7 +103,7 @@ void diff_control(Diff& d, bool ea, const std::vector<std::string>& aa, const st
 }
 
 bool same_acl(const ClientAcl& a, const ClientAcl& b) {
-    return a.name == b.name && a.public_key == b.public_key && a.extra_keys == b.extra_keys && a.read_only == b.read_only && a.prefix == b.prefix &&
+    return a.name == b.name && a.public_key == b.public_key && a.extra_keys == b.extra_keys && a.read_only == b.read_only && a.prefix == b.prefix && a.root == b.root &&
            a.max_sessions == b.max_sessions && a.max_write_bytes_per_hour == b.max_write_bytes_per_hour &&
            a.max_bandwidth_kbps == b.max_bandwidth_kbps;
 }
@@ -350,6 +353,7 @@ struct ControlHost::Impl {
     StatusFn status;
     ReloadFn reload;
     PairFn pair;
+    InviteFn invite;
     std::unique_ptr<IpcServer> server;
     std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
     std::mutex m;
@@ -410,6 +414,21 @@ struct ControlHost::Impl {
                 r.token = q.token;
             }
             break;
+        case ControlOp::InviteCreate:
+        case ControlOp::InviteList:
+        case ControlOp::InviteRevoke:
+        case ControlOp::InviteRemoveMachine:
+        case ControlOp::InviteApprove:
+        case ControlOp::InviteDeny:
+            if (!invite) {
+                r.status = ControlStatus::Unsupported;
+                r.error = "invites are not available on this daemon";
+            } else {
+                r = invite(q);
+                r.op = q.op;
+                r.token = q.token;
+            }
+            break;
         }
         return r;
     }
@@ -428,6 +447,7 @@ ControlHost::ControlHost(Role role, DaemonOptions opts, IpcServerOptions ipc, St
 ControlHost::~ControlHost() { stop(); }
 
 void ControlHost::set_pair_handler(PairFn fn) { p_->pair = std::move(fn); }
+void ControlHost::set_invite_handler(InviteFn fn) { p_->invite = std::move(fn); }
 
 void ControlHost::start() {
     Impl* im = p_.get();
@@ -685,10 +705,12 @@ struct ServerDaemon::Impl {
     PairingMode cfg_pairing = PairingMode::Off;
     bool rotation_under_way = false;
     void note_config(const ServerConfig& c, const PeerLoad& pl) {
-        std::lock_guard<std::mutex> lk(info_mu);
+        std::unique_lock<std::mutex> lk(info_mu);
         peers = pl;
         cfg_pairing = c.pairing;
         rotation_under_way = !c.key_file_next.empty();
+        lk.unlock();
+        sync_invite_flag();   // [server] pairing = "off" closes the GUI invites
     }
 
     // ---- pairing by code (simple/pairing.h): runs on the thread of whoever calls approve (an IPC worker)
@@ -709,9 +731,101 @@ struct ServerDaemon::Impl {
         std::lock_guard<std::mutex> rl(reload_mu);
         if (!pairing_configured()) throw Error("pairing is switched off in the configuration ([server] pairing = \"off\")");
         if (opts.config_path.empty()) throw Error("pairing needs a configuration file");
-        std::set<std::string> prefixes, names;
+        std::set<std::string> prefixes;
+        for (const ClientAcl& c : cfg.clients) prefixes.insert(c.prefix);
+        // A folder that already exists may hold another machine's files: never hand it over.
+        std::string prefix = simple::safe_pair_prefix(name, prefixes);
+        for (int i = 0; i < 1000; ++i) {
+            std::error_code ec;
+            if (!fs::exists(fs::u8path(cfg.root) / fs::u8path(prefix), ec)) break;
+            prefixes.insert(prefix);
+            prefix = simple::safe_pair_prefix(name, prefixes);
+        }
+        add_peer_locked(name, key, /*read_only=*/false, "", prefix);
+        log_info("paired machine added with folder '" + prefix + "'");
+        return prefix;
+    }
+
+    // ---- invitation codes (simple/invite.h): the same atomic grant, with the perm and folder of the invite.
+    std::shared_ptr<simple::InviteManager> invites;   // guarded by info_mu
+    bool gui_invites_allowed_now() {
+        std::lock_guard<std::mutex> lk(info_mu);
+        return opts.allow_pairing && cfg_pairing != PairingMode::Off;
+    }
+    void sync_invite_flag() {
+        std::shared_ptr<simple::InviteManager> m;
+        bool allowed;
+        {
+            std::lock_guard<std::mutex> lk(info_mu);
+            m = invites;
+            allowed = opts.allow_pairing && cfg_pairing != PairingMode::Off;
+        }
+        if (m) m->set_gui_invites_allowed(allowed);
+    }
+
+    // Why `folder` may not be handed to a new machine ("" = it may): it must not overlap the folder of another machine or of another
+    // live invitation (equal to an invitation's folder is fine: that is sharing on purpose), nor contain / lie inside the place MySync
+    // keeps its configuration, keys, state and invitations. Caller holds reload_mu.
+    std::string folder_problem_locked(const std::string& folder, simple::InviteManager& mgr, bool against_invites) {
+        std::vector<ClientAcl> peers = cfg.clients;
+        if (!opts.config_path.empty())
+            for (const ClientAcl& c : peer_list(opts.config_path)) peers.push_back(c);
+        std::vector<simple::FolderUse> use = simple::folders_in_use(cfg, peers, against_invites ? mgr.store().list() : std::vector<simple::InviteRecord>(), mgr.store().now());
+        std::vector<std::string> prot{mgr.store().dir(), cfg.key_file, cfg.key_file_next, effective_server_state_dir(cfg.state_dir, cfg.root), cfg.log_file};
+        if (!opts.config_path.empty()) prot.push_back(fs::u8path(opts.config_path).parent_path().u8string());
+        return simple::folder_conflict(folder, use, prot);
+    }
+
+    // Folder of an invitation about to be created from the control channel: validated, checked for overlaps, created private when
+    // missing (links refused). Returns the canonical folder. Throws Error.
+    std::string prepare_invite_folder(const std::string& folder_in, simple::InviteManager& mgr) {
+        // The desktop receiver runs as the user. A privileged daemon (elevated / service) never takes a folder from the control channel:
+        // the channel could otherwise point a SYSTEM-run peer at any folder of the machine.
+        if (opts.enforce_config_trust) throw Error("invites made from the app are not available while MySync runs with administrator rights: create the invite with the command line (mysync invite create)");
+        if (!simple::valid_invite_folder(folder_in)) throw Error("the folder must be an absolute path");
+        const std::string folder = simple::canonical_folder(folder_in);
+        {
+            std::lock_guard<std::mutex> rl(reload_mu);
+            std::string why = folder_problem_locked(folder, mgr, true);
+            if (!why.empty()) throw Error(why);
+        }
+        std::error_code fec;
+        const bool existed = fs::is_directory(fs::u8path(folder), fec);
+        prepare_shared_folder(folder, /*fix_permissions=*/false);
+        // Always judged here (not only when elevated): an existing folder other local accounts can write to is not handed out;
+        // one MySync just created is private already.
+        if (existed) require_trusted_dir(folder, "the shared folder", {});
+        return folder;
+    }
+
+    // Adds the machine to the allowlist with `perm`, confined to `folder` (ClientAcl::root; created private when missing).
+    // Refuses a key that is already in the allowlist, whoever it belongs to (generic text: nothing about other machines).
+    std::string grant_peer(const std::string& name, const PubKey& key, simple::InvitePerm perm, const std::string& folder_in) {
+        std::lock_guard<std::mutex> rl(reload_mu);
+        if (opts.config_path.empty()) throw Error("invitations need a configuration file");
+        if (!simple::valid_invite_folder(folder_in)) throw Error("the folder of this invitation is not valid");
+        const std::string folder = simple::canonical_folder(folder_in);
+        std::shared_ptr<simple::InviteManager> mgr;
+        {
+            std::lock_guard<std::mutex> lk(info_mu);
+            mgr = invites;
+        }
+        if (!mgr) throw Error("invitations are not available");
+        std::string why = folder_problem_locked(folder, *mgr, false);   // again at grant time, against the machines that are in now (the invitations were checked when they were made)
+        if (!why.empty()) throw Error(why);
+        prepare_shared_folder(folder, /*fix_permissions=*/false);
+        add_peer_locked(name, key, perm == simple::InvitePerm::ReadOnly, folder, "");
+        log_info(std::string("a machine joined by invitation (") + simple::invite_perm_name(perm) + ", its own folder)");
+        return folder;
+    }
+
+    // Caller holds reload_mu. ATOMIC: peer_add -> reload -> trust check -> apply_config. Up to apply_config nothing is committed,
+    // so ANY failure after peer_add takes the peer out again (not revoked) and the call fails with the verbatim reason; the
+    // request stays waiting and the sender is not told it was approved. Once apply_config succeeded the grant is committed and
+    // nothing afterwards (the window closing, a closed IPC connection) can undo it: roll forward.
+    void add_peer_locked(const std::string& name, const PubKey& key, bool read_only, const std::string& root, const std::string& prefix) {
+        std::set<std::string> names;
         for (const ClientAcl& c : cfg.clients) {  // the running configuration also holds the peers.d entries
-            prefixes.insert(c.prefix);
             names.insert(c.name);
             PublicKey k = key;
             if (acl_has_key(c, k)) throw Error("this computer is already paired");
@@ -722,24 +836,13 @@ struct ServerDaemon::Impl {
         }
         std::string display = name;
         for (int n = 2; names.count(display) && n < 1000; ++n) display = name + " (" + std::to_string(n) + ")";
-        // A folder that already exists may hold another machine's files: never hand it over.
-        std::string prefix = simple::safe_pair_prefix(name, prefixes);
-        for (int i = 0; i < 1000; ++i) {
-            std::error_code ec;
-            if (!fs::exists(fs::u8path(cfg.root) / fs::u8path(prefix), ec)) break;
-            prefixes.insert(prefix);
-            prefix = simple::safe_pair_prefix(name, prefixes);
-        }
         // The one place peers are written (peers.h): `mysync peer list/remove` sees a machine paired by code too.
         PeerSpec spec;
         spec.name = display;
         spec.key = key;
-        spec.read_only = false;  // "rw"
+        spec.read_only = read_only;
+        spec.root = root;
         spec.prefix = prefix;
-        // ATOMIC: peer_add -> reload -> trust check -> apply_config. Up to apply_config nothing is committed, so ANY failure
-        // after peer_add takes the peer out again (not revoked) and the approval fails with the verbatim reason; the request
-        // stays waiting and the sender is not told it was approved. Once apply_config succeeded the pairing is committed and
-        // nothing afterwards (the window closing, a closed IPC connection) can undo it: roll forward.
         peer_add(opts.config_path, spec);
         try {
             if (opts.pair_test_hook) opts.pair_test_hook("after_peer_add");
@@ -770,8 +873,7 @@ struct ServerDaemon::Impl {
                                           : "; ALSO the new computer could not be taken out again (" + rb +
                                                 "): deny its request to remove it"));
         }
-        log_info("paired machine '" + display + "' added with folder '" + prefix + "'");
-        return prefix;
+        log_info("machine '" + display + "' added to the allowlist");
     }
 
     // Denying a request makes sure its key is not allowed (a half-failed approval may have left it in the file): take it
@@ -856,6 +958,180 @@ struct ServerDaemon::Impl {
             i.seconds_left = static_cast<uint32_t>(w.seconds_left);
             p.pending.push_back(i);
         }
+        return r;
+    }
+
+    // ---- invites (MSY2) over the control channel (gui/invite_ops.h). Every request is checked: the process must have been
+    // started with --allow-pairing AND the configuration must not say [server] pairing = "off" (a reload may switch it).
+    // An administrator's CLI invite is none of this channel's business: it is neither listed nor revocable from here.
+    static const char* invite_state_name(simple::InviteRecord::State s) {
+        switch (s) {
+        case simple::InviteRecord::State::Live: return "live";
+        case simple::InviteRecord::State::Expired: return "expired";
+        case simple::InviteRecord::State::UsedUp: return "used-up";
+        case simple::InviteRecord::State::Revoked: return "revoked";
+        }
+        return "?";
+    }
+
+    // Takes the key out of the allowlist and revokes it, then applies at once (this also cuts its open sessions).
+    void invite_remove_key(const PubKey& key) {
+        std::lock_guard<std::mutex> rl(reload_mu);
+        if (opts.config_path.empty()) throw Error("removing a computer needs a configuration file");
+        peer_remove(opts.config_path, key_to_hex(key), /*revoke=*/true);
+        PeerLoad pl;
+        ServerConfig n = load_server_config_resolved(opts.config_path, &pl,
+                                                     opts.enforce_config_trust ? &opts.trusted_writers : nullptr);
+        check_trust(n, opts);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            if (server) server->apply_config(n);
+        }
+        cfg = n;
+        note_config(n, pl);
+        log_info("a computer that joined by invite was removed");
+    }
+
+    void fill_invite_info(Server& srv, simple::InviteManager& mgr, InviteListInfo& out) {
+        out.allowed = true;
+        out.machine = simple::default_device_name();
+        out.fingerprint = simple::invite_fingerprint(srv.public_key());
+        out.port = srv.port();
+        {
+            std::lock_guard<std::mutex> rl(reload_mu);
+            out.root = cfg.root;
+        }
+        std::set<std::string> in_allowlist;   // a machine removed from the allowlist is no longer "joined"
+        bool have_allowlist = false;
+        try {
+            if (!opts.config_path.empty()) {
+                for (const ClientAcl& c : peer_list(opts.config_path)) {
+                    in_allowlist.insert(key_to_hex(c.public_key));
+                    for (const PublicKey& k : c.extra_keys) in_allowlist.insert(key_to_hex(k));
+                }
+                have_allowlist = true;
+            }
+        } catch (const std::exception&) {
+        }
+        int64_t now = mgr.store().now();
+        for (const simple::InviteRecord& rec : mgr.store().list()) {
+            if (rec.created_by != "gui") continue;
+            auto st = rec.state(now);
+            if (st == simple::InviteRecord::State::Live && out.invites.size() < kMaxInviteRows) {
+                InviteView v;
+                v.id_hex = rec.id_hex;
+                v.label = rec.label;
+                v.folder = rec.folder;
+                v.created_by = rec.created_by;
+                v.perm = rec.perm;
+                v.state = invite_state_name(st);
+                v.uses_left = static_cast<uint32_t>(std::max(0, rec.uses_left));
+                v.uses_total = static_cast<uint32_t>(std::max(0, rec.uses_total));
+                v.expires_unix = rec.expires_unix;
+                v.ask = rec.ask;
+                out.invites.push_back(std::move(v));
+            }
+            for (const simple::InviteJoined& j : rec.joined) {
+                if (have_allowlist && !in_allowlist.count(j.key_hex)) continue;
+                if (out.joined.size() >= kMaxInviteRows) break;
+                JoinedMachineView m;
+                m.name = j.name;
+                m.key_hex = j.key_hex;
+                m.when_utc = j.when_utc;
+                m.invite_id_hex = rec.id_hex;
+                m.folder = rec.folder;
+                m.perm = rec.perm;
+                out.joined.push_back(std::move(m));
+            }
+        }
+        out.pending = mgr.pending();
+    }
+
+    ControlResponse invite_op(Server& srv, const ControlRequest& q) {
+        ControlResponse r;
+        if (!pairing_configured()) {   // first: the constructor also clears opts.allow_pairing when the configuration says "off"
+            r.status = ControlStatus::Denied;
+            r.error = "invites are switched off in the configuration ([server] pairing = \"off\")";
+            return r;
+        }
+        if (!opts.allow_pairing) {
+            r.status = ControlStatus::Denied;
+            r.error = "invites are not available: this program was not started with --allow-pairing";
+            return r;
+        }
+        std::shared_ptr<simple::InviteManager> mgr = srv.invites();
+        if (!mgr) {
+            r.status = ControlStatus::Unsupported;
+            r.error = "invites are not available on this daemon";
+            return r;
+        }
+        if (q.op == ControlOp::InviteCreate && opts.enforce_config_trust) {
+            r.status = ControlStatus::Denied;
+            r.error = "invites made from the app are not available while MySync runs with administrator rights: create the invite with the command line (mysync invite create)";
+            return r;
+        }
+        try {
+            switch (q.op) {
+            case ControlOp::InviteCreate: {
+                InviteCreateReq req = decode_invite_create(q.payload);
+                if (req.addrs.empty()) throw Error("the invite needs at least one address");
+                simple::InviteNew n;
+                n.folder = prepare_invite_folder(req.folder, *mgr);   // InviteCreateReq::folder is an absolute folder
+                n.label = req.label;
+                if (n.label.empty()) {
+                    n.label = simple::clean_display_name(fs::u8path(n.folder).filename().u8string());
+                    if (n.label.empty()) n.label = "MySync";
+                }
+                n.machine = simple::default_device_name();
+                n.perm = req.perm;
+                n.ttl_seconds = static_cast<int>(std::clamp<uint32_t>(req.ttl_seconds, 60, simple::kInviteMaxTtlSeconds));
+                n.uses = static_cast<int>(std::clamp<uint32_t>(req.uses, 1, simple::kInviteMaxUses));
+                n.created_by = "gui";
+                n.ask = req.ask;
+                n.server_key = srv.public_key();
+                n.addrs = req.addrs;
+                r.invites.created_code = simple::encode_invite_code(mgr->store().create(n));   // validates the folder
+                log_info("an invite was created from the control channel");
+                break;
+            }
+            case ControlOp::InviteRevoke: {
+                std::string id = decode_invite_text(q.payload);
+                bool mine = false;
+                for (const simple::InviteRecord& rec : mgr->store().list())
+                    if (rec.created_by == "gui" && id.size() >= 4 && rec.id_hex.compare(0, id.size(), id) == 0) mine = true;
+                if (!mine || !mgr->revoke(id)) throw Error("there is no such invite");
+                break;
+            }
+            case ControlOp::InviteRemoveMachine: {
+                PubKey key = key_from_hex(decode_invite_text(q.payload));
+                bool ours = false;   // only a machine that joined by an invite made here may be removed from here
+                for (const simple::InviteRecord& rec : mgr->store().list())
+                    if (rec.created_by == "gui")
+                        for (const simple::InviteJoined& j : rec.joined)
+                            if (j.key_hex == key_to_hex(key)) ours = true;
+                if (!ours) throw Error("this computer did not join by an invite made here");
+                invite_remove_key(key);
+                break;
+            }
+            case ControlOp::InviteApprove:
+                mgr->approve(q.arg);
+                break;
+            case ControlOp::InviteDeny:
+                mgr->deny(q.arg);
+                break;
+            default:
+                break;   // InviteList: just the state below
+            }
+        } catch (const Error& e) {
+            r.status = ControlStatus::Failed;
+            r.error = e.what();
+        } catch (const std::exception& e) {
+            r.status = ControlStatus::Failed;
+            r.error = e.what();
+        }
+        std::string code = std::move(r.invites.created_code);
+        fill_invite_info(srv, *mgr, r.invites);
+        r.invites.created_code = std::move(code);
         return r;
     }
 
@@ -944,6 +1220,11 @@ ServerDaemon::~ServerDaemon() {
 }
 
 StatusSnapshot ServerDaemon::snapshot() { return p_->snapshot(); }
+bool ServerDaemon::gui_invites_allowed() const { return p_->gui_invites_allowed_now(); }
+std::shared_ptr<simple::InviteManager> ServerDaemon::invites() const {
+    std::lock_guard<std::mutex> lk(p_->info_mu);
+    return p_->invites;
+}
 bool ServerDaemon::pairing_allowed() const { return p_->opts.allow_pairing; }  // already cleared in the constructor when [server] pairing = "off"
 ReloadResult ServerDaemon::reload() { return p_->reload(); }
 
@@ -963,6 +1244,21 @@ void ServerDaemon::run(std::atomic<bool>& stop) {
     }
     im.key_stamp_running = key_stamp(im.cfg);
     Server srv(im.cfg);
+    {   // Invitations: the store always exists, so an invite made by `mysync invite create` redeems on this running server.
+        const std::string cdir = im.opts.config_path.empty() ? im.dir : fs::u8path(im.opts.config_path).parent_path().u8string();
+        auto store = std::make_shared<simple::InviteStore>((fs::u8path(cdir) / "invites.d").u8string());
+        auto mgr = std::make_shared<simple::InviteManager>(srv.public_key(), store);
+        mgr->set_grant_handler([&im](const std::string& n, const PubKey& k, simple::InvitePerm p, const std::string& d) {
+            return im.grant_peer(n, k, p, d);
+        });
+        {
+            std::lock_guard<std::mutex> lk(im.info_mu);
+            im.invites = mgr;
+        }
+        im.sync_invite_flag();
+        srv.set_invites(mgr);
+        store->purge_old();
+    }
     if (im.opts.allow_pairing)
         srv.pairing().set_approve_handler([&im](const std::string& n, const PubKey& k) { return im.pair_approve(n, k); });
     if (im.opts.allow_pairing)
@@ -985,6 +1281,7 @@ void ServerDaemon::run(std::atomic<bool>& stop) {
                 [&im] { return im.reload(); });
             if (im.opts.allow_pairing)
                 im.host->set_pair_handler([&im, &srv](const ControlRequest& q) { return im.pair_op(srv, q); });
+            im.host->set_invite_handler([&im, &srv](const ControlRequest& q) { return im.invite_op(srv, q); });  // answers Denied itself when off
             im.host->start();
         } catch (const std::exception& e) {
             log_error(std::string("control channel unavailable (the GUI cannot manage this server): ") + e.what());

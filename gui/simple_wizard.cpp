@@ -2,7 +2,12 @@
 // Copyright (C) 2026 META.vn
 // Author: Nguyễn Đức Sơn
 // Trình hướng dẫn 3 bước của chế độ Đơn giản: (1) thư mục cần đồng bộ, (2) nơi lưu, (3) bắt đầu.
+// Bước 2 có hai cách: thư mục / USB / thư mục chia sẻ, hoặc "máy khác có cài MySync" = dán MỘT mã mời (MSY2). Mã được kiểm
+// ngay khi dán (nền, có chỉ báo động): dạng, tổng kiểm, hạn, rồi hỏi máy kia (probe_invite, chạy thử, chưa dùng mã). Việc
+// dùng mã thật (redeem_invite) xảy ra ở "Bắt đầu đồng bộ"; xong mới ghi cấu hình như mọi đích khác.
 #include <wx/dirdlg.h>
+
+#include <ctime>
 
 #include "form_model.h"
 #include "mysync/keys.h"
@@ -19,10 +24,12 @@ std::string join_nl(const std::vector<std::string>& v) {
     for (const auto& s : v) o += (o.empty() ? "" : "\n") + s;
     return o;
 }
+
+int64_t now_unix() { return static_cast<int64_t>(std::time(nullptr)); }
 }  // namespace
 
 WizardPage::WizardPage(wxWindow* parent, SimpleCtx& c, std::function<void()> done, std::function<void()> cancel)
-    : wxPanel(parent, wxID_ANY), c_(c), done_(std::move(done)), cancel_(std::move(cancel)), pair_timer_(this),
+    : wxPanel(parent, wxID_ANY), c_(c), done_(std::move(done)), cancel_(std::move(cancel)), join_timer_(this),
       auto_timer_(this, wxID_HIGHEST + 77) {
     auto* top = new wxBoxSizer(wxVERTICAL);
     busy_ = new BusyIndicator(this);
@@ -73,16 +80,17 @@ WizardPage::WizardPage(wxWindow* parent, SimpleCtx& c, std::function<void()> don
     });
     b_next_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { CheckInput(true); });
     b_start_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { Begin(); });
-    Bind(wxEVT_TIMER, [this](wxTimerEvent&) { PairTick(); }, pair_timer_.GetId());
+    Bind(wxEVT_TIMER, [this](wxTimerEvent&) { JoinTick(); }, join_timer_.GetId());
     Bind(wxEVT_TIMER, [this](wxTimerEvent&) { AutoStep(); }, auto_timer_.GetId());
     Restart(false);
 }
 
 WizardPage::~WizardPage() {
     *alive_ = false;
-    pair_timer_.Stop();
+    join_timer_.Stop();
     auto_timer_.Stop();
-    if (pair_) pair_->cancel = true;
+    if (join_) join_->cancel = true;
+    if (probe_cancel_) *probe_cancel_ = true;
 }
 
 void WizardPage::SetBusy(bool on, const char* key) {
@@ -145,51 +153,46 @@ void WizardPage::BuildDest(wxWindow* p) {
     v->AddSpacer(14);
     v->Add(r_machine_, 0, wxBOTTOM, 4);
     auto* mv = new wxBoxSizer(wxVERTICAL);
-    mv->Add(new wxStaticText(p, wxID_ANY, L("wizard.s2.machine.how")), 0, wxBOTTOM, 4);
+    auto* how = new WrapText(p, L("wizard.s2.machine.how"));
+    mv->Add(how, 0, wxEXPAND | wxBOTTOM, 4);
     code_ = new wxTextCtrl(p, wxID_ANY, "", wxDefaultPosition, wxSize(-1, 54), wxTE_MULTILINE | wxTE_BESTWRAP);
     code_->SetHint(L("wizard.s2.code.hint"));
     mv->Add(code_, 0, wxEXPAND);
-    auto* bh = new wxBoxSizer(wxHORIZONTAL);
-    b_send_ = new wxButton(p, wxID_ANY, L("wizard.s2.send"));
-    b_pcancel_ = new wxButton(p, wxID_ANY, L("btn.cancel"));
-    b_pcancel_->Hide();
-    bh->Add(b_send_, 0, wxRIGHT, 8);
-    bh->Add(b_pcancel_, 0);
-    mv->Add(bh, 0, wxTOP, 6);
-    sas_hint_ = new wxStaticText(p, wxID_ANY, L("wizard.s2.sas.hint"));
-    sas_hint_->Hide();
-    sas_ = new wxStaticText(p, wxID_ANY, "");
-    sp_font(sas_, 2.0);
-    {
-        wxFont f = sas_->GetFont();
-        f.SetFamily(wxFONTFAMILY_TELETYPE);
-        sas_->SetFont(f);
-    }
-    sas_->Hide();
-    mv->Add(sas_hint_, 0, wxTOP, 8);
-    mv->Add(sas_, 0, wxTOP | wxBOTTOM, 4);
-    pair_busy_ = new BusyIndicator(p);
-    mv->Add(pair_busy_, 0, wxEXPAND);
-    pair_msg_ = new WrapText(p, "");
-    pair_msg_->Hide();
-    mv->Add(pair_msg_, 0, wxEXPAND | wxTOP, 4);
+    probe_busy_ = new BusyIndicator(p);
+    mv->Add(probe_busy_, 0, wxEXPAND | wxTOP, 4);
+    code_msg_ = new WrapText(p, "");
+    code_msg_->Hide();
+    mv->Add(code_msg_, 0, wxEXPAND | wxTOP, 4);
+
+    // Phần tóm tắt bằng lời thường; dấu vân tay chỉ nằm trong "Chi tiết" (đóng sẵn).
+    inv_panel_ = new wxPanel(p, wxID_ANY);
+    auto* iv = new wxBoxSizer(wxVERTICAL);
+    inv_sentence_ = new WrapText(inv_panel_, "");
+    sp_font(inv_sentence_, 1.05, false);
+    iv->Add(inv_sentence_, 0, wxEXPAND | wxTOP, 6);
+    b_details_ = new wxButton(inv_panel_, wxID_ANY, L("simple.svc.details.show"), wxDefaultPosition, wxDefaultSize, wxBU_EXACTFIT);
+    iv->Add(b_details_, 0, wxTOP, 6);
+    inv_detail_ = new WrapText(inv_panel_, "");
+    inv_detail_->SetTextColour(kGrey);
+    inv_detail_->Hide();
+    iv->Add(inv_detail_, 0, wxEXPAND | wxTOP, 4);
+    inv_panel_->SetSizer(iv);
+    inv_panel_->Hide();
+    mv->Add(inv_panel_, 0, wxEXPAND);
     v->Add(mv, 0, wxEXPAND | wxLEFT, 24);
     p->SetSizer(v);
 
     b_dst_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { ChooseDest(); });
     r_folder_->Bind(wxEVT_RADIOBUTTON, [this](wxCommandEvent&) { UpdateDestEnable(); });
     r_machine_->Bind(wxEVT_RADIOBUTTON, [this](wxCommandEvent&) { UpdateDestEnable(); });
-    b_send_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { SendPairRequest(); });
-    b_pcancel_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { CancelPair(); });
-    code_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) {
-        if (pair_running_) return;
-        // Sửa mã sau khi đã ghép: bỏ kết quả ghép cũ, phải gửi lại.
-        m_.clear_paired();
-        sas_->Hide();
-        sas_hint_->Hide();
-        pair_msg_->Hide();
+    b_details_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+        bool show = !inv_detail_->IsShown();
+        inv_detail_->Show(show);
+        b_details_->SetLabel(L(show ? "simple.svc.details.hide" : "simple.svc.details.show"));
+        content_->Layout();
         Layout();
     });
+    code_->Bind(wxEVT_TEXT, [this](wxCommandEvent&) { OnCodeText(); });
 }
 
 void WizardPage::BuildFinish(wxWindow* p) {
@@ -201,34 +204,62 @@ void WizardPage::BuildFinish(wxWindow* p) {
     auto* note = new WrapText(p, L("wizard.s3.note"));
     note->SetTextColour(kGrey);
     v->Add(note, 0, wxEXPAND);
+
+    // Chỉ dùng khi đích là máy khác và máy kia hỏi người dùng trước khi cho vào.
+    sas_hint_ = new wxStaticText(p, wxID_ANY, L("wizard.s2.sas.hint"));
+    sas_hint_->Hide();
+    sas_ = new wxStaticText(p, wxID_ANY, "");
+    sp_font(sas_, 2.0);
+    {
+        wxFont f = sas_->GetFont();
+        f.SetFamily(wxFONTFAMILY_TELETYPE);
+        sas_->SetFont(f);
+    }
+    sas_->Hide();
+    v->Add(sas_hint_, 0, wxTOP, 14);
+    v->Add(sas_, 0, wxTOP | wxBOTTOM, 4);
+    join_busy_ = new BusyIndicator(p);
+    v->Add(join_busy_, 0, wxEXPAND | wxTOP, 8);
+    b_jcancel_ = new wxButton(p, wxID_ANY, L("inv.join.cancel"));
+    b_jcancel_->Hide();
+    v->Add(b_jcancel_, 0, wxTOP, 6);
+    join_msg_ = new WrapText(p, "");
+    join_msg_->SetTextColour(kRed);
+    join_msg_->Hide();
+    v->Add(join_msg_, 0, wxEXPAND | wxTOP, 8);
     p->SetSizer(v);
+    b_jcancel_->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) { CancelJoin(); });
 }
 
 void WizardPage::UpdateDestEnable() {
     bool folder = r_folder_->GetValue();
     dst_->Enable(folder);
     b_dst_->Enable(folder);
-    code_->Enable(!folder && !pair_running_);
-    b_send_->Enable(!folder && !pair_running_);
+    code_->Enable(!folder && !join_running_);
     m_.set_kind(folder ? simple::DestKind::Folder : simple::DestKind::PairedMachine);
 }
 
 void WizardPage::Restart(bool can_cancel) {
-    if (pair_) pair_->cancel = true;
-    pair_running_ = false;
-    pair_timer_.Stop();
+    if (join_) join_->cancel = true;
+    if (probe_cancel_) *probe_cancel_ = true;
+    join_running_ = false;
+    join_timer_.Stop();
     m_.reset();
+    inv_.reset();
     src_->SetValue("");
     dst_->SetValue("");
-    code_->SetValue("");
+    code_->ChangeValue("");
     r_folder_->SetValue(true);
     src_err_->Hide();
     dst_err_->Hide();
+    code_msg_->Hide();
+    inv_panel_->Hide();
+    probe_busy_->Stop();
+    join_busy_->Stop();
+    join_msg_->Hide();
     sas_->Hide();
     sas_hint_->Hide();
-    pair_msg_->Hide();
-    pair_busy_->Stop();
-    b_pcancel_->Hide();
+    b_jcancel_->Hide();
     b_quit_->Show(can_cancel);
     UpdateDestEnable();
     ShowStep();
@@ -275,7 +306,7 @@ void WizardPage::DropFolder(const std::string& path) {
 }
 
 void WizardPage::CheckInput(bool advance) {
-    if (busy_flag_ || pair_running_) return;
+    if (busy_flag_ || join_running_) return;
     m_.set_source(trim(S(src_->GetValue())));
     bool folder = r_folder_->GetValue();
     m_.set_kind(folder ? simple::DestKind::Folder : simple::DestKind::PairedMachine);
@@ -297,6 +328,8 @@ void WizardPage::CheckInput(bool advance) {
             src_err_->Show(!a.empty());
             if (m_.step() == WizardStep::Dest) {
                 auto b = m_.issues_for(WizardStep::Dest);
+                // Mã đang được kiểm / đã có lỗi riêng: không chồng thêm câu "hãy dán mã".
+                if (!r_folder_->GetValue() && inv_.stage() != CodeStage::Empty && inv_.stage() != CodeStage::Ready) b.clear();
                 dst_err_->SetText(W(join_nl(b)));
                 dst_err_->Show(!b.empty());
             } else {
@@ -308,142 +341,181 @@ void WizardPage::CheckInput(bool advance) {
         });
 }
 
-void WizardPage::CancelPair() {
-    if (pair_) pair_->cancel = true;
+// ---------------------------------------------------------------------------------------------- mã mời (phía gửi)
+void WizardPage::OnCodeText() {
+    if (join_running_) return;
+    std::string text = S(code_->GetValue());
+    if (!trim(text).empty() && !r_machine_->GetValue()) {   // dán mã = chọn cách "máy khác"
+        r_machine_->SetValue(true);
+        UpdateDestEnable();
+    }
+    if (probe_cancel_) *probe_cancel_ = true;
+    bool probe = inv_.set_text(text, now_unix());
+    m_.clear_paired();   // mã đổi: kết quả kiểm cũ không còn đúng
+    ShowCodeState();
+    if (probe) StartProbe();
 }
 
-void WizardPage::SendPairRequest() {
-    if (pair_running_ || busy_flag_) return;
-    simple::PairCode code;
-    std::string e = check_pair_code_text(S(code_->GetValue()), &code);
-    if (!e.empty()) {
-        pair_msg_->SetText(W(e));
-        pair_msg_->SetTextColour(kRed);
-        pair_msg_->Show();
-        sas_->Hide();
-        sas_hint_->Hide();
-        Layout();
+void WizardPage::StartProbe() {
+    simple::InviteCode code = inv_.code();
+    uint64_t gen = inv_.generation();
+    probe_cancel_ = std::make_shared<std::atomic<bool>>(false);
+    auto cancel = probe_cancel_;
+    SimpleHost* host = c_.host;
+    const bool demo = !simple_test_hooks().demo_invite_code.empty();
+    probe_busy_->Start(L("inv.checking"));
+    run_async<simple::InviteOutcome>(
+        alive_,
+        [code, cancel, host, demo]() {
+            if (demo) {   // chỉ ảnh tài liệu: không hỏi mạng, coi như máy kia đã trả lời
+                simple::InviteOutcome o;
+                o.kind = simple::InviteOutcome::Ok;
+                o.grant.machine = code.machine;
+                o.grant.label = code.label;
+                o.grant.perm = code.perm;
+                o.grant.expires_unix = code.expires_unix;
+                o.grant.uses_left = 1;
+                o.grant.fingerprint = simple::invite_fingerprint(code.server_key);
+                if (!code.addrs.empty()) o.grant.address = code.addrs[0];
+                o.grant.server_key = code.server_key;
+                return o;
+            }
+            KeyPair self = SimpleHost::load_or_create_client_key(host->paths());
+            return simple::probe_invite(code, self, *cancel);
+        },
+        [this, gen](bool ok, simple::InviteOutcome& o, const std::string& err) {
+            if (gen != inv_.generation()) return;   // người dùng đã sửa ô trong lúc chờ
+            probe_busy_->Stop();
+            if (!ok) {
+                o = simple::InviteOutcome{};
+                o.kind = simple::InviteOutcome::Failed;
+                o.message = err;
+            }
+            if (!inv_.apply_probe(gen, o)) return;
+            if (inv_.ready()) {
+                m_.set_paired(pair_code_from_grant(inv_.grant()));
+                m_.set_machine_label(inv_.summary(now_unix()).dest_label);
+            }
+            ShowCodeState();
+        });
+}
+
+void WizardPage::ShowCodeState() {
+    CodeStage st = inv_.stage();
+    if (st != CodeStage::Checking) probe_busy_->Stop();
+    bool err = st == CodeStage::Invalid || st == CodeStage::Failed;
+    code_msg_->SetText(W(inv_.error()));
+    code_msg_->SetTextColour(kRed);
+    code_msg_->Show(err);
+    if (st == CodeStage::Ready) {
+        InviteSummary s = inv_.summary(now_unix());
+        inv_sentence_->SetText(W(s.line));
+        std::string d = trf("inv.fp", {s.fingerprint});
+        inv_detail_->SetText(W(d));
+        inv_panel_->Show();
+        dst_err_->Hide();
+    } else {
+        inv_panel_->Hide();
+    }
+    content_->Layout();
+    Layout();
+}
+
+// ---------------------------------------------------------------------------------------------- Bắt đầu
+void WizardPage::CancelJoin() {
+    if (join_) join_->cancel = true;
+}
+
+void WizardPage::JoinTick() {
+    if (!join_running_ || !join_) return;
+    int s = join_->secs.load();
+    if (s >= 0) {
+        sas_hint_->Show();
+        sas_->Show();
+        content_->Layout();
+    }
+    join_busy_->Start(W(join_busy_text(s >= 0, s)));
+}
+
+void WizardPage::Begin() {
+    if (busy_flag_ || join_running_) return;
+    if (m_.input().kind == simple::DestKind::PairedMachine && inv_.ready()) {
+        StartJoin();
         return;
     }
+    SaveAndFinish();
+}
+
+void WizardPage::StartJoin() {
+    simple::InviteCode code = inv_.code();
     KeyPair self;
     try {
         self = SimpleHost::load_or_create_client_key(c_.host->paths());
     } catch (const std::exception& ex) {
-        pair_msg_->SetText(W(ex.what()));
-        pair_msg_->SetTextColour(kRed);
-        pair_msg_->Show();
-        Layout();
+        join_msg_->SetText(W(ex.what()));
+        join_msg_->Show();
+        content_->Layout();
         return;
     }
-    // Chuỗi xác nhận tính được ngay từ hai khoá công khai: hiện trước khi chờ để hai bên so cùng lúc.
-    sas_->SetLabelText(W(sas_display(simple::pair_sas(self.pub, code.server_key))));
-    sas_->Show();
-    sas_hint_->Show();
-    pair_msg_->Hide();
-    pair_ = std::make_shared<PairRun>();
-    pair_running_ = true;
-    b_send_->Disable();
-    code_->Disable();
-    r_folder_->Disable();
-    r_machine_->Disable();
-    b_dst_->Disable();
-    b_next_->Disable();
+    // Chuỗi xác nhận tính được ngay từ mã + khoá của máy này; chỉ hiện khi máy kia thật sự đang chờ người đồng ý.
+    sas_->SetLabelText(W(sas_display(simple::invite_sas(code, self))));
+    join_msg_->Hide();
+    join_ = std::make_shared<JoinRun>();
+    join_running_ = true;
+    b_start_->Disable();
     b_back_->Disable();
-    b_pcancel_->Show();
-    pair_busy_->Start(L("pair.waiting"));
-    pair_timer_.Start(prefers_reduced_motion() ? 1000 : 500);
-    auto run = pair_;
-    run_async<simple::PairOutcome>(
+    b_quit_->Disable();
+    b_jcancel_->Show();
+    join_busy_->Start(W(join_busy_text(false, 0)));
+    join_timer_.Start(prefers_reduced_motion() ? 1000 : 500);
+    const bool demo = !simple_test_hooks().demo_invite_code.empty();
+    auto run = join_;
+    run_async<simple::InviteOutcome>(
         alive_,
-        [code, self, run]() {
-            simple::PairingClient pc(code, self, simple::default_device_name());
-            return pc.run(run->cancel, [run](int s) { run->secs = s; });
-        },
-        [this, run, code](bool ok, simple::PairOutcome& o, const std::string& err) {
-            if (pair_ != run) return;  // lượt cũ đã bị thay
-            pair_running_ = false;
-            pair_timer_.Stop();
-            pair_busy_->Stop();
-            b_pcancel_->Hide();
-            r_folder_->Enable();
-            r_machine_->Enable();
-            b_next_->Enable();
-            b_back_->Enable();
-            code_->Enable();
-            b_send_->Enable();
-            UpdateDestEnable();
-            if (!ok) {
-                pair_msg_->SetText(W(err));
-                pair_msg_->SetTextColour(kRed);
-                sas_->Hide();
-                sas_hint_->Hide();
-            } else if (o.kind == simple::PairOutcome::Approved) {
-                m_.set_paired(code);
-                pair_msg_->SetText(W(pair_outcome_text(o)));
-                pair_msg_->SetTextColour(kGreen);
-            } else {
-                pair_msg_->SetText(W(pair_outcome_text(o)));
-                pair_msg_->SetTextColour(o.kind == simple::PairOutcome::Failed ? kRed : kAmber);
-                sas_->Hide();
-                sas_hint_->Hide();
+        [code, self, run, demo]() {
+            if (demo) {
+                simple::InviteOutcome o;
+                o.kind = simple::InviteOutcome::Failed;
+                o.message = "demo";
+                return o;
             }
-            pair_msg_->Show();
+            return simple::redeem_invite(code, self, simple::default_device_name(), run->cancel,
+                                         [run](int s) { run->secs = s; });
+        },
+        [this, run](bool ok, simple::InviteOutcome& o, const std::string& err) {
+            if (join_ != run) return;   // lượt cũ đã bị thay
+            join_running_ = false;
+            join_timer_.Stop();
+            join_busy_->Stop();
+            b_jcancel_->Hide();
+            b_start_->Enable();
+            b_back_->Enable();
+            b_quit_->Enable();
+            sas_->Hide();
+            sas_hint_->Hide();
+            if (!ok) {
+                join_msg_->SetText(W(err));
+                join_msg_->Show();
+            } else if (o.kind != simple::InviteOutcome::Ok) {
+                join_msg_->SetText(W(invite_outcome_text(o)));
+                join_msg_->Show();
+            } else {
+                // Máy kia đã cho vào: đích là địa chỉ đã trả lời + khoá máy kia (ghim); máy kia tự áp thư mục con / quyền.
+                m_.set_paired(pair_code_from_grant(o.grant));
+                m_.set_machine_label(inv_.summary(now_unix()).dest_label);
+                content_->Layout();
+                Layout();
+                SaveAndFinish();
+                return;
+            }
             content_->Layout();
             Layout();
         });
+    content_->Layout();
     Layout();
 }
 
-void WizardPage::PairTick() {
-    if (!pair_running_ || !pair_) return;
-    int s = pair_->secs.load();
-    pair_busy_->Start(s >= 0 ? W(trf("pair.waiting_left", {fmt_countdown(s)})) : L("pair.waiting"));
-}
-
-void WizardPage::AutoDrive(const std::string& src, const std::string& dst) {
-    auto_src_ = src;
-    auto_dst_ = dst;
-    auto_ = true;
-    auto_timer_.Start(500);
-}
-
-void WizardPage::AutoStep() {
-    if (!auto_ || IsBusy()) return;
-    switch (m_.step()) {
-        case WizardStep::Source:
-            if (src_->GetValue().empty()) src_->SetValue(W(auto_src_));
-            if (simple_test_hooks().auto_stop == 0) {  // chụp ảnh tài liệu: dừng ở bước 1 với thư mục đã chọn
-                auto_ = false;
-                auto_timer_.Stop();
-                CheckInput(false);
-                break;
-            }
-            CheckInput(true);
-            break;
-        case WizardStep::Dest:
-            if (dst_->GetValue().empty()) dst_->SetValue(W(auto_dst_));
-            if (simple_test_hooks().auto_stop == 1) {
-                auto_ = false;
-                auto_timer_.Stop();
-                CheckInput(false);
-                break;
-            }
-            CheckInput(true);
-            break;
-        case WizardStep::Finish:
-            if (simple_test_hooks().auto_stop == 2) {
-                auto_ = false;
-                auto_timer_.Stop();
-                break;
-            }
-            auto_ = false;
-            auto_timer_.Stop();
-            Begin();
-            break;
-    }
-}
-
-void WizardPage::Begin() {
+void WizardPage::SaveAndFinish() {
     if (busy_flag_) return;
     simple::WizardInput in = m_.input();
     SimpleHost* host = c_.host;
@@ -473,6 +545,58 @@ void WizardPage::Begin() {
             }
             if (done_) done_();
         });
+}
+
+void WizardPage::AutoDrive(const std::string& src, const std::string& dst) {
+    auto_src_ = src;
+    auto_dst_ = dst;
+    auto_ = true;
+    auto_timer_.Start(500);
+}
+
+void WizardPage::AutoStep() {
+    if (!auto_ || IsBusy()) return;
+    switch (m_.step()) {
+        case WizardStep::Source:
+            if (src_->GetValue().empty()) src_->SetValue(W(auto_src_));
+            if (simple_test_hooks().auto_stop == 0) {  // chụp ảnh tài liệu: dừng ở bước 1 với thư mục đã chọn
+                auto_ = false;
+                auto_timer_.Stop();
+                CheckInput(false);
+                break;
+            }
+            CheckInput(true);
+            break;
+        case WizardStep::Dest:
+            if (!simple_test_hooks().demo_invite_code.empty()) {   // ảnh tài liệu: dán mã mẫu, đợi kiểm xong
+                if (!auto_code_done_) {
+                    auto_code_done_ = true;
+                    code_->SetValue(W(simple_test_hooks().demo_invite_code));
+                    break;
+                }
+                if (!inv_.ready()) break;
+            } else if (dst_->GetValue().empty()) {
+                dst_->SetValue(W(auto_dst_));
+            }
+            if (simple_test_hooks().auto_stop == 1) {
+                auto_ = false;
+                auto_timer_.Stop();
+                CheckInput(false);
+                break;
+            }
+            CheckInput(true);
+            break;
+        case WizardStep::Finish:
+            if (simple_test_hooks().auto_stop == 2) {
+                auto_ = false;
+                auto_timer_.Stop();
+                break;
+            }
+            auto_ = false;
+            auto_timer_.Stop();
+            Begin();
+            break;
+    }
 }
 
 }  // namespace mysync::gui

@@ -19,7 +19,7 @@ const Entry kTable[] = {
 #include "i18n_strings.inc"
 #include "i18n_strings_ui.inc"
 #include "i18n_strings_simple.inc"
-#include "i18n_strings_server.inc"
+#include "i18n_strings_invite.inc"
 };
 
 std::atomic<int> g_lang{0};

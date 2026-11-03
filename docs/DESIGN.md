@@ -150,6 +150,63 @@ Tên hiển thị của máy gửi: ≤ 40 ký tự UTF-8, không điều khiể
 
 Không được bảo đảm: (1) nếu người dùng bấm Đồng ý mà không so SAS thì không có gì ngăn một yêu cầu từ kẻ lạ trong cửa sổ ghép được chấp nhận (mọi cơ chế "bấm xác nhận" đều vậy); (2) mã đi qua kênh nào thì kênh đó thấy địa chỉ và khoá công khai; (3) chặn theo IP không chống được kẻ có nhiều địa chỉ, giới hạn toàn cục mới là chốt; (4) không chống kẻ đã kiểm soát máy nhận hay máy gửi; (5) địa chỉ trong mã phải tới được từ máy gửi (NAT, tường lửa là việc của người dùng); (6) ghép xong, quyền là đọc-ghi trong một thư mục riêng — thu hồi bằng cách xoá `[[client]]` tương ứng.
 
+## Mã mời MSY2 (Đợt 11): MỘT mã nối hai máy
+
+Lý do: bản ghép MSY1 chỉ chạy khi có người ngồi ở máy nhận bấm Đồng ý, còn hộp "Dựng máy chủ" in khoá công khai + `client.toml` + `peer add` mà giao diện máy gửi không dùng được; máy chủ không người trông thì không nối được. Luật mới: **thứ máy nhận tạo ra phải dùng thẳng được ở máy gửi** — một mã duy nhất. Từ ngữ khoá/toml/peer chỉ còn ở dòng lệnh và mục "Chi tiết" đóng sẵn. Mã nguồn: `include/mysync/simple/invite.h`, `src/simple_invite.cpp`; phía máy chủ `server.cpp` (`serve_invited`), `gui_daemon.cpp` (`grant_peer`, các lệnh `Invite*`), dòng lệnh `mysync invite` trong `cli_ops.cpp`.
+
+### Định dạng
+
+`MSY2-` + base32 Crockford (như MSY1, nhóm 5 ký tự) của payload:
+
+```
+version(1)=1 | khoá CÔNG KHAI máy nhận (32) | id lời mời (8) | bí mật (16, 128 bit) | hết hạn u32 BE (giây UNIX) | perm (1: 0 ro, 1 rw)
+ | số địa chỉ (1..3) | n x [cổng u16 BE | độ dài host (1) | host] | tên máy (1+n) | nhãn thư mục (1+n) | checksum (4)
+checksum = 4 byte đầu của BLAKE2b-256 trên mọi byte đứng trước
+```
+
+Mã **không bao giờ chứa khoá bí mật**. `decode` ném lỗi chung (không lặp lại nội dung nhập) khi: sai tiền tố/phiên bản, ký tự ngoài bảng, độ dài sai, checksum sai, host/cổng/số địa chỉ vô lý, UTF-8 hỏng hoặc có ký tự điều khiển trong nhãn, perm lạ, thừa byte. Địa chỉ: máy desktop đưa địa chỉ LAN của nó (tối đa 3); máy chủ dùng `--address`, hoặc `bind` đã cấu hình cộng tên máy. Không có relay: máy gửi phải tới được một trong các địa chỉ đó (LAN thì được; qua Internet máy nhận cần IP công khai hoặc mở cổng).
+
+### Kho lời mời (`invites.d`) trên máy nhận
+
+Mỗi lời mời một tệp `<id>.invite` (dạng `khoá = giá trị`) trong `<thư mục cấu hình>/invites.d`, ghi nguyên tử (tệp tạm + đổi tên) dưới khoá liên tiến trình để `mysync invite create` ở một tiến trình và máy chủ đang chạy ở tiến trình khác không làm mất cập nhật của nhau. Tệp giữ: id, perm, **thư mục tuyệt đối** (mỗi lời mời trỏ tới MỘT thư mục bất kỳ do người tạo chọn), số lần dùng còn lại, hạn, ai tạo (`cli`/`gui`), cờ `ask`, cờ thu hồi, danh sách máy đã vào, và **chỉ một giá trị kiểm chứng suy ra từ bí mật** (khoá công khai Ed25519 với seed = BLAKE2b("MSY2-seed" || bí mật)). Bí mật không bao giờ được lưu, nên lộ `invites.d` không cho phép dùng lời mời đó.
+
+### Đổi mã (redeem)
+
+1. Máy gửi nối bằng Noise IK **ghim khoá máy nhận lấy từ mã** (kẻ chen giữa không trả lời được).
+2. Trong kênh đã mã hoá, gửi `REDEEM{id, cờ, chữ ký, tên máy}`. Chữ ký (Ed25519, khoá suy ra từ bí mật) phủ `"MSY2-redeem-v1" || cờ || băm bắt tay (SecureChannel::handshake_hash) || khoá công khai máy gửi || id`, nên **gắn với đúng phiên này**: phát lại ở phiên khác thất bại.
+3. Máy nhận kiểm chữ ký, rồi kiểm (không lộ lý do) còn hạn, còn lượt, chưa thu hồi; sau đó: thêm máy gửi vào `peers.d` với perm và thư mục riêng (`root` của peer) của lời mời qua cùng logic `peer_add` (nguyên tử, hoàn tác nếu nạp lại lỗi), trừ một lượt, ghi một dòng kiểm toán (`invite AUDIT ...` vào log và `invites.d/audit.log`, không có bí mật).
+4. Mọi lý do thất bại (id lạ, chữ ký sai, hết hạn, hết lượt, thu hồi, lời mời tạo qua GUI khi `pairing = "off"`) đều nhận **cùng một** `Rejected`. Thất bại bị giới hạn theo IP (và tính như xác thực sai); phiên chưa ghép chỉ được nói `REDEEM`/`BYE`, ngân sách phiên riêng (4, 2 mỗi IP).
+5. Trả về `Granted{perm, tên máy, nhãn, hạn, lượt còn}` để máy gửi tự cấu hình đích. Cờ `dry run` (bit 0) dùng cho bước kiểm nhanh khi dán mã: kiểm chữ ký và trạng thái nhưng không trừ lượt, không thêm máy.
+
+### `ask` (chỉ lời mời tạo từ giao diện)
+
+"Hỏi tôi trước khi cho vào" (mặc định bật): sau khi chữ ký hợp lệ, yêu cầu nằm chờ; máy nhận thấy **tên máy + chuỗi SAS** (`pair_sas`) và bấm Đồng ý/Từ chối như MSY1; chỉ khi Đồng ý mới ghi peer và trừ lượt. Bỏ chọn thì tự động. Trên máy chủ (`mysync invite create`) **không bao giờ cần xác nhận tương tác**.
+
+### Thư mục riêng cho từng máy (per-peer root)
+
+Một daemon, một cổng, nhưng mỗi máy được lời mời cho vào bị **nhốt trong đúng thư mục của lời mời đó** (`root` của peer, khoá `root` trong `peers.d`/`[[client]]`; trống = gốc của máy chủ như trước). Không có "thư mục nhận chung". Quy tắc: thư mục được kiểm như một gốc hiện nay (link/junction ở bất kỳ thành phần nào bị từ chối; MySync tự tạo thì tạo riêng tư; mở cho người khác ghi khi chạy quyền cao thì lỗi `UntrustedFolderError` kèm đường "Khoá quyền thư mục"/`--fix-permissions`); hai máy **không** được có gốc trùng hay lồng nhau trừ khi cùng một thư mục của cùng một lời mời (chung nhau thư mục đó); kiểm khi tạo lời mời và khi cấp quyền (chuẩn hoá đường dẫn, không phân biệt hoa thường trên Windows). Thùng rác `__sync/__trash`, chỉ mục, hạn mức đều tính theo từng máy trong thư mục của nó.
+
+### Lời mời chỉ-xem (ro) ở máy gửi
+
+Giao diện máy gửi **chặn ngay lúc dán mã**: "Mã này chỉ cho xem, không dùng để gửi tệp lên máy kia được…"; trình hướng dẫn không tới được bước Bắt đầu. Mã ro vẫn tạo được bằng `mysync invite create --ro` cho quản trị.
+
+### `pairing = "off"`
+
+Giữ nguyên nghĩa: tắt các lời mời tạo qua giao diện/kênh điều khiển (các lệnh `Invite*` bị từ chối, lời mời `gui` còn sót bị từ chối khi đổi). **Không** chặn lời mời quản trị viên tạo bằng `mysync invite create` (người tạo là quản trị viên, có quyền ghi cấu hình). Ghép MSY1 mặt đối mặt vẫn mặc định tắt trên máy chủ; giao diện không còn đường tới nó, lõi và cấu hình cũ vẫn đọc được.
+
+### Mối đe doạ
+
+| Mối đe doạ | Cách chặn |
+|---|---|
+| Mã bị lộ | mã là bí mật mang quyền: mặc định 1 lượt, 24 giờ, một thư mục, một perm; thu hồi được ngay; `ask` cho thêm người duyệt |
+| Kẻ nghe/chen giữa | khoá máy nhận ghim từ mã; chữ ký gắn băm bắt tay, không phát lại được |
+| Đoán bí mật | 128 bit; giới hạn thất bại theo IP; chỉ lưu giá trị kiểm chứng một chiều |
+| Lộ `invites.d` | không chứa bí mật; thư mục riêng tư; không dùng để đổi mã |
+| Máy gửi đổi tên độc hại | `clean_display_name`; thư mục do lời mời quyết định, không do máy gửi |
+| Dò lý do thất bại | mọi lý do cùng một `Rejected`; thời gian kiểm chữ ký xảy ra trước tra cứu trạng thái |
+
+Không được bảo đảm: kẻ có mã dùng trước người được mời thì là người vào (bật `ask` để loại trừ); chặn theo IP không chống kẻ nhiều địa chỉ; địa chỉ trong mã phải tới được; kẻ đã kiểm soát máy nhận hay máy gửi.
+
 ## Chế độ Đơn giản: engine con, khoá thư mục, nâng lên dịch vụ
 
 - **Cấu hình người dùng** ở `%APPDATA%\MySync\` / `~/.config/mysync/` (`UserPaths`): `config.toml`, `server-user.toml`, `key`, `receiver.key`, `state/`, `receiver-state/`, `log/`. Thư mục và khoá chỉ người dùng đó truy cập (Windows: DACL có bảo vệ, chỉ người dùng + SYSTEM; Linux 0700/0600). Tin cậy cấu hình đi nhánh "tài khoản thường, tệp của chính mình" (`need_strict_trust` = false).

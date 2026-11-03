@@ -77,6 +77,7 @@ struct PeerSpec {
     std::string name;
     PublicKey key{};
     bool read_only = false;
+    std::optional<std::string> root;             // absolute folder this peer is confined to ("" = the server root); absent = keep
     std::optional<std::string> prefix;           // absent = keep the peer's current folder (a new peer: whole root); "" = whole root
     std::optional<uint32_t> max_sessions;
     std::optional<uint32_t> max_bandwidth_kbps;

@@ -14,6 +14,7 @@
 #include <set>
 #include <string>
 
+#include "invite_model.h"
 #include "mysync/gui/ipc.h"
 #include "shared.h"
 #include "simple_host.h"
@@ -37,6 +38,8 @@ struct SimpleTestHooks {
     int auto_stop = -1;         // --wizard-stop: dừng trình hướng dẫn tự lái ở bước này (0..2)
     bool redact_account = false;   // --redact-account: ảnh tài liệu thay tên người dùng/tên máy thật bằng tên mẫu
     std::string dialog_shot;
+    std::string demo_invite_code;   // --demo-invite-code: mã MSY2 mẫu cho ảnh tài liệu; bước 2 coi như đã kiểm xong (không hỏi mạng)
+    std::string invite_demo_folder, invite_demo_png, invite_demo_joined;   // --invite-demo*: hộp "Cho máy khác gửi tệp tới đây"
     std::string dialog_shot_open;   // --dialog-shot-open: PNG của hộp khi đã mở phần Chi tiết    // --dialog-shot: hộp xác nhận cài dịch vụ tự chụp ra PNG rồi tự đóng (KHÔNG cài gì)
 };
 SimpleTestHooks& simple_test_hooks();
@@ -81,7 +84,7 @@ public:
     ~WizardPage() override;
     void Restart(bool can_cancel);           // về bước 1, xoá lựa chọn cũ
     void DropFolder(const std::string& path);  // kéo-thả vào cửa sổ
-    bool IsBusy() const { return busy_flag_ || pair_running_; }
+    bool IsBusy() const { return busy_flag_ || join_running_; }
     void AutoDrive(const std::string& src, const std::string& dst);  // kiểm thử: đi hết ba bước bằng sự kiện thật
 
 private:
@@ -92,10 +95,14 @@ private:
     void CheckInput(bool advance);
     void ChooseSource();
     void ChooseDest();
-    void SendPairRequest();
-    void CancelPair();
-    void PairTick();
+    void OnCodeText();
+    void StartProbe();
+    void ShowCodeState();
+    void StartJoin();
+    void CancelJoin();
+    void JoinTick();
     void Begin();
+    void SaveAndFinish();
     void UpdateDestEnable();
     void SetBusy(bool on, const char* key);
     void AutoStep();
@@ -103,79 +110,76 @@ private:
     SimpleCtx& c_;
     std::function<void()> done_, cancel_;
     WizardModel m_;
+    SenderInviteModel inv_;
     wxBoxSizer* root_ = nullptr;
     wxStaticText *title_ = nullptr, *stepno_ = nullptr;
     wxSimplebook* book_ = nullptr;
     wxPanel* content_ = nullptr;
     BusyIndicator* busy_ = nullptr;
-    WrapText *src_err_ = nullptr, *dst_err_ = nullptr, *summary_ = nullptr, *pair_msg_ = nullptr;
+    WrapText *src_err_ = nullptr, *dst_err_ = nullptr, *summary_ = nullptr, *code_msg_ = nullptr, *inv_sentence_ = nullptr,
+             *inv_detail_ = nullptr, *join_msg_ = nullptr;
     wxTextCtrl *src_ = nullptr, *dst_ = nullptr, *code_ = nullptr;
     wxRadioButton *r_folder_ = nullptr, *r_machine_ = nullptr;
-    wxButton *b_src_ = nullptr, *b_dst_ = nullptr, *b_send_ = nullptr, *b_pcancel_ = nullptr;
+    wxButton *b_src_ = nullptr, *b_dst_ = nullptr, *b_details_ = nullptr, *b_jcancel_ = nullptr;
+    wxPanel* inv_panel_ = nullptr;
     wxStaticText *sas_ = nullptr, *sas_hint_ = nullptr;
     wxButton *b_back_ = nullptr, *b_next_ = nullptr, *b_start_ = nullptr, *b_quit_ = nullptr;
-    BusyIndicator* pair_busy_ = nullptr;
-    wxTimer pair_timer_, auto_timer_;
+    BusyIndicator *probe_busy_ = nullptr, *join_busy_ = nullptr;
+    wxTimer join_timer_, auto_timer_;
     std::string auto_src_, auto_dst_;
-    bool auto_ = false;
-    struct PairRun {
+    bool auto_ = false, auto_code_done_ = false;
+    std::shared_ptr<std::atomic<bool>> probe_cancel_;
+    struct JoinRun {
         std::atomic<bool> cancel{false};
         std::atomic<int> secs{-1};
     };
-    std::shared_ptr<PairRun> pair_;
-    bool pair_running_ = false;
+    std::shared_ptr<JoinRun> join_;
+    bool join_running_ = false;
     bool busy_flag_ = false;
     AliveFlag alive_ = make_alive();
 };
 
-// Một ô nhận file: công tắc, mã ghép, hộp thoại duyệt.
+// Ô "Nhận tệp từ máy khác" trên màn Trạng thái: một nút mở hộp thoại "Cho máy khác gửi tệp tới đây" (mã mời MSY2) và bộ canh
+// các yêu cầu cần người dùng đồng ý (mã tạo với "Hỏi tôi trước khi cho vào"): hộp xác nhận hiện dù hộp thoại đã đóng.
+class InviteDialog;
 class ReceiveBox : public wxPanel {
 public:
     ReceiveBox(wxWindow* parent, SimpleCtx& c);
     ~ReceiveBox() override;
-    void RestoreAtStartup();   // đã bật lần trước thì chạy lại engine nhận (chưa mở cửa sổ ghép)
-    bool IsOn() const { return on_; }
-    void AutoEnable(const std::string& folder, bool with_code = true);   // kiểm thử: bật nhận với thư mục này, không hỏi
+    void RestoreAtStartup();   // đã dùng lần trước: bộ nhận đã được MainFrame bật; ở đây chỉ canh yêu cầu cần đồng ý
+    void OpenDialog();
+    void AutoDemo();           // ảnh tài liệu: mở hộp thoại, điền thư mục mẫu và tạo mã thật
+
+    // ---- cho InviteDialog (gọi ở luồng UI; kết quả trả về luồng UI)
+    struct CreateResult {
+        bool ok = false;
+        std::string code, error, untrusted_folder;
+        InviteListInfo info;
+    };
+    void CreateCode(const ReceiverForm& form, bool fix_permissions, std::function<void(bool, CreateResult&, const std::string&)> done);
+    void RemoveMachine(const std::string& key_hex, std::function<void(bool, InviteListInfo&, const std::string&)> done);
+    void RevokeInvite(const std::string& id_hex, std::function<void(bool, InviteListInfo&, const std::string&)> done);
+    void RefreshNow() { Tick(); }
+    void DialogClosed() { dlg_ = nullptr; }
+    std::string DefaultFolder() const;   // gợi ý ban đầu (thư mục MySync-Nhan trong Tài liệu); người dùng chọn thư mục khác tuỳ ý
+    SimpleCtx& ctx() { return c_; }
 
 private:
-    void OnToggle(bool want);
-    void StartReceiving(bool open_window);
-    void StopReceiving();
-    void OpenWindow();
     void Tick();
-    void ApplyInfo(const PairInfo& pi);
-    void CancelCode();
-    void MarkCodeUsed();
-    void Rebuild();
-    void RebuildCode();
-    void ShowApprove(const PairPendingInfo& p);
-    void Resize();
+    void OnInfo(const InviteListInfo& info);
+    void ShowApprove(const simple::PendingInvite& p);
+    void Watch(bool on);
 
     SimpleCtx& c_;
     AliveFlag alive_ = make_alive();
-    wxCheckBox* chk_ = nullptr;
-    wxPanel* body_ = nullptr;
-    BusyIndicator* busy_ = nullptr;
-    wxTextCtrl* code_ = nullptr;
-    wxChoice* ip_ = nullptr;
-    wxStaticText *folder_ = nullptr, *count_ = nullptr, *portl_ = nullptr;
-    WrapText *fw_ = nullptr, *result_ = nullptr;
-    wxButton *copy_ = nullptr, *reopen_ = nullptr, *chg_ = nullptr, *cancel_code_ = nullptr;
-    wxPanel* code_row_ = nullptr;
     wxTimer timer_;
-    bool on_ = false;
+    bool watching_ = false;
     bool ticking_ = false;
-    bool changing_ = false;
-    bool window_open_ = false;
-    int secs_left_ = 0;
-    std::string pub_hex_;
-    std::string token_hex_;   // mật mã dùng một lần của mã hiện tại; chỉ có ngay khi bật, không bao giờ đọc lại được
-    bool code_used_ = false;
-    uint16_t port_ = 0;
-    std::vector<std::string> ips_;
-    std::set<uint32_t> dismissed_;
-    class ApproveDialog* dlg_ = nullptr;
-    uint32_t dlg_id_ = 0;
+    bool working_ = false;
+    InviteDialog* dlg_ = nullptr;
+    class ApproveDialog* approve_ = nullptr;
+    uint32_t approve_id_ = 0;
+    std::vector<uint32_t> dismissed_;
     friend class ApproveDialog;
 };
 
@@ -191,7 +195,8 @@ public:
     void RestoreReceiver() { if (recv_) recv_->RestoreAtStartup(); }
     void SetQuitting(bool on);
     void AutoServiceDialog() { ToServiceClick(); }   // kiểm thử: mở hộp xác nhận cài dịch vụ
-    void AutoReceive(const std::string& folder, bool with_code) { if (recv_) recv_->AutoEnable(folder, with_code); }
+    void OpenInvite() { if (recv_) recv_->OpenDialog(); }
+    void AutoInviteDemo() { if (recv_) recv_->AutoDemo(); }
     void OnShown() { UpdateAutostart(); }   // đọc lại ô "Tự chạy khi tôi đăng nhập" từ hệ thống
 
 private:

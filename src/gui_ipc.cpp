@@ -1199,4 +1199,37 @@ std::string ControlClient::pair_approve(uint32_t id) {
 
 void ControlClient::pair_deny(uint32_t id) { pair_call(*this, ControlOp::PairDeny, id, take_token(m_, next_token_)); }
 
+namespace {
+InviteListInfo invite_call(ControlClient& c, ControlOp op, uint32_t arg, Bytes payload, uint64_t token) {
+    ControlRequest q;
+    q.op = op;
+    q.token = token;
+    q.arg = arg;
+    q.payload = std::move(payload);
+    ControlResponse r = c.call(q);
+    if (r.status == ControlStatus::Unsupported) throw Error(r.error.empty() ? "this program does not accept invites" : r.error);
+    if (r.status != ControlStatus::Ok) throw Error(r.error.empty() ? "invite request refused" : r.error);
+    return std::move(r.invites);
+}
+}  // namespace
+
+InviteListInfo ControlClient::invite_create(const InviteCreateReq& req) {
+    return invite_call(*this, ControlOp::InviteCreate, 0, encode_invite_create(req), take_token(m_, next_token_));
+}
+InviteListInfo ControlClient::invite_list() {
+    return invite_call(*this, ControlOp::InviteList, 0, {}, take_token(m_, next_token_));
+}
+InviteListInfo ControlClient::invite_revoke(const std::string& id) {
+    return invite_call(*this, ControlOp::InviteRevoke, 0, encode_invite_text(id), take_token(m_, next_token_));
+}
+InviteListInfo ControlClient::invite_remove_machine(const std::string& key_hex) {
+    return invite_call(*this, ControlOp::InviteRemoveMachine, 0, encode_invite_text(key_hex), take_token(m_, next_token_));
+}
+InviteListInfo ControlClient::invite_approve(uint32_t id) {
+    return invite_call(*this, ControlOp::InviteApprove, id, {}, take_token(m_, next_token_));
+}
+InviteListInfo ControlClient::invite_deny(uint32_t id) {
+    return invite_call(*this, ControlOp::InviteDeny, id, {}, take_token(m_, next_token_));
+}
+
 }  // namespace mysync::gui

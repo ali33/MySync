@@ -81,6 +81,9 @@ struct ClientAcl {
     std::vector<PublicKey> extra_keys;
     std::string source;       // "" = the main file; else the peers.d file name (not written to the configuration)
     bool read_only = false;   // access = "ro"
+    // Absolute folder that is this client's whole world ("" = the server's root). Set for machines that joined by an invitation:
+    // each one is confined to its own folder, `prefix` (if any) then lies inside it. Two clients never overlap unless equal.
+    std::string root;
     std::string prefix;       // sub-directory of root this client may see ("" = whole root), no leading/trailing '/'
     uint32_t max_sessions = 4;                              // concurrent sessions of this client (0 = unlimited)
     uint64_t max_write_bytes_per_hour = 50ull << 30;        // bytes received in any sliding hour (0 = unlimited)

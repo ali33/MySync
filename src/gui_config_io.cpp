@@ -270,6 +270,7 @@ std::string serialize_server_config(const ServerConfig& c) {
             kv(o, "public_keys", arr(ks));
         }
         kv(o, "access", q(a.read_only ? "ro" : "rw"));
+        if (!a.root.empty()) kv(o, "root", q(a.root));
         if (!a.prefix.empty()) kv(o, "prefix", q(a.prefix));
         kv(o, "max_sessions", std::to_string(a.max_sessions));
         kv(o, "max_bandwidth_kbps", std::to_string(a.max_bandwidth_kbps));

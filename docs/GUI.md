@@ -87,7 +87,7 @@ Nếu có dịch vụ đang chạy và trả lời, GUI vào thẳng chế độ
 1. **Thư mục nào cần được giữ bản sao?** Bấm *Chọn thư mục…*, gõ đường dẫn hoặc **kéo-thả một thư mục** từ Explorer vào cửa sổ. Lỗi hiện ngay dưới ô bằng lời dễ hiểu kèm đường dẫn/lỗi hệ thống nguyên văn (không thấy thư mục, là tệp chứ không phải thư mục, là cả ổ đĩa, nằm trong thư mục làm việc của MySync...).
 2. **Bản sao sẽ được lưu ở đâu?**
    - *Một thư mục khác, ổ USB hoặc thư mục chia sẻ trong mạng*: chọn thư mục hoặc gõ `\\tên-máy\chia-sẻ`. GUI thử ghi một tệp nhỏ để chắc chắn ghi được.
-   - *Một máy tính khác có cài MySync*: dán **mã ghép** (xem dưới), bấm *Gửi yêu cầu ghép*. Màn hình hiện **chuỗi xác nhận** (4 nhóm ký tự, chữ lớn), dòng "Đang chờ máy kia đồng ý…" có vòng quay và đếm ngược, nút *Huỷ*; quá 2 phút báo rõ "Hết thời gian chờ". Xong mới sang bước 3.
+   - *Một máy tính khác có cài MySync*: dán **mã mời** `MSY2-…` (xem dưới). Dán xong MySync kiểm ngay ở nền (có vòng quay): đúng định dạng/checksum, còn hạn, tới được máy kia; rồi nói bằng lời thường tên máy, nhãn thư mục, quyền ("được gửi và sửa tệp"), thời gian còn lại và số lần dùng; vân tay khoá nằm trong **Chi tiết** (đóng sẵn). Mã **chỉ-xem** bị chặn ngay ("Mã này chỉ cho xem, không dùng để gửi tệp lên máy kia được…") và nút *Tiếp theo* tắt. Bấm *Bắt đầu đồng bộ* ở bước 3 mới đổi mã (thêm đích tự động); nếu máy nhận bật "Hỏi tôi trước" thì màn hình hiện **chuỗi xác nhận**, vòng quay + đếm ngược "Đang chờ máy kia đồng ý…" và nút *Huỷ*.
 3. **Sẵn sàng.** Một câu tóm tắt ("MySync sẽ giữ thư mục "…" luôn có bản sao ở … Tệp tạm và tệp hệ thống được bỏ qua; tệp bị xoá hoặc ghi đè được cất vào thùng rác; mọi thay đổi được gửi đi ngay"). Bấm **Bắt đầu đồng bộ**: ghi cấu hình (kèm bản sao `.bak` nếu đã có), tạo khoá, khởi động bộ đồng bộ, bật *Tự chạy khi tôi đăng nhập* (mặc định bật sau lần đầu, tắt được ở màn Trạng thái) và chuyển sang màn Trạng thái.
 
 ### Màn Trạng thái gọn
@@ -119,14 +119,16 @@ Câu lớn đổi theo tình hình, màu cũng đổi (icon khay đổi theo): *
 - **Chế độ nâng cao**: nút bật/tắt hiện bốn tab cũ ngay bên dưới (cùng cấu hình `config.toml` của người dùng; Lưu ở tab Cấu hình sẽ nạp lại nóng).
 - **Chạy cả khi chưa đăng nhập máy (cài dịch vụ)**: hỏi bằng lời thường, rồi chuyển từng bước (dừng bộ đồng bộ của bạn, chuyển cấu hình sang nơi an toàn của hệ thống, cài và chạy dịch vụ) qua hộp xin quyền quản trị; có chỉ báo động và tên bước đang chạy; lỗi hiện nguyên văn kèm bước hỏng, và hệ thống tự trả về như cũ nếu có thể (câu báo cho biết đã trả lại được hay chưa). Có chiều ngược **Quay lại chạy dưới tài khoản của tôi**. Khi đang chạy dịch vụ, nút *Thêm thư mục* tạm tắt (dùng chế độ nâng cao).
 
-### Ghép hai máy bằng mã (không phải chép khoá)
+### Mã mời MSY2: một mã nối hai máy
 
-![Cho phép máy khác gửi file vào đây](images/gui-06-cho-phep-may-khac.png)
+![Máy nhận: Cho máy khác gửi tệp tới đây](images/gui-09-cho-may-khac-gui.png)
 
-(Ảnh chụp lúc đã bật nhận file nhưng **chưa có mã ghép**; bấm *Tạo mã mới* thì hiện dòng mã `MSY1-…` kèm nút *Sao chép*, danh sách địa chỉ và cổng của máy. Ảnh không chứa mã hay địa chỉ mạng thật.)
-**Máy NHẬN** (máy giữ bản sao): tại ô *Nhận file từ máy khác* bật *Cho phép máy khác gửi file vào đây*. Lần đầu GUI hỏi thư mục sẽ chứa file nhận được (mặc định `Documents\MySync-Nhan`), chạy bộ nhận, rồi mở **cửa sổ ghép 10 phút** (có đếm ngược). Màn hình hiện **mã ghép** một dòng (bắt đầu bằng `MSY1-`); mỗi lần bật là một mã MỚI có mật mã **dùng một lần** (hết hạn sau ít phút, có đếm ngược; nút *Tạo mã mới* và *Huỷ mã*): sau khi có một máy xin ghép (đồng ý hay không) mã cũ hết hiệu lực và màn hình nói rõ; máy gửi sai/thiếu mật mã hoặc dùng mã hết hạn/đã dùng chỉ thấy câu "Không ghép được…" chung và máy nhận không thấy hộp Đồng ý; nếu máy nhận cấm ghép bằng mã (`pairing = off`) công tắc báo "Máy này đang cấm ghép bằng mã" và không bật được. Mã ghép hiện ra, nút *Sao chép*, danh sách địa chỉ IP của máy này trong mạng (địa chỉ mạng nội bộ xếp đầu) và, nếu cần, nhắc mở tường lửa bằng lời thường. Khi máy kia xin ghép, hiện hộp thoại: **tên máy gửi + chuỗi xác nhận** lớn + "Hãy kiểm tra máy kia đang hiện đúng chuỗi này" + *Đồng ý* / *Từ chối*. Chỉ đồng ý khi hai chuỗi giống hệt nhau. Máy đã ghép vẫn gửi được sau khi cửa sổ ghép đóng; muốn ghép thêm máy bấm *Ghép thêm máy*.
+(Ảnh chụp thật với dữ liệu mẫu `demo-*`; sinh bằng các tham số chụp ảnh, xem "Tham số dòng lệnh thêm".)
+**Máy NHẬN**: bấm **Cho máy khác gửi tệp tới đây…** (ô *Nhận tệp từ máy khác* ở màn Trạng thái, hoặc menu Cài đặt). Hộp thoại có: thư mục nhận (**thư mục nào cũng được**, không có "thư mục nhận chung"); quyền **Gửi và sửa tệp** (mặc định) hoặc **Chỉ xem**; hạn dùng (mặc định 24 giờ; 1 giờ / 24 giờ / 7 ngày); số lần dùng (mặc định 1); ô **Hỏi tôi trước khi cho vào** (tích sẵn: khi máy gửi dán mã, hộp *Đồng ý/Từ chối* hiện tên máy + chuỗi xác nhận lớn như trước; bỏ tích thì vào tự động). **Tạo mã** hiện mã một dòng kèm nút **Chép** và vòng quay "Đang chờ máy kia…". Phía dưới: **Các máy đã vào** (nút **Gỡ**, hỏi lại trước khi gỡ) và **Mã đang dùng được** (nút **Huỷ mã**). Thư mục chưa có thì MySync tạo riêng tư; thư mục đã có mà người khác ghi được khi MySync chạy quyền quản trị thì giải thích bằng lời thường kèm nút **Khoá quyền thư mục**. Việc ghi khoá và cấu hình nhận được làm tự động ở lần đầu (một máy nhận, một cổng); không còn màn in khoá công khai, `client.toml` hay `peer add`.
 
-**Máy GỬI**: ở bước 2 chọn "Một máy tính khác có cài MySync", dán mã. Mã hỏng (thiếu/sai ký tự) báo bằng lời thường. Không bước nào bắt sửa danh sách khoá hay chép khoá bằng tay; **mã ghép không bao giờ chứa khoá bí mật** và GUI không bao giờ hiện khoá bí mật.
+**Máy GỬI**: bước 2, dán mã (xem trên). Mã không bao giờ chứa khoá bí mật, và GUI không bao giờ hiện khoá bí mật. Mỗi máy được cho vào chỉ thấy đúng thư mục của mã đó.
+
+`[server] pairing = "off"` tắt các mã tạo từ giao diện (hộp thoại báo rõ, không bật được); mã quản trị tạo bằng dòng lệnh `mysync invite create` không bị ảnh hưởng (xem SERVER-TO-SERVER.md).
 
 ### Dịch vụ Windows chạy bằng chính tài khoản của bạn
 Nút **Chạy cả khi chưa đăng nhập máy (cài dịch vụ)** hoạt động cho cả tài khoản quản trị lẫn tài khoản chuẩn:
@@ -151,30 +153,17 @@ Mọi chờ có chỉ báo động (BusyIndicator, vô hiệu hoá phần nội 
 
 ### Hạn chế của chế độ Đơn giản
 - Một GUI (một bộ engine) cho mỗi người dùng; hai thư mục đồng bộ cùng lúc bởi hai tiến trình bị chặn bằng khoá `<thư mục>/__sync/engine.lock`.
-- Đích kiểu "Máy tính khác" cần hai máy tới được nhau trực tiếp (cùng mạng/VPN, tường lửa cho cổng nhận). Chưa có xuyên NAT/relay.
+- Đích kiểu "Máy tính khác" cần hai máy tới được nhau trực tiếp (cùng mạng/VPN; qua Internet thì máy nhận cần IP công khai hoặc mở cổng; tường lửa cho cổng nhận). **Không có relay**, chưa xuyên NAT.
 - Chưa chạy giao diện thật trên Linux (xem "Hạn chế đã biết" ở trên); các nhánh Linux (autostart `.desktop`, `pkexec`) chỉ được dựng/kiểm bằng test headless.
 - Đã chạy thật trên Windows 11: trình hướng dẫn (hai thư mục tạm, tệp sang được đích), bộ giám sát tự khởi động lại và báo "không tự khởi động lại được nữa" khi cấu hình hỏng, bật nhận file + mã ghép + hộp thoại duyệt + ghép xong với một máy gửi giả lập, "Thoát hẳn" dừng cả engine. **Chưa chạy thật** việc cài/gỡ dịch vụ từ nút "Chạy cả khi chưa đăng nhập máy" (cần quyền quản trị và đổi hệ thống; logic từng bước được kiểm bằng bộ giả trong test của lõi). Ô *Tự chạy khi tôi đăng nhập*: lần chạy thật đã thấy trình hướng dẫn ghi `HKCU\...\Run` (đã gỡ tay sau khi thử).
-- Cửa sổ ghép cố định 10 phút, yêu cầu chờ duyệt cố định 2 phút (đặt trong lõi, không đổi từ GUI).
-- Đổi thư mục nhận file hoặc tắt nhận không xoá các máy đã ghép (xoá ở chế độ nâng cao, tab *Ghép máy và Khoá*).
+- Yêu cầu chờ duyệt (`Hỏi tôi trước`) hết hạn sau 2 phút (đặt trong lõi).
+- Gỡ một máy: nút **Gỡ** ở hộp *Cho máy khác gửi tệp tới đây* (thu hồi ngay, ngắt phiên đang mở).
 
-## Dựng máy chủ (hộp thoại một nút)
+## Đã bỏ: hộp thoại "Dựng máy chủ"
 
-Mục **Dựng máy chủ…** (menu Cài đặt của cửa sổ chính, có trong cả chế độ Đơn giản và Nâng cao) mở một hộp thoại làm đúng việc của lệnh `mysync quick-server` — cùng một hàm lõi (`quick_server()` trong `src/quick_setup.cpp`), không chạy dòng lệnh rồi đọc chữ của nó.
+Hộp thoại này (in khoá công khai + `client.toml` + `peer add`) đã bị **gỡ** ở Đợt 11 vì máy gửi không dùng được thứ nó in ra. Thay bằng hộp **Cho máy khác gửi tệp tới đây** (mục trên) và, cho máy chủ không giao diện, lệnh `mysync invite create`. `quick-server`/`quick-client` còn trong dòng lệnh cho script. Ảnh `gui-09-dung-may-chu.png` đã được thay bằng `gui-09-cho-may-khac-gui.png`.
 
-1. **Chọn thư mục nhận tệp** (thư mục sẽ được chia sẻ) và **cổng** (mặc định 5656; kiểm 1–65535 ngay tại ô).
-2. Bấm **Tạo**. Việc chạy ở luồng nền, có vòng quay báo đang làm; lỗi hiện nguyên văn trên màn hình. Tạo khoá nếu chưa có, ghi cấu hình với mặc định an toàn (ghép nối nhanh **tắt**), thư mục cấu hình nằm cạnh thư mục chia sẻ (`<thư mục>.mysync`), không nằm trong nó.
-3. **Màn kết quả**: đường dẫn cấu hình và tệp khoá (khoá bí mật **không bao giờ hiện** và không được chép), khoá công khai + dấu vân tay, đoạn `client.toml` cho máy khách, dòng `mysync peer add ...`; mỗi khối có nút **Chép**. Chạy lại trên thư mục đã dựng thì chỉ báo "đã có sẵn, giữ nguyên".
-4. (Tuỳ chọn) **Thêm máy khách**: dán khoá công khai của máy khách (chấp nhận khoảng trắng, xuống dòng, `0x`, dấu `:`), đặt tên, chọn đọc-ghi hoặc chỉ-đọc. Dùng cùng `peer_add` và cùng bước kiểm tin cậy tệp cấu hình như `mysync peer add`; thêm lại cùng khoá thì "không đổi".
-5. (Tuỳ chọn) **Cài thành dịch vụ**: đi qua đúng `ServiceController` của nút dịch vụ (kiểm chương trình, nhóm rộng, cấu hình chỉ nhóm tin cậy sửa được; UAC/pkexec). Nếu thư mục cấu hình mà người dùng thường ghi được bị từ chối thì thông báo nguyên văn hiện ra; đó là chủ ý, không có đường vòng.
-
-**Thư mục bị từ chối vì "người khác ghi được"**: chỉ xảy ra khi MySync chạy bằng quyền quản trị. Thư mục trên ổ D:, E:... thường thừa hưởng từ gốc ổ quyền "Users được tạo tệp/thư mục", nên hầu như thư mục nào ngoài hồ sơ người dùng cũng vướng. Hộp thoại giải thích bằng lời thường và hiện nút **Khoá quyền thư mục**: sau khi xác nhận, thư mục chỉ còn cho bạn, SYSTEM và nhóm Administrators (bỏ thừa hưởng từ ổ đĩa), rồi dựng tiếp. Thư mục do MySync **tự tạo** thì được khoá như vậy ngay từ đầu. Dòng lệnh: `--fix-permissions`. Không chạy bằng quyền quản trị thì không có bước kiểm này (dịch vụ vẫn cài qua UAC riêng).
-
-
-![Dựng máy chủ: màn kết quả](images/gui-09-dung-may-chu.png)
-
-(Ảnh chụp với dữ liệu mẫu: thư mục tạm, khoá sinh riêng cho lần chụp.) Chụp lại: `mysync-gui --server-wizard-demo <thư mục tạm> --server-wizard-shot <png>`.
-
-Chưa kiểm: cài dịch vụ thật từ hộp thoại này (cần quyền quản trị), và chạy trên Linux/GTK (chỉ dựng được; model có test headless).
+Thư mục bị từ chối vì "người khác ghi được" (chỉ khi MySync chạy bằng quyền quản trị: thư mục trên ổ D:, E:... thừa hưởng quyền "Users được tạo tệp" từ gốc ổ) vẫn được xử lý bằng nút **Khoá quyền thư mục** (sau xác nhận, chỉ còn bạn, SYSTEM và Administrators; dòng lệnh `--fix-permissions`).
 
 ## README-snippet
 
@@ -182,5 +171,5 @@ Chưa kiểm: cài dịch vụ thật từ hộp thoại này (cần quyền qu�
 1. Dựng `mysync-gui` (xem "Giao diện đồ hoạ") và mở nó. Lần đầu bạn sẽ thấy màn **Bắt đầu nhanh**: chọn **Dùng ngay, không cần cài đặt**.
 2. **Bước 1**: chọn (hoặc kéo-thả) thư mục cần giữ bản sao. **Bước 2**: chọn nơi lưu: thư mục khác, ổ USB, thư mục chia sẻ trong mạng (`\\máy\chia-sẻ`), hoặc một máy tính khác có MySync (dán mã ghép). **Bước 3**: bấm **Bắt đầu đồng bộ**.
 3. Từ đó MySync chạy dưới biểu tượng ở khay hệ thống (xanh lá = đã xong, xanh dương = đang chép, vàng/đỏ = cần chú ý). Đóng cửa sổ chỉ thu xuống khay; chọn **Thoát hẳn** ở menu khay để dừng.
-4. Gửi file sang máy khác: trên máy nhận bật **Cho phép máy khác gửi file vào đây**, sao chép **mã ghép**; trên máy gửi dán mã ở bước 2, so **chuỗi xác nhận** hai máy thấy giống nhau rồi bấm **Đồng ý** ở máy nhận.
+4. Gửi file sang máy khác: trên máy nhận bấm **Cho máy khác gửi tệp tới đây…**, tạo và sao chép **mã**; trên máy gửi dán mã ở bước 2 (nếu máy nhận bật "Hỏi tôi trước" thì so **chuỗi xác nhận** rồi bấm **Đồng ý** ở máy nhận).
 5. Muốn chạy cả khi chưa đăng nhập máy: ở màn Trạng thái bấm **Chạy cả khi chưa đăng nhập máy (cài dịch vụ)**. Trên Windows nút chạy được cho cả tài khoản quản trị lẫn tài khoản thường: UAC chỉ cấp phép cài (người quản trị nhập thông tin ở đó không trở thành chủ dịch vụ); dịch vụ chạy bằng tài khoản CỦA BẠN, và phần đồng bộ trong đó chạy bằng token hạn chế (bỏ nhóm quản trị và quyền nguy hiểm, mức toàn vẹn Medium). Hộp xác nhận trước UAC ghi rõ tài khoản nào sẽ chạy dịch vụ. Cần chỉnh sâu hơn: bấm **Chế độ nâng cao**.

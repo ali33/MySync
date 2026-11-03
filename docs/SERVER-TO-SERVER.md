@@ -24,7 +24,27 @@ Mọi lệnh bên dưới chạy được trên Linux lẫn Windows (ví dụ vi
 Thông điệp lỗi viết ra stderr, nguyên văn, kèm tên tệp / số dòng khi có. Kết quả máy đọc được ở stdout
 (`--json` nếu lệnh hỗ trợ).
 
-## 2.0 Cách nhanh: `quick-server` / `quick-client`
+## 2.-1 Cách khuyên dùng: MỘT mã mời (`mysync invite`)
+
+Trên máy chủ nhận (B), một lệnh; không cần chép khoá, `peer add` hay `client.toml`:
+```
+mysync invite create --dir /srv/nhan --rw --ttl 24h --uses 1 --address b.example.com:5656 --name bao-cao
+# in:  MSY2-XXXXX-XXXXX-...   + hạn dùng (giờ máy, có thứ), quyền, số lần, thư mục, địa chỉ, vân tay khoá, id
+mysync invite list [--json] [-c server.toml]
+mysync invite revoke <id|tiền tố>
+```
+Trên máy gửi (A): dán mã vào bước 2 của giao diện MySync (mục "Một máy tính khác có cài MySync"). Mã là bí mật mang quyền: ai có mã trong hạn là vào được.
+
+- Tuỳ chọn: `--dir` thư mục nhận (**thư mục nào cũng được**; mỗi máy vào bị nhốt trong đúng thư mục của mã, hai mã khác nhau không được trùng hay lồng nhau), `--rw` (mặc định) / `--ro`, `--ttl` (`90m`, `24h`, `3d` hoặc số giây; tối đa 30 ngày), `--uses N` (mặc định 1), `--address host:port` (lặp lại được, tối đa 3; mặc định: `bind` đã cấu hình nếu cụ thể, cộng tên máy và địa chỉ IP không loopback), `--name` nhãn, `--json`, `-c server.toml`, `--port`, `--service` (cài dịch vụ qua đúng đường `ServiceController` như `quick-server --service`), `--fix-permissions`.
+- Chưa có cấu hình máy chủ thì lệnh tạo bằng `quick_server` với mặc định an toàn (khoá mới, `pairing = "off"`, cấu hình ở `<thư mục>.mysync` cạnh thư mục chia sẻ). Đã có thì dùng nó; máy chủ đang chạy thấy mã mới ngay (kho `invites.d` đọc theo từng yêu cầu).
+- **Nhận mã trên máy chủ không bao giờ hỏi xác nhận** và mã do `invite create` luôn tự động; chỉ mã tạo từ giao diện máy bàn mới có tuỳ chọn "Hỏi tôi trước".
+- `--json`: một dòng với các khoá ổn định `id, code, expires_unix, perm, uses, folder, label, addresses, config, key_fingerprint` (chỉ ASCII). Mã thoát như mục 1.
+- Ghép mặt đối mặt (MSY1) vẫn **tắt** mặc định trên máy chủ. `[server] pairing = "off"` tắt các mã tạo qua giao diện/kênh điều khiển, **không** tắt mã quản trị tạo bằng `mysync invite create` (người tạo là quản trị viên). Mã đã dùng hết lượt, hết hạn hoặc bị huỷ bị từ chối bằng cùng một thông báo chung.
+- Mỗi lần có máy vào, một dòng kiểm toán `invite AUDIT ...` được ghi vào log và `invites.d/audit.log` (id mã, tên máy, IP, kết quả; không có bí mật). `mysync peer list` thấy máy đó; `mysync peer revoke <tên>` hoặc nút **Gỡ** thu hồi ngay. Tệp bị xoá/ghi đè cất vào `__sync/__trash` như mọi khi.
+- **Không có relay**: máy gửi phải tới được một trong các địa chỉ trong mã. LAN thì được; qua Internet máy nhận cần IP công khai hoặc mở cổng.
+- Thiết kế và mối đe doạ: `DESIGN.md` mục "Mã mời MSY2".
+
+## 2.0 Cách nhanh cho script: `quick-server` / `quick-client`
 
 Thay cho việc tự `keygen` + viết `server.toml` + viết `client.toml` (các mục 2.1 và 2.2 bên dưới là cách làm tay tương đương):
 
@@ -317,6 +337,8 @@ ExecStart=/usr/local/bin/mysync health -c /etc/mysync/client.toml
 Nagios/Icinga: dùng `mysync health` như một plugin (mã 0/1/2 đúng chuẩn).
 
 ## 9. `pairing = "off"` cho máy chủ không người trông
+
+> Từ Đợt 11: `pairing = "off"` chỉ tắt các mã mời tạo qua giao diện/kênh điều khiển và ghép MSY1. Mã tạo bằng `mysync invite create` (mục 2.-1) vẫn dùng được, vì do quản trị viên tạo.
 
 Trạng thái `pairing` trong `status` là trạng thái **đang hiệu lực** (tiến trình được chạy với `--allow-pairing` VÀ cấu hình không để `off`), không phải chỉ giá trị trong tệp; đổi sang `off` rồi reload thì cửa sổ ghép đang mở bị đóng ngay và mọi thao tác ghép bị từ chối. `[server] pairing = "off"` (mặc định) nghĩa là **không có đường nào** bật chế độ ghép bằng mã — kể cả qua kênh điều
 khiển cục bộ hay `--allow-pairing`: tiến trình bỏ qua cờ đó và ghi cảnh báo. Chỉ `pairing = "on-demand"` cho phép

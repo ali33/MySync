@@ -84,6 +84,12 @@ const char* kHelp =
     "                                          the same for a client: key + client.toml; prints its public key and the 'peer add' to run on the server\n"
     "  mysync peer add <public key hex> --name N --perm ro|rw [--subdir D] [--rotate] -c <server.toml>\n"
     "  mysync peer remove|revoke <name|key> | peer retire-key <name> <key> | peer list [--json]   (server peers, idempotent)\n"
+    "  mysync invite create --dir <folder> [--rw|--ro] [--ttl 24h|90m|3d|<seconds>] [--uses N] [--address host:port]... [--name label] [--json]\n"
+    "                  [-c server.toml] [--service] [--port N] [--fix-permissions]\n"
+    "                                          make ONE invitation code (MSY2...) for another machine: it carries this server's public key and\n"
+    "                                          addresses; the machine that redeems it is added with the access and folder chosen here. Sets the\n"
+    "                                          server up first (like quick-server) when there is none\n"
+    "  mysync invite list [--json] | invite revoke <id|prefix> -c <server.toml>   (list: state, uses, joined machines; never a secret)\n"
     "  mysync key show --public [-k keyfile|-c config] [--json]\n"
     "  mysync key rotate --server-config <server.toml> --prepare|--promote|--status   (server key rotation, no downtime)\n"
     "                                          --changed-exit on the commands above: exit 10 when something changed\n"
@@ -815,7 +821,7 @@ int dispatch(const std::vector<std::string>& a) {
         std::cout << "mysync " << kVersion << "\n";
         return 0;
     }
-    if (cmd == "keygen" || cmd == "quick-server" || cmd == "quick-client" || cmd == "peer" || cmd == "key" || cmd == "health" ||
+    if (cmd == "keygen" || cmd == "quick-server" || cmd == "quick-client" || cmd == "peer" || cmd == "invite" || cmd == "key" || cmd == "health" ||
         (cmd == "status" && std::find(a.begin(), a.end(), "--json") != a.end()))
         return cli_ops_main(a);  // server operations: non-interactive, scriptable (see cli_ops.h)
     Opts o = parse_opts(a, 2);

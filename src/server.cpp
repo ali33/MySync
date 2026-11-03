@@ -30,8 +30,11 @@
 #include "mysync/net.h"
 #include "mysync/pathsafe.h"
 #include "mysync/protocol.h"
+#include "mysync/quick_setup.h"
 #include "mysync/ratelimit.h"
 #include "mysync/secure_channel.h"
+#include "mysync/linkcheck.h"
+#include "mysync/simple/invite.h"
 #include "mysync/simple/pairing.h"
 
 namespace mysync {
@@ -377,6 +380,12 @@ struct ServerCore {
     std::mutex live_mu;
     std::list<LiveSess> live;
     std::unique_ptr<simple::PairingManager> pairing;  // created with the keys; off until the operator turns it on
+    mutable std::mutex inv_mu;
+    std::shared_ptr<simple::InviteManager> invites_;  // optional (Server::set_invites)
+    std::shared_ptr<simple::InviteManager> invites() const {
+        std::lock_guard<std::mutex> lk(inv_mu);
+        return invites_;
+    }
     AuthThrottle thr;
     net::Socket lsock;
     std::string root;
@@ -401,7 +410,7 @@ struct ServerCore {
     bool still_permitted(const ClientAcl& a, const PubKey& authkey) const {
         auto p = policy();
         for (const ClientAcl& n : p->cfg.clients)
-            if (acl_has_key(n, authkey)) return n.read_only == a.read_only && n.prefix == a.prefix;
+            if (acl_has_key(n, authkey)) return n.read_only == a.read_only && n.prefix == a.prefix && n.root == a.root;
         return false;
     }
     // Wakes every live session whose client was removed (or whose access / prefix / key set no longer allows what it
@@ -419,8 +428,12 @@ struct ServerCore {
         return n;
     }
     std::mutex trash_mu;           // serialises moves into / purges of <root>/__sync/__trash
-    bool trash_scanned = false;    // trash_bytes is valid (computed lazily, only when max_trash_bytes != 0)
-    uint64_t trash_bytes = 0;
+    struct TrashAcct {
+        bool scanned = false;   // bytes is valid (computed lazily, only when max_trash_bytes != 0)
+        uint64_t bytes = 0;
+    };
+    std::map<std::string, TrashAcct> trash_acct;   // one trash per root (the server's and each invited peer's), under trash_mu
+    std::set<std::string> orphans_cleaned;         // peer roots whose leftover temp files were swept (under trash_mu)
 
     size_t unauth_cap() const { return std::max<size_t>(8, max_conn.load() / 2); }
     bool unauth_acquire(const std::string& key) {
@@ -556,8 +569,9 @@ uint64_t tree_bytes(const fs::path& p) {
 
 // Frees trash until trash_bytes <= target by deleting whole timestamp directories, oldest name first (the names are
 // UTC timestamps, so they sort by age). Caller holds c.trash_mu.
-void trash_purge_to(ServerCore& c, uint64_t target) {
-    fs::path troot = u8(c.root) / "__sync" / "__trash";
+void trash_purge_to(ServerCore& c, const std::string& root, uint64_t target) {
+    auto& acct = c.trash_acct[root];
+    fs::path troot = u8(root) / "__sync" / "__trash";
     std::error_code ec;
     std::vector<fs::path> dirs;
     for (fs::directory_iterator it(troot, ec), end; !ec && it != end; it.increment(ec)) dirs.push_back(it->path());
@@ -565,43 +579,44 @@ void trash_purge_to(ServerCore& c, uint64_t target) {
     size_t purged = 0;
     uint64_t freed = 0;
     for (const auto& d : dirs) {
-        if (c.trash_bytes <= target) break;
+        if (acct.bytes <= target) break;
         uint64_t sz = tree_bytes(d);
         std::error_code e2;
         fs::remove_all(d, e2);
         if (e2) throw OpError(ErrCode::IoError, "cannot free trash space");
-        c.trash_bytes -= std::min(sz, c.trash_bytes);
+        acct.bytes -= std::min(sz, acct.bytes);
         freed += sz;
         purged++;
     }
     if (purged)
         log_info("trash over max_trash_bytes: purged " + std::to_string(purged) + " oldest entr" +
                  (purged == 1 ? "y" : "ies") + " (" + std::to_string(freed) + " bytes)");
-    if (c.trash_bytes > target) c.trash_bytes = tree_bytes(troot);  // accounting drifted: resynchronise
-    if (c.trash_bytes > target) throw OpError(ErrCode::IoError, "cannot free enough trash space");
+    if (acct.bytes > target) acct.bytes = tree_bytes(troot);  // accounting drifted: resynchronise
+    if (acct.bytes > target) throw OpError(ErrCode::IoError, "cannot free enough trash space");
 }
 
 // Moves `abs` (file or directory) into <root>/__sync/__trash/<UTC timestamp>/<real> by rename and returns the new
 // location. Enforces max_trash_bytes: older entries are purged first; an item larger than the cap is refused.
-fs::path trash_move(ServerCore& c, const ServerConfig& cfg, const fs::path& abs, const std::string& real) {
+fs::path trash_move(ServerCore& c, const ServerConfig& cfg, const std::string& root, const fs::path& abs, const std::string& real) {
     std::lock_guard<std::mutex> lk(c.trash_mu);
+    auto& acct = c.trash_acct[root];
     const uint64_t limit = cfg.max_trash_bytes;
     uint64_t sz = 0;
     if (limit) {
         sz = tree_bytes(abs);
         if (sz > limit)
             throw OpError(ErrCode::TooLarge, "item is larger than the trash limit (max_trash_bytes); not removed");
-        if (!c.trash_scanned) {
-            c.trash_bytes = tree_bytes(u8(c.root) / "__sync" / "__trash");
-            c.trash_scanned = true;
+        if (!acct.scanned) {
+            acct.bytes = tree_bytes(u8(root) / "__sync" / "__trash");
+            acct.scanned = true;
         }
-        if (c.trash_bytes + sz > limit) trash_purge_to(c, limit - sz);
+        if (acct.bytes + sz > limit) trash_purge_to(c, root, limit - sz);
     }
-    for (const fs::path& q : {u8(c.root) / "__sync", u8(c.root) / "__sync" / "__trash"}) {  // a link would redirect the removed data
+    for (const fs::path& q : {u8(root) / "__sync", u8(root) / "__sync" / "__trash"}) {  // a link would redirect the removed data
         fio::StatInfo si = fio::stat_path(q);
         if (si.exists && (si.is_symlink || !si.is_dir)) throw OpError(ErrCode::IoError, "the trash folder is a link: refusing");
     }
-    fs::path base = u8(c.root) / "__sync" / "__trash" / utc_stamp() / u8(real);
+    fs::path base = u8(root) / "__sync" / "__trash" / utc_stamp() / u8(real);
     std::error_code ec;
     fio::create_dirs(base.parent_path(), cfg.dir_mode, ec);
     if (ec) throw OpError(ErrCode::IoError, "cannot create trash directory");
@@ -610,7 +625,7 @@ fs::path trash_move(ServerCore& c, const ServerConfig& cfg, const fs::path& abs,
         cand = fs::path(base.u8string() + "-" + std::to_string(n));
     fs::rename(abs, cand, ec);
     if (ec) throw OpError(ErrCode::IoError, "cannot move to trash");
-    if (limit) c.trash_bytes += sz;
+    if (limit) acct.bytes += sz;
     return cand;
 }
 
@@ -648,15 +663,42 @@ public:
     // so a replayed msg1 (valid handshake, no HELLO) cannot take a session slot of the client it impersonates.
     // Returns false when the peer was told why it is refused.
     bool read_hello() {
+        root_ = c_.root;
+        if (!acl_.root.empty()) {   // a machine that joined by invitation lives in a folder of its own
+            std::error_code rec;
+            std::string link = link_component(acl_.root);
+            if (!link.empty()) throw Error("the folder of this client is, or lies behind, a link: refusing the session");
+            // Defence in depth for a hand-edited peers.d: a client folder never overlaps the server's own root or its state.
+            if (simple::folder_within(acl_.root, c_.root) || simple::folder_within(c_.root, acl_.root) ||
+                simple::folder_within(acl_.root, c_.state_dir.u8string()) || simple::folder_within(c_.state_dir.u8string(), acl_.root))
+                throw Error("the folder of this client overlaps the folder or the state of the server: refusing the session");
+            if (!fs::is_directory(u8(acl_.root), rec)) {   // missing: created PRIVATE (as the invitation made it), links judged again afterwards
+                fio::create_dirs(u8(acl_.root), pol_->cfg.dir_mode, rec);
+                if (fs::is_directory(u8(acl_.root), rec)) {
+                    make_folder_private(acl_.root);
+                    link = link_component(acl_.root);
+                    if (!link.empty()) throw Error("the folder of this client is, or lies behind, a link: refusing the session");
+                }
+            }
+            if (!fs::is_directory(u8(acl_.root), rec)) throw Error("the folder of this client does not exist");
+            root_ = fs::weakly_canonical(u8(acl_.root), rec).u8string();
+            if (rec) throw Error("cannot resolve the folder of this client");
+            bool sweep = false;
+            {
+                std::lock_guard<std::mutex> lk(c_.trash_mu);
+                sweep = c_.orphans_cleaned.insert(root_).second;
+            }
+            if (sweep) clean_orphans(root_);
+        }
         prefix_ = normalize_rel(acl_.prefix);
         while (!prefix_.empty() && prefix_.back() == '/') prefix_.pop_back();
         if (!prefix_.empty()) {
             if (is_internal_dir(prefix_)) throw Error("client prefix points into the internal directory");
-            fs::path p = safe_join(c_.root, prefix_);  // throws on a malicious prefix: session refused
+            fs::path p = safe_join(root_, prefix_);  // throws on a malicious prefix: session refused
             std::error_code ec;
             fio::create_dirs(p, pol_->cfg.dir_mode, ec);
         }
-        tree_ = c_.tree_for(prefix_);
+        tree_ = c_.tree_for(tree_key(prefix_));
 
         // The first record must arrive promptly: a replayed msg1 completes the handshake but cannot produce it.
         hello_pending_ = true;
@@ -706,7 +748,10 @@ private:
     std::string ip_;
     ClientState& cs_;
     std::string prefix_;
+    std::string root_;   // the folder this client is confined to: the server root, or its own (ClientAcl::root)
     std::shared_ptr<Tree> tree_;
+    // Index caches are kept per (root, prefix); the server's own root keeps the old key so existing index files stay valid.
+    std::string tree_key(const std::string& p) const { return acl_.root.empty() ? p : root_ + "|" + p; }
     uint32_t caps_ = 0;
     std::deque<std::unique_ptr<Pending>> pending_;
 
@@ -774,14 +819,14 @@ private:
         if (is_internal_dir(v) || is_internal_dir(real) || has_tmp_component(v))
             throw OpError(ErrCode::PathDenied, "path denied");
         try {
-            return Resolved{safe_join(c_.root, real), v, real};
+            return Resolved{safe_join(root_, real), v, real};
         } catch (const Error&) {
             throw OpError(ErrCode::PathDenied, "path denied");
         }
     }
     void recheck(const Resolved& r) const {
         try {
-            safe_join(c_.root, r.real);
+            safe_join(root_, r.real);
         } catch (const Error&) {
             throw OpError(ErrCode::PathDenied, "path denied");
         }
@@ -980,7 +1025,7 @@ private:
             fs::path trashed;
             if (pol_->cfg.trash) {
                 fio::StatInfo old = fio::stat_path(p->r.abs);
-                if (old.exists && old.is_regular) trashed = trash_move(c_, pol_->cfg, p->r.abs, p->r.real);
+                if (old.exists && old.is_regular) trashed = trash_move(c_, pol_->cfg, root_, p->r.abs, p->r.real);
             }
             std::error_code ec;
             fs::rename(p->tmp.path(), p->r.abs, ec);  // atomic replace; a directory at the destination fails here
@@ -1013,7 +1058,7 @@ private:
         if (acl_.read_only) throw OpError(ErrCode::PathDenied, "read-only client");
     }
 
-    void move_to_trash(const Resolved& r) { trash_move(c_, pol_->cfg, r.abs, r.real); }
+    void move_to_trash(const Resolved& r) { trash_move(c_, pol_->cfg, root_, r.abs, r.real); }
 
     void on_delete(const Delete& d) {
         require_rw();
@@ -1084,7 +1129,7 @@ private:
         std::string key;
         if (lp.empty()) {
             key = prefix_;
-            scan_root = prefix_.empty() ? u8(c_.root) : safe_join(c_.root, prefix_);
+            scan_root = prefix_.empty() ? u8(root_) : safe_join(root_, prefix_);
         } else {
             Resolved r = resolve(lp);
             key = r.real;
@@ -1095,7 +1140,7 @@ private:
             send(ListEnd{0});
             return;
         }
-        std::shared_ptr<Tree> t = (key == prefix_) ? tree_ : c_.tree_for(key);
+        std::shared_ptr<Tree> t = (key == prefix_) ? tree_ : c_.tree_for(tree_key(key));
         std::vector<FileMeta> metas;
         {
             std::lock_guard<std::mutex> lk(t->m);
@@ -1165,6 +1210,48 @@ void serve_unpaired(ServerCore& c, SecureChannel& ch, SessRec& rec, const std::s
     }
 }
 
+// A connection whose key is NOT in the allowlist but was admitted because an invitation can be redeemed. It may only say
+// REDEEM / BYE (InviteManager::on_message refuses everything else); no policy, no tree, no session slot is created for it.
+void serve_invited(ServerCore& c, simple::InviteManager& inv, SecureChannel& ch, SessRec& rec, const std::string& ip,
+                   const PubKey& key, std::atomic<bool>& stop) {
+    {
+        std::lock_guard<std::mutex> lk(rec.m);
+        rec.sock = &ch.socket();
+    }
+    struct Unreg {
+        SessRec& rec;
+        ~Unreg() {
+            std::lock_guard<std::mutex> lk(rec.m);
+            rec.sock = nullptr;
+        }
+    } unreg{rec};
+    try {
+        const int64_t deadline = steady_ms() + int64_t(simple::kPairRequestTtlSeconds + 15) * 1000;
+        bool first = true;
+        while (!stop.load()) {
+            int64_t left = deadline - steady_ms();
+            if (left <= 0) break;
+            int wait_ms = first ? kHelloTimeoutMs : int(std::min<int64_t>(left, 30000));
+            Bytes raw = ch.recv_msg_within(wait_ms);
+            first = false;
+            simple::RedeemRequest rq;
+            rq.ip = ip;
+            rq.sender_key = key;
+            rq.handshake_hash = ch.handshake_hash();
+            rq.raw = std::move(raw);
+            simple::InviteManager::Reply rep = inv.on_message(rq);
+            if (!rep.msg.empty()) {
+                ch.socket().set_timeouts(10000, 10000);
+                ch.send_msg(rep.msg);
+            }
+            if (rep.failed_auth) c.thr.record_failure(ip, steady_ms());
+            if (rep.close) break;
+        }
+    } catch (const std::exception& e) {
+        if (!stop.load()) log_debug("invitation session from " + ip + " ended: " + e.what());
+    }
+}
+
 void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRec& rec, std::atomic<bool>& stop) {
     struct Done {
         SessRec& rec;
@@ -1194,6 +1281,16 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
             if (held) c.pairing->session_ended(ip);
         }
     } pair_slot{c, ip};
+    std::shared_ptr<simple::InviteManager> inv = c.invites();
+    bool invited = false;   // an invitation can be redeemed: unknown key admitted, only REDEEM / BYE allowed
+    struct InviteSlot {
+        std::shared_ptr<simple::InviteManager> m;
+        std::string ip;
+        bool held = false;
+        ~InviteSlot() {
+            if (held && m) m->session_ended(ip);
+        }
+    } inv_slot{inv, ip};
     std::shared_ptr<const Policy> pol = c.policy();  // fixed for this session, whatever a reload does meanwhile
     try {
         std::shared_ptr<const detail::KeySet> ks = c.key_set();
@@ -1216,6 +1313,12 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
                 unpaired_key = k;
                 return true;
             }
+            if (inv && inv->admit_handshake(ip, k)) {
+                inv_slot.held = true;
+                invited = true;
+                unpaired_key = k;
+                return true;
+            }
             return false;
         }, SecureChannel::kHandshakeTimeoutMs, &used_key));
         if (used_key != 0) log_info("client at " + ip + " used the NEXT server key (key_file_next)");
@@ -1223,6 +1326,11 @@ void session_main(ServerCore& c, net::Socket sock, const std::string& ip, SessRe
         unauth.release();
         c.thr.record_failure(ip, steady_ms());
         log_warn("authentication failed from " + ip);
+        return;
+    }
+    if (invited) {  // lives on the invitation budget, like the pairing one
+        unauth.release();
+        serve_invited(c, *inv, *ch, rec, ip, unpaired_key, stop);
         return;
     }
     if (unpaired) {  // lives on the pairing budget (4 sessions, 2 per source), not on the shared unauthenticated one
@@ -1324,6 +1432,13 @@ Server::~Server() = default;
 uint16_t Server::port() const { return p_->lsock.local_port(); }
 
 simple::PairingManager& Server::pairing() { return *p_->pairing; }
+
+std::shared_ptr<simple::InviteManager> Server::invites() const { return p_->invites(); }
+
+void Server::set_invites(std::shared_ptr<simple::InviteManager> m) {
+    std::lock_guard<std::mutex> lk(p_->inv_mu);
+    p_->invites_ = std::move(m);
+}
 
 PubKey Server::public_key() const { return p_->key_set()->primary.pub; }
 

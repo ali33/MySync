@@ -37,7 +37,7 @@
 namespace mysync {
 
 namespace detail { struct ServerCore; }
-namespace simple { class PairingManager; }
+namespace simple { class PairingManager; class InviteManager; }
 
 // allow/deny lists of "*", IP or CIDR (IPv4 and IPv6; IPv4-mapped IPv6 addresses are treated as IPv4).
 // Deny wins. An empty allow list permits nobody. Throws Error on a malformed entry.
@@ -137,6 +137,12 @@ public:
     // Pairing by code (simple/pairing.h). Off until the operator calls enable(); while on, a key that is not in the
     // allowlist may finish the handshake but its session only speaks PAIR_REQUEST / PAIR_POLL / BYE.
     simple::PairingManager& pairing();
+
+    // Invitation codes (simple/invite.h). Without a manager unknown keys are refused exactly as before. With one, a key
+    // that is not in the allowlist may finish the handshake while some invite can be redeemed; its session only speaks
+    // REDEEM / BYE. Thread-safe; may be called while the server runs (nullptr removes it).
+    void set_invites(std::shared_ptr<simple::InviteManager> m);
+    std::shared_ptr<simple::InviteManager> invites() const;   // null when none was set
 
 private:
 

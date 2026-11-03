@@ -88,8 +88,10 @@ public:
     void set_source(const std::string& path);
     void set_kind(simple::DestKind k);
     void set_dest_path(const std::string& path);
-    void set_paired(const simple::PairCode& c);   // sau khi máy kia đã đồng ý
+    void set_paired(const simple::PairCode& c);   // đích máy khác đã xác định (mã mời đã kiểm xong: địa chỉ + khoá máy nhận)
     void clear_paired();
+    // Chữ mô tả máy kia (tên máy · thư mục · quyền) cho bước tóm tắt; rỗng = hiện địa chỉ.
+    void set_machine_label(const std::string& label) { machine_label_ = label; }
     // Kết quả kiểm (từ validate_wizard chạy ở luồng nền) cho đúng bản `input()` hiện tại.
     void apply_validation(const std::vector<simple::WizardIssue>& issues);
     bool validated() const { return validated_; }
@@ -110,6 +112,7 @@ private:
     WizardStep step_ = WizardStep::Source;
     simple::WizardInput in_;
     bool paired_ok_ = false;
+    std::string machine_label_;
     bool validated_ = false;
     std::vector<simple::WizardIssue> issues_;
 };
@@ -127,11 +130,6 @@ std::string sas_display(const std::string& sas);
 // Xếp địa chỉ IP để chọn: IPv4 mạng nội bộ trước, rồi IPv4 khác, rồi IPv6; bỏ loopback / link-local; không trùng.
 std::vector<std::string> rank_addresses(const std::vector<std::string>& ips);
 bool is_private_ipv4(const std::string& ip);
-
-// Kết quả ghép phía GỬI -> câu cho người dùng. Failed dùng nguyên văn `message`.
-std::string pair_outcome_text(const simple::PairOutcome& o);
-// Kiểm mã dán vào: "" nếu giải mã được, ngược lại câu lời thường (không lộ nội dung mã).
-std::string check_pair_code_text(const std::string& text, simple::PairCode* out = nullptr);
 
 // Lỗi của lõi dạng "<khoá>: <chi tiết>" (khoá wizard.* / receiver.*) -> lời thường + chi tiết nguyên văn.
 // Lỗi khác trả về nguyên văn.

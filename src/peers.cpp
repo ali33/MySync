@@ -107,7 +107,7 @@ std::string utc_date() {
 
 bool same_acl(const ClientAcl& a, const ClientAcl& b) {
     return a.name == b.name && a.public_key == b.public_key && a.extra_keys == b.extra_keys && a.read_only == b.read_only &&
-           a.prefix == b.prefix && a.max_sessions == b.max_sessions &&
+           a.prefix == b.prefix && a.root == b.root && a.max_sessions == b.max_sessions &&
            a.max_write_bytes_per_hour == b.max_write_bytes_per_hour && a.max_bandwidth_kbps == b.max_bandwidth_kbps;
 }
 
@@ -225,6 +225,7 @@ std::string serialize_peer_file(const ClientAcl& a) {
         o += "]\n";
     }
     o += std::string("access = ") + (a.read_only ? "\"ro\"" : "\"rw\"") + "\n";
+    if (!a.root.empty()) o += "root = " + quote(a.root) + "\n";
     if (!a.prefix.empty()) o += "prefix = " + quote(a.prefix) + "\n";
     o += "max_sessions = " + std::to_string(a.max_sessions) + "\n";
     o += "max_bandwidth_kbps = " + std::to_string(a.max_bandwidth_kbps) + "\n";
@@ -531,6 +532,7 @@ PeerEdit peer_add(const std::string& config_path, const PeerSpec& spec) {
         want.public_key = spec.key;
     }
     want.read_only = spec.read_only;
+    if (spec.root) want.root = *spec.root;  // absent = keep
     if (spec.prefix) want.prefix = *spec.prefix;  // absent = keep what the peer has (a new peer gets the whole root)
     if (spec.max_sessions) want.max_sessions = *spec.max_sessions;
     if (spec.max_bandwidth_kbps) want.max_bandwidth_kbps = *spec.max_bandwidth_kbps;

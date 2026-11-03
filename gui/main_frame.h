@@ -59,8 +59,11 @@ public:
         auto_req_ = true;
         if (mode_ == Mode::Simple) RunAutoDrive();
     }
-    void SimpleAutoReceive(const std::string& folder, bool with_code) {
-        if (simple_ && simple_->status()) simple_->status()->AutoReceive(folder, with_code);
+    void SimpleOpenInvite() {   // menu "Cho máy khác gửi tệp tới đây…" (chỉ có ý nghĩa ở chế độ Đơn giản)
+        if (simple_ && simple_->status()) simple_->status()->OpenInvite();
+    }
+    void SimpleAutoInviteDemo() {
+        if (simple_ && simple_->status()) simple_->status()->AutoInviteDemo();
     }
     void Screenshot(const std::string& png);
     void SimpleShowAdvanced(bool on);
@@ -73,6 +76,7 @@ public:
 private:
     enum class Mode { Pending, Simple, Advanced };
     void BuildMenu();
+    void OnInviteMenu();
     void BuildUi();
     void BuildSimple();
     void EnterSimple();

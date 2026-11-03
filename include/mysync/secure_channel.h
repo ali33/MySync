@@ -10,6 +10,7 @@
 //   <- e, ee, se
 // then Split() gives one key per direction for the record layer (counter nonce, frames <= 1 MiB).
 // Not thread-safe per direction: at most one sender thread and one receiver thread (state is disjoint).
+#include <array>
 #include <functional>
 #include <vector>
 
@@ -70,9 +71,14 @@ public:
     net::Socket& socket() { return sock_; }
     // The authenticated static public key of the other side (server key for a client; client key for a server).
     const PubKey& peer_public() const { return peer_; }
+    // 64 bytes derived from the Noise symmetric-state hash at Split time: identical on both sides of THIS session and
+    // different for every session (it covers both ephemeral keys). Lets a message be bound to the session it is sent in.
+    // Public information (not a key). Zero on a dead / moved-from channel.
+    const std::array<uint8_t, 64>& handshake_hash() const { return hh_; }
 
 private:
-    static SecureChannel make(net::Socket&& s, const uint8_t send_key[32], const uint8_t recv_key[32], const PubKey& peer);
+    static SecureChannel make(net::Socket&& s, const uint8_t send_key[32], const uint8_t recv_key[32], const PubKey& peer,
+                              const uint8_t sym_hash[32]);
     void wipe();
     Bytes recv_msg_impl(int total_ms);  // total_ms < 0: no overall deadline
 
@@ -82,6 +88,7 @@ private:
     uint64_t send_ctr_ = 0;
     uint64_t recv_ctr_ = 0;
     PubKey peer_{};
+    std::array<uint8_t, 64> hh_{};
     bool dead_ = true;
 
 

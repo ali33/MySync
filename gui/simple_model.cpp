@@ -184,6 +184,7 @@ void WizardModel::clear_paired() {
     if (!paired_ok_) return;
     in_.paired = simple::PairCode{};
     paired_ok_ = false;
+    machine_label_.clear();
     invalidate();
 }
 void WizardModel::apply_validation(const std::vector<simple::WizardIssue>& issues) {
@@ -236,7 +237,7 @@ void WizardModel::reset() { *this = WizardModel{}; }
 
 std::string WizardModel::summary() const {
     std::string dest = in_.kind == simple::DestKind::PairedMachine
-                           ? trf("wizard.sum.machine", {in_.paired.host})
+                           ? trf("wizard.sum.machine", {machine_label_.empty() ? in_.paired.host : machine_label_})
                            : trf("wizard.sum.folder", {in_.dest_path});
     return trf("wizard.summary", {in_.source, dest});
 }
@@ -299,31 +300,6 @@ std::vector<std::string> rank_addresses(const std::vector<std::string>& ips) {
     out.insert(out.end(), pub.begin(), pub.end());
     out.insert(out.end(), v6.begin(), v6.end());
     return out;
-}
-
-std::string pair_outcome_text(const simple::PairOutcome& o) {
-    switch (o.kind) {
-        case simple::PairOutcome::Approved: return tr("pair.out.approved");
-        case simple::PairOutcome::Denied: return tr("pair.out.denied");
-        case simple::PairOutcome::Busy: return tr("pair.out.busy");
-        case simple::PairOutcome::Expired: return tr("pair.out.expired");
-        case simple::PairOutcome::Cancelled: return tr("pair.out.cancelled");
-        case simple::PairOutcome::Failed: break;
-    }
-    return o.message.empty() ? tr("pair.out.failed") : trf("pair.out.failed_msg", {o.message});
-}
-
-std::string check_pair_code_text(const std::string& text, simple::PairCode* out) {
-    std::string t = trim(text);
-    if (t.empty()) return tr("pair.code.empty");
-    if (!simple::looks_like_pair_code(t)) return tr("pair.code.notcode");
-    try {
-        simple::PairCode c = simple::decode_pair_code(t);
-        if (out) *out = c;
-        return "";
-    } catch (const std::exception&) {
-        return tr("pair.code.broken");  // không lặp lại nội dung đã dán
-    }
 }
 
 std::string friendly_error(const std::string& what) {

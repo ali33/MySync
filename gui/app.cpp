@@ -7,7 +7,6 @@
 #include <wx/snglinst.h>
 
 #include "main_frame.h"
-#include "server_wizard.h"
 
 using namespace mysync::gui;
 
@@ -70,10 +69,11 @@ public:
             });
             t->StartOnce(3000);
         });
-        server_wizard_demo().folder = sw_demo_;
-        server_wizard_demo().png = sw_shot_;
-        if (!sw_demo_.empty()) f->CallAfter([f] { show_server_wizard(f); });
-        if (!auto_recv_.empty()) f->CallAfter([f, this] { f->SimpleAutoReceive(auto_recv_, !no_code_); });
+        simple_test_hooks().demo_invite_code = demo_invite_code_;
+        simple_test_hooks().invite_demo_folder = invite_demo_;
+        simple_test_hooks().invite_demo_png = invite_shot_;
+        simple_test_hooks().invite_demo_joined = invite_joined_;
+        if (!invite_demo_.empty()) f->CallAfter([f] { f->SimpleAutoInviteDemo(); });
         if (!shot_.empty()) {
             std::string png = shot_;
             bool ex = shot_exit_;
@@ -111,10 +111,10 @@ public:
         p.AddSwitch("", "redact-account", "documentation screenshots: show a sample account name instead of the real one");
         p.AddOption("", "dialog-shot-open", "test: PNG of that dialog with the Details part opened", wxCMD_LINE_VAL_STRING);
         p.AddOption("", "dialog-shot", "test: PNG of that confirmation dialog", wxCMD_LINE_VAL_STRING);
-        p.AddOption("", "server-wizard-demo", "documentation: open the server wizard on this (temporary) folder, create, add a sample client", wxCMD_LINE_VAL_STRING);
-        p.AddOption("", "server-wizard-shot", "documentation: PNG of the server wizard result screen (then it closes)", wxCMD_LINE_VAL_STRING);
-        p.AddSwitch("", "no-code", "test: with --auto-recv, receive without opening a pairing code");
-        p.AddOption("", "auto-recv", "test: turn on receiving into this folder", wxCMD_LINE_VAL_STRING);
+        p.AddOption("", "invite-demo", "documentation: open \"let another computer send files here\" on this (temporary) folder and make a real code", wxCMD_LINE_VAL_STRING);
+        p.AddOption("", "invite-shot", "documentation: PNG of that dialog once the code is shown (then the program exits)", wxCMD_LINE_VAL_STRING);
+        p.AddOption("", "invite-joined", "documentation: show one sample joined machine with this name in that dialog", wxCMD_LINE_VAL_STRING);
+        p.AddSwitch("", "demo-invite-code", "documentation: with --auto-src --wizard-stop 1, paste a sample MSY2 code (no network) so step 2 shows its summary");
         p.AddOption("", "auto-dst", "test: run the wizard with this destination folder", wxCMD_LINE_VAL_STRING);
     }
     bool OnCmdLineParsed(wxCmdLineParser& p) override {
@@ -133,15 +133,15 @@ public:
         shot_exit_ = p.Found("shot-exit");
         if (p.Found("auto-src", &c)) auto_src_ = S(c);
         if (p.Found("auto-dst", &c)) auto_dst_ = S(c);
-        if (p.Found("auto-recv", &c)) auto_recv_ = S(c);
         if (p.Found("wizard-stop", &n)) wizard_stop_ = static_cast<int>(n);
         if (p.Found("demo-ip", &c)) demo_ip_ = S(c);
         show_adv_ = p.Found("show-advanced");
         redact_ = p.Found("redact-account");
-        no_code_ = p.Found("no-code");
+        if (p.Found("demo-invite-code")) demo_invite_code_ = demo_invite_code("MAY-NHAN", "Báo cáo", "192.168.1.20", 5656, mysync::simple::InvitePerm::ReadWrite, 23 * 3600 + 1800);
         auto_svc_dialog_ = p.Found("auto-svc-dialog");
-        if (p.Found("server-wizard-demo", &c)) sw_demo_ = S(c);
-        if (p.Found("server-wizard-shot", &c)) sw_shot_ = S(c);
+        if (p.Found("invite-demo", &c)) invite_demo_ = S(c);
+        if (p.Found("invite-shot", &c)) invite_shot_ = S(c);
+        if (p.Found("invite-joined", &c)) invite_joined_ = S(c);
         if (p.Found("dialog-shot", &c)) dialog_shot_ = S(c);
         if (p.Found("dialog-shot-open", &c)) dialog_shot_open_ = S(c);
         return wxApp::OnCmdLineParsed(p);
@@ -185,11 +185,11 @@ private:
     bool tray_only_ = false;
     int tab_ = -1;
     int page_ = -1;
-    std::string config_, daemon_, lang_, dump_icons_, user_dir_, shot_, auto_src_, auto_dst_, auto_recv_;
+    std::string config_, daemon_, lang_, dump_icons_, user_dir_, shot_, auto_src_, auto_dst_;
     int shot_delay_ = 2500;
     int wizard_stop_ = -1;
-    bool show_adv_ = false, auto_svc_dialog_ = false, redact_ = false, no_code_ = false;
-    std::string demo_ip_, dialog_shot_, dialog_shot_open_, sw_demo_, sw_shot_;
+    bool show_adv_ = false, auto_svc_dialog_ = false, redact_ = false;
+    std::string demo_ip_, dialog_shot_, dialog_shot_open_, demo_invite_code_, invite_demo_, invite_shot_, invite_joined_;
     bool shot_exit_ = false;
 
     static void DumpIcons(const std::string& path) {

@@ -106,6 +106,13 @@ public:
     PairInfo pair_mode(bool on, uint32_t seconds = 0);
     std::string pair_approve(uint32_t id);      // returns the prefix granted
     void pair_deny(uint32_t id);
+    // Invites (gui/invite_ops.h). Throw Error with the daemon's verbatim reason on refusal (e.g. pairing is off).
+    InviteListInfo invite_create(const InviteCreateReq& req);   // created_code is filled once
+    InviteListInfo invite_list();
+    InviteListInfo invite_revoke(const std::string& id_or_prefix);
+    InviteListInfo invite_remove_machine(const std::string& key_hex);   // out of the allowlist and revoked at once
+    InviteListInfo invite_approve(uint32_t pending_id);
+    InviteListInfo invite_deny(uint32_t pending_id);
 
     const std::string& name() const { return name_; }
 

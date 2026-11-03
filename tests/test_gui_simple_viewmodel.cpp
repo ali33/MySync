@@ -238,6 +238,9 @@ TEST(simple_wizard_paired_machine_needs_approval) {
     CHECK(!m.can_next());  // đổi đầu vào: kiểm lại
     m.apply_validation({});
     CHECK(m.can_next());
+    m.set_machine_label("MAY-NHAN · thư mục \"Báo cáo\" · chỉ xem");
+    CHECK(has(m.summary(), "MAY-NHAN"));
+    CHECK(!has(m.summary(), "192.168.1.20"));
     // tạo tay: kind máy khác nhưng chưa ghép dù không có issue -> vẫn chặn
     WizardModel m2;
     m2.set_source("D:/A");
@@ -296,48 +299,6 @@ TEST(simple_pair_helpers) {
     CHECK(!is_private_ipv4("example.com"));
 
     CHECK(has(firewall_hint(5656), "5656"));
-}
-
-TEST(simple_pair_code_check_is_plain_and_never_echoes_the_code) {
-    LangGuard g(Lang::Vi);
-    CHECK(!check_pair_code_text("").empty());
-    CHECK(has(check_pair_code_text("hello world"), "MSY1-"));
-
-    simple::PairCode c;
-    c.server_key = key_from_hex(std::string(64, 'a'));
-    c.port = 5656;
-    c.host = "192.168.1.20";
-    std::string code = simple::encode_pair_code(c);
-    simple::PairCode back;
-    CHECK_EQ(check_pair_code_text(code, &back), std::string(""));
-    CHECK_EQ(back.host, c.host);
-    CHECK_EQ(back.port, uint16_t(5656));
-    // dán thừa khoảng trắng / xuống dòng (chép từ email) vẫn đọc được
-    CHECK_EQ(check_pair_code_text("  " + code + "\r\n"), std::string(""));
-    // hỏng một ký tự giữa mã: báo bằng lời thường, không lộ mã
-    std::string bad = code;
-    size_t i = bad.size() / 2;
-    bad[i] = bad[i] == '2' ? '3' : '2';
-    std::string e = check_pair_code_text(bad);
-    CHECK(!e.empty());
-    CHECK(!has(e, bad));
-    CHECK(!has(e, "checksum"));
-}
-
-TEST(simple_pair_outcome_text_covers_every_kind) {
-    LangGuard g(Lang::Vi);
-    using K = simple::PairOutcome;
-    for (auto k : {K::Approved, K::Denied, K::Busy, K::Expired, K::Cancelled, K::Failed}) {
-        K o;
-        o.kind = k;
-        auto t = pair_outcome_text(o);
-        CHECK(!t.empty());
-        CHECK(t.find("?pair") == std::string::npos);
-    }
-    K f;
-    f.kind = K::Failed;
-    f.message = "connection refused";
-    CHECK(has(pair_outcome_text(f), "connection refused"));  // nguyên văn
 }
 
 TEST(simple_friendly_error_translates_core_issue_keys) {
@@ -458,7 +419,7 @@ TEST(simple_symlink_error_has_plain_headline) {
 // ---- không có thuật ngữ kỹ thuật trong lời của chế độ Đơn giản
 TEST(simple_strings_have_no_jargon) {
     const char* banned[] = {"daemon", "toml", "noise", "allowlist", "ipc", "sid ", "named pipe", "pubkey", "public key"};
-    const char* prefixes[] = {"simple.", "wizard.", "pair.", "recv.", "quick."};
+    const char* prefixes[] = {"simple.", "wizard.", "pair.", "recv.", "quick.", "inv."};
     size_t checked = 0;
     for (Lang l : {Lang::Vi, Lang::En}) {
         LangGuard g(l);

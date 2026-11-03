@@ -545,6 +545,24 @@ void apply_client_acl(const Section& sec, ClientAcl& a) {
     get_num(kv, "max_bandwidth_kbps", a.max_bandwidth_kbps, 0, INT32_MAX);
     raise_small_bandwidth(a.max_bandwidth_kbps, "[[client]]");
     get_size(kv, "max_write_bytes_per_hour", a.max_write_bytes_per_hour);
+    {
+        const Entry* re = nullptr;
+        for (const auto& x : sec.entries)
+            if (x.key == "root") re = &x;
+        get_str(kv, "root", a.root);
+        if (re && !a.root.empty()) {
+            bool bad = a.root.size() > 1000;
+            for (unsigned char ch : a.root)
+                if (ch < 0x20 || ch == 0x7F) bad = true;
+            std::filesystem::path rp = std::filesystem::u8path(a.root);
+            if (!bad && !rp.is_absolute()) bad = true;
+            for (const auto& part : rp)
+                if (part == "..") bad = true;
+            if (bad) fail(re->line, "invalid root (must be an absolute folder, without \"..\")");
+            while (a.root.size() > 1 && (a.root.back() == '/' || a.root.back() == '\\') && !(a.root.size() == 3 && a.root[1] == ':'))
+                a.root.pop_back();
+        }
+    }
     const Entry* pe = nullptr;
     for (const auto& x : sec.entries)
         if (x.key == "prefix") pe = &x;

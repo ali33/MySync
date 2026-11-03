@@ -317,29 +317,7 @@ TEST(qs_refuses_link_or_junction_on_the_way) {
     CHECK_THROWS(quick_server(p));
 }
 
-// GUI "add client" runs the same trust guard as `mysync peer add`: a server.toml reached through a link is refused,
-// and nothing is written.
-#include "i18n_model.h"
-#include "server_wizard_model.h"
-TEST(qs_gui_add_client_runs_the_trust_guard) {
-    Tmp t;
-    QuickResult r = quick_server(QuickServerOptions{t.s("share"), "", 5656, "", false});
-    std::string lnk = t.s("link.toml");
-    std::error_code ec;
-    fs::create_symlink(fs::u8path(r.config_file), fs::u8path(lnk), ec);
-    if (ec) return;   // no right to create symbolic links here
-    std::string hex = key_to_hex(generate_keypair().pub);
-    gui::AddClientOutcome o = gui::add_client(lnk, "may-a", hex, false);
-    CHECK(!o.ok);
-    CHECK(o.message.find("link") != std::string::npos);
-    auto cli = sotest::cli({"peer", "add", hex, "--name", "may-a", "--perm", "rw", "-c", lnk});
-    CHECK(cli.rc != 0);                                       // the CLI refuses the same file
-    CHECK(peer_list(r.config_file).empty());
-    gui::AddClientOutcome good = gui::add_client(r.config_file, "may-a", hex, false);   // the real file still works
-    CHECK(good.ok);
-}
-
-TEST(qs_vietnamese_snippet_loads_and_gui_messages_follow_language) {
+TEST(qs_vietnamese_snippet_loads) {
     // core: Vietnamese comments are still valid TOML
     std::string vi = make_client_snippet("host.example", 5656, std::string(64, 'a'), "may-a", true);
     CHECK(vi.find("thay b\xE1\xBA\xB1ng") != std::string::npos);
@@ -349,19 +327,6 @@ TEST(qs_vietnamese_snippet_loads_and_gui_messages_follow_language) {
     // CLI result stays English
     Tmp t;
     CHECK(quick_server(QuickServerOptions{t.s("a"), "", 5656, "", false}).client_snippet.find("replace with the folder") != std::string::npos);
-    // GUI in Vietnamese: snippet comments and the add-client sentence are Vietnamese, the snippet loads
-    gui::set_lang(gui::Lang::Vi);
-    QuickResult r = gui::create_server(t.s("b"), 5700);
-    CHECK(r.client_snippet.find("thay b\xE1\xBA\xB1ng") != std::string::npos);
-    CHECK_EQ(parse_client_config_text(r.client_snippet).watches[0].targets[0].port, uint16_t(5700));
-    std::string hex = key_to_hex(generate_keypair().pub);
-    gui::AddClientOutcome o = gui::add_client(r.config_file, "may-a", hex, false);
-    CHECK(o.ok);
-    CHECK(o.message.find("peer '") == std::string::npos);
-    CHECK(o.message.find("\xC4\x91\xC3\xA3 th\xC3\xAA" "m") != std::string::npos);   // "đã thêm"
-    gui::set_lang(gui::Lang::En);
-    gui::AddClientOutcome o2 = gui::add_client(r.config_file, "may-a", hex, false);
-    CHECK(o2.message.find("unchanged") != std::string::npos);
 }
 
 TEST(qs_make_folder_private_removes_other_writers_and_new_folders_start_private) {

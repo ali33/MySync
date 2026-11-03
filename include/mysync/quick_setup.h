@@ -37,6 +37,12 @@ struct UntrustedFolderError : Error {
 // Used for folders quick_server / quick_client create, and for existing ones when fix_permissions is set.
 void make_folder_private(const std::string& dir);
 
+// Makes `dir` ready to be handed to a machine that joins by invitation, with the checks every shared root gets: no link /
+// junction in any component (Error), created PRIVATE when missing (make_folder_private), and, for an elevated run, refused with
+// UntrustedFolderError when other accounts can change it (fix_permissions = make it private first). Returns true when it created
+// the folder. Throws Error.
+bool prepare_shared_folder(const std::string& dir, bool fix_permissions);
+
 struct QuickServerOptions {
     std::string dir;           // the folder that receives files (server root); created when missing
     std::string config_dir;    // where server.toml / server.key / peers.d live; "" = <dir>.mysync (beside the root, NOT inside it)

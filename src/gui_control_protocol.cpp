@@ -223,6 +223,115 @@ PairInfo get_pair(Reader& r) {
     return p;
 }
 
+constexpr size_t kMaxPendingInvites = 8;
+
+void put_invites(Writer& w, const InviteListInfo& v, const Limits& lim) {
+    w.boolean(v.allowed);
+    w.str(clean(v.machine, 200));
+    w.str(clean(v.fingerprint, 40));
+    w.u16(v.port);
+    w.str(clean(v.root, 1024));
+    w.str(clean(v.created_code, 1500));
+    size_t ni = std::min({v.invites.size(), lim.items, kMaxInviteRows});
+    w.u16(static_cast<uint16_t>(ni));
+    for (size_t i = 0; i < ni; ++i) {
+        const InviteView& x = v.invites[i];
+        w.str(clean(x.id_hex, 16));
+        w.str(clean(x.label, 200));
+        w.str(clean(x.folder, 400));
+        w.str(clean(x.created_by, 16));
+        w.u8(static_cast<uint8_t>(x.perm));
+        w.str(clean(x.state, 16));
+        w.u32(x.uses_left);
+        w.u32(x.uses_total);
+        w.i64(x.expires_unix);
+        w.boolean(x.ask);
+    }
+    size_t nj = std::min({v.joined.size(), lim.items, kMaxInviteRows});
+    w.u16(static_cast<uint16_t>(nj));
+    for (size_t i = 0; i < nj; ++i) {
+        const JoinedMachineView& x = v.joined[i];
+        w.str(clean(x.name, 200));
+        w.str(clean(x.key_hex, 64));
+        w.str(clean(x.when_utc, 32));
+        w.str(clean(x.invite_id_hex, 16));
+        w.str(clean(x.folder, 400));
+        w.u8(static_cast<uint8_t>(x.perm));
+    }
+    size_t np = std::min(v.pending.size(), kMaxPendingInvites);
+    w.u16(static_cast<uint16_t>(np));
+    for (size_t i = 0; i < np; ++i) {
+        const simple::PendingInvite& q = v.pending[i];
+        w.u32(q.id);
+        w.str(clean(q.name, 200));
+        w.str(clean(q.sas, 40));
+        w.str(clean(q.ip, 64));
+        w.u32(static_cast<uint32_t>(std::max(0, q.seconds_left)));
+        w.str(clean(q.label, 200));
+    }
+}
+
+simple::InvitePerm get_perm(Reader& r) {
+    uint8_t p = r.u8();
+    if (p > 1) throw Error("control message: bad permission");
+    return static_cast<simple::InvitePerm>(p);
+}
+
+InviteListInfo get_invites(Reader& r) {
+    InviteListInfo v;
+    v.allowed = r.boolean();
+    v.machine = r.str();
+    v.fingerprint = r.str();
+    v.port = r.u16();
+    v.root = r.str();
+    v.created_code = r.str();
+    size_t ni = r.u16();
+    if (ni > kMaxInviteRows) throw Error("control message: too many invites");
+    for (size_t i = 0; i < ni; ++i) {
+        InviteView x;
+        x.id_hex = r.str();
+        x.label = r.str();
+        x.folder = r.str();
+        x.created_by = r.str();
+        x.perm = get_perm(r);
+        x.state = r.str();
+        x.uses_left = r.u32();
+        x.uses_total = r.u32();
+        x.expires_unix = r.i64();
+        x.ask = r.boolean();
+        v.invites.push_back(std::move(x));
+    }
+    size_t nj = r.u16();
+    if (nj > kMaxInviteRows) throw Error("control message: too many joined machines");
+    for (size_t i = 0; i < nj; ++i) {
+        JoinedMachineView x;
+        x.name = r.str();
+        x.key_hex = r.str();
+        x.when_utc = r.str();
+        x.invite_id_hex = r.str();
+        x.folder = r.str();
+        x.perm = get_perm(r);
+        v.joined.push_back(std::move(x));
+    }
+    size_t np = r.u16();
+    if (np > kMaxPendingInvites) throw Error("control message: too many waiting invites");
+    for (size_t i = 0; i < np; ++i) {
+        simple::PendingInvite q;
+        q.id = r.u32();
+        q.name = r.str();
+        q.sas = r.str();
+        q.ip = r.str();
+        q.seconds_left = static_cast<int>(std::min<uint32_t>(r.u32(), 86400));
+        q.label = r.str();
+        v.pending.push_back(std::move(q));
+    }
+    return v;
+}
+
+bool needs_payload(ControlOp op) {
+    return op == ControlOp::InviteCreate || op == ControlOp::InviteRevoke || op == ControlOp::InviteRemoveMachine;
+}
+
 Bytes encode_once(const ControlResponse& m, const Limits& lim) {
 
     Writer w;
@@ -261,11 +370,19 @@ Bytes encode_once(const ControlResponse& m, const Limits& lim) {
     case ControlOp::PairDeny:
         put_pair(w, m.pair, lim);
         break;
+    case ControlOp::InviteCreate:
+    case ControlOp::InviteList:
+    case ControlOp::InviteRevoke:
+    case ControlOp::InviteRemoveMachine:
+    case ControlOp::InviteApprove:
+    case ControlOp::InviteDeny:
+        put_invites(w, m.invites, lim);
+        break;
     }
     return w.take();
 }
 
-bool known_op(uint8_t op) { return op >= 1 && op <= 9; }
+bool known_op(uint8_t op) { return op >= 1 && op <= 15; }
 
 }  // namespace
 
@@ -280,6 +397,12 @@ const char* control_op_name(ControlOp op) {
     case ControlOp::PairList: return "PAIR_LIST";
     case ControlOp::PairApprove: return "PAIR_APPROVE";
     case ControlOp::PairDeny: return "PAIR_DENY";
+    case ControlOp::InviteCreate: return "INVITE_CREATE";
+    case ControlOp::InviteList: return "INVITE_LIST";
+    case ControlOp::InviteRevoke: return "INVITE_REVOKE";
+    case ControlOp::InviteRemoveMachine: return "INVITE_REMOVE_MACHINE";
+    case ControlOp::InviteApprove: return "INVITE_APPROVE";
+    case ControlOp::InviteDeny: return "INVITE_DENY";
     }
     return "?";
 }
@@ -290,6 +413,13 @@ Bytes encode_request(const ControlRequest& q) {
     w.u8(static_cast<uint8_t>(q.op));
     w.u64(q.token);
     w.u32(q.arg);
+    if (needs_payload(q.op)) {
+        if (q.payload.empty() || q.payload.size() > kMaxRequestPayload) throw Error("control message: bad payload size");
+        w.u32(static_cast<uint32_t>(q.payload.size()));
+        w.raw(q.payload.data(), q.payload.size());
+    } else if (!q.payload.empty()) {
+        throw Error("control message: this operation takes no payload");
+    }
     return w.take();
 }
 
@@ -302,6 +432,12 @@ ControlRequest decode_request(const void* data, size_t n) {
     q.op = static_cast<ControlOp>(op);
     q.token = r.u64();
     q.arg = r.u32();
+    if (needs_payload(q.op)) {   // required for these ops and forbidden for all others, so old requests stay strict
+        uint32_t len = r.u32();
+        if (len == 0 || len > kMaxRequestPayload || len > r.remaining()) throw Error("control message: bad payload size");
+        q.payload.resize(len);
+        r.raw(q.payload.data(), len);
+    }
     r.expect_end();
     return q;
 }
@@ -372,9 +508,68 @@ ControlResponse decode_response(const void* data, size_t n) {
     case ControlOp::PairDeny:
         m.pair = get_pair(r);
         break;
+    case ControlOp::InviteCreate:
+    case ControlOp::InviteList:
+    case ControlOp::InviteRevoke:
+    case ControlOp::InviteRemoveMachine:
+    case ControlOp::InviteApprove:
+    case ControlOp::InviteDeny:
+        m.invites = get_invites(r);
+        break;
     }
     r.expect_end();
     return m;
+}
+
+Bytes encode_invite_create(const InviteCreateReq& q) {
+    Writer w;
+    w.str(clean(q.folder, 400));
+    w.str(clean(q.label, 200));
+    w.u8(static_cast<uint8_t>(q.perm));
+    w.u32(q.ttl_seconds);
+    w.u32(q.uses);
+    w.boolean(q.ask);
+    size_t n = std::min(q.addrs.size(), simple::kInviteMaxAddrs);
+    w.u8(static_cast<uint8_t>(n));
+    for (size_t i = 0; i < n; ++i) {
+        w.str(clean(q.addrs[i].host, 255));
+        w.u16(q.addrs[i].port);
+    }
+    return w.take();
+}
+
+InviteCreateReq decode_invite_create(const Bytes& b) {
+    Reader r(b);
+    InviteCreateReq q;
+    q.folder = r.str();
+    q.label = r.str();
+    q.perm = get_perm(r);
+    q.ttl_seconds = r.u32();
+    q.uses = r.u32();
+    q.ask = r.boolean();
+    size_t n = r.u8();
+    if (n > simple::kInviteMaxAddrs) throw Error("control message: too many addresses");
+    for (size_t i = 0; i < n; ++i) {
+        simple::InviteAddr a;
+        a.host = r.str();
+        a.port = r.u16();
+        q.addrs.push_back(std::move(a));
+    }
+    r.expect_end();
+    return q;
+}
+
+Bytes encode_invite_text(const std::string& s) {
+    Writer w;
+    w.str(clean(s, 200));
+    return w.take();
+}
+
+std::string decode_invite_text(const Bytes& b) {
+    Reader r(b);
+    std::string s = r.str();
+    r.expect_end();
+    return s;
 }
 
 Bytes frame_message(const Bytes& payload) {

@@ -30,6 +30,7 @@
 #include "mysync/gui/status.h"
 #include "mysync/peers.h"
 #include "mysync/server.h"
+#include "mysync/simple/invite.h"
 
 namespace mysync::gui {
 
@@ -96,6 +97,9 @@ public:
     // Set before start().
     using PairFn = std::function<ControlResponse(const ControlRequest&)>;
     void set_pair_handler(PairFn fn);
+    // Answers the INVITE_* operations (receiver with invites; without a handler they get Unsupported). Set before start().
+    using InviteFn = std::function<ControlResponse(const ControlRequest&)>;
+    void set_invite_handler(InviteFn fn);
     void start();   // throws Error (the endpoint could not be created)
     void stop();
     const std::string& endpoint() const;
@@ -132,6 +136,12 @@ public:
     // True only when the process asked for the pairing mode (DaemonOptions::allow_pairing) AND [server] pairing is
     // not "off". Whatever enables pairing (control-channel ops, GUI) must consult this: with "off" there is no way in.
     bool pairing_allowed() const;
+    // Invitation codes (simple/invite.h). invites() is null until run() has built the server. The store lives in
+    // <config dir>/invites.d whatever [server] pairing says; gui_invites_allowed() is true only when the process asked for
+    // pairing (DaemonOptions::allow_pairing) AND [server] pairing is not "off": the control-channel ops consult it, while
+    // invites an administrator created with `mysync invite create` redeem regardless.
+    std::shared_ptr<simple::InviteManager> invites() const;
+    bool gui_invites_allowed() const;
 
 private:
     struct Impl;

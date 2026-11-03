@@ -20,7 +20,7 @@ Lần đầu mở, màn **Chào mừng đến với MySync** hiện hai lựa ch
 ![Màn Bắt đầu nhanh](docs/images/gui-01-bat-dau-nhanh.png)
 
 - **Bước 1 — "Thư mục nào cần được giữ bản sao?"**: bấm **Chọn thư mục…** hoặc kéo một thư mục từ cửa sổ quản lý tệp thả vào cửa sổ. Bấm **Tiếp theo**.
-- **Bước 2 — "Bản sao sẽ được lưu ở đâu?"**: chọn **Một thư mục khác, ổ USB hoặc thư mục chia sẻ trong mạng**, hoặc **Một máy tính khác có cài MySync** (xem mục 4).
+- **Bước 2 — "Bản sao sẽ được lưu ở đâu?"**: chọn **Một thư mục khác, ổ USB hoặc thư mục chia sẻ trong mạng**, hoặc **Một máy tính khác có cài MySync** (dán mã, xem mục 4).
 - **Bước 3 — "Sẵn sàng"**: đọc dòng tóm tắt, bấm **Bắt đầu đồng bộ**. Từ bước 2 trở đi có nút **Quay lại** để sửa lựa chọn trước; bước 1 có **Huỷ**.
 
 Mặc định an toàn: bỏ qua tệp tạm và tệp hệ thống, tệp bị xoá hoặc ghi đè được cất vào thùng rác của nơi lưu, không giới hạn tốc độ, cập nhật ngay khi có thay đổi.
@@ -28,13 +28,24 @@ Mặc định an toàn: bỏ qua tệp tạm và tệp hệ thống, tệp bị 
 ### 3. Đồng bộ sang thư mục khác, ổ USB hoặc thư mục chia sẻ trong mạng
 Ở bước 2, chọn thư mục đích (ví dụ `E:\Sao-luu`). Thư mục chia sẻ trong mạng gõ dạng `\\tên-máy\tên-chia-sẻ` (hai dấu gạch chéo ngược ở đầu). Nếu hiện lỗi "Không tìm thấy nơi lưu này", hãy kiểm tra ổ USB đã cắm chưa hoặc đường dẫn mạng có đúng không.
 
-### 4. Ghép hai máy bằng mã
-1. **Máy nhận**: ở màn nhận file, bật công tắc **Cho phép máy khác gửi file vào đây**, rồi bấm **Sao chép** ở dòng **Mã ghép**. Mã bắt đầu bằng `MSY1-`, **chỉ dùng được một lần và hết hạn sau khoảng 10 phút**; hết hạn thì bấm **Tạo mã mới**.
-2. **Máy gửi**: ở bước 2 chọn **Một máy tính khác có cài MySync**, dán mã vào ô, bấm **Gửi yêu cầu ghép**.
-3. Hai máy cùng hiện một **chuỗi xác nhận**. Kiểm tra giống hệt nhau, rồi ở máy nhận bấm **Đồng ý** (không giống hoặc không biết máy nào thì bấm **Từ chối**).
-4. Nếu máy gửi không nối được, tường lửa của máy nhận có thể đang chặn: khi Windows hỏi có cho MySync truy cập mạng không, chọn **Cho phép**.
+### 4. Đồng bộ một thư mục sang máy khác (3 bước, một mã)
+Hai máy đều cài MySync. Không chép khoá, không sửa tệp cấu hình.
+1. **Máy nhận**: bấm **Cho máy khác gửi tệp tới đây…** (ở màn Trạng thái hoặc menu Cài đặt), chọn thư mục sẽ nhận tệp (thư mục nào cũng được), chọn **Gửi và sửa tệp** (hoặc **Chỉ xem**), bấm **Tạo mã**, rồi bấm **Chép**. Mặc định mã dùng được **1 lần trong 24 giờ**, và ô **Hỏi tôi trước khi cho vào** được tích.
+2. **Máy gửi**: ở bước 2 của trình hướng dẫn chọn **Một máy tính khác có cài MySync** và dán mã. MySync kiểm ngay (mã đúng chưa, còn hạn không, tới được máy kia không) rồi nói bằng lời thường: tên máy, thư mục, quyền, còn bao lâu. Bấm **Tiếp theo**, rồi **Bắt đầu đồng bộ**.
+3. Nếu máy nhận để tích **Hỏi tôi trước khi cho vào**: hai máy cùng hiện một **chuỗi xác nhận**; kiểm tra giống hệt nhau rồi bấm **Đồng ý** ở máy nhận. Bỏ tích thì vào luôn, không hỏi.
 
-![Máy nhận file](docs/images/gui-06-cho-phep-may-khac.png)
+Máy nhận thấy danh sách **Các máy đã vào** kèm nút **Gỡ**, và danh sách mã đang dùng được kèm nút **Huỷ mã**.
+
+![Máy gửi: dán mã ở bước 2](docs/images/gui-03b-ma-moi.png)
+![Máy nhận: tạo mã](docs/images/gui-09-cho-may-khac-gui.png)
+
+Cần biết:
+- **Không có máy trung gian (relay).** Máy gửi phải tới được một trong các địa chỉ có trong mã: cùng mạng LAN/VPN thì được; qua Internet thì máy nhận cần có địa chỉ IP công khai hoặc mở cổng trên router/tường lửa (Windows hỏi có cho MySync truy cập mạng không thì chọn **Cho phép**).
+- Mã **chỉ chứa khoá công khai**, không chứa khoá bí mật, nhưng ai có mã trong thời hạn là vào được: đừng đăng công khai, và để mặc định 1 lần dùng.
+- Mã loại **Chỉ xem** không dùng để gửi tệp; trình hướng dẫn báo ngay khi dán.
+- Tệp bị xoá hoặc ghi đè ở máy nhận được cất vào `__sync/__trash`, không mất ngay.
+
+![Máy nhận file](docs/images/gui-06-cho-may-khac-gui.png)
 
 ### 5. Đọc màn Trạng thái
 Câu lớn ở giữa cho biết tình hình: "Đang đồng bộ … tệp…", "Mọi thứ đã được đồng bộ", hoặc "Có lỗi: …" (nguyên văn nguyên nhân).
@@ -53,7 +64,7 @@ Nút **Chế độ nâng cao** hiện bốn tab (Trạng thái, Cấu hình, D�
 ### 8. Hỏi nhanh
 - **Tệp bị xoá/ghi đè nằm đâu?** Không mất ngay: bản cũ được cất vào thư mục `__sync/__trash` ngay trong nơi lưu, chia theo giờ xoá.
 - **Máy kia tắt thì sao?** MySync báo "Chưa nối được tới nơi lưu…" và tự thử lại; khi máy kia bật lại, phần bị lỡ được đồng bộ bù.
-- **Gỡ một máy đã ghép?** Dùng chế độ nâng cao, tab Ghép máy và Khoá (danh sách máy được phép), hoặc dòng lệnh `mysync peer revoke <tên>` (xem `docs/SERVER-TO-SERVER.md`); phiên đang mở của máy đó bị ngắt ngay.
+- **Gỡ một máy đã ghép?** Bấm **Gỡ** cạnh tên máy trong hộp **Cho máy khác gửi tệp tới đây**, hoặc dòng lệnh `mysync peer revoke <tên>` (xem `docs/SERVER-TO-SERVER.md`); phiên đang mở của máy đó bị ngắt ngay.
 
 ## Điểm chính
 - **Watch realtime**: ReadDirectoryChangesW (Windows) / inotify (Linux), gộp sự kiện theo từng tệp (mặc định 300 ms), chờ tệp hết bị khoá, tràn hàng đợi thì quét lại, quét toàn bộ định kỳ để dự phòng.
@@ -77,20 +88,17 @@ mysync service install -c server.toml        # cài dịch vụ (admin/root)
 ```
 Ghép máy, cấu hình mẫu và dịch vụ: `docs/SETUP.md`, `docs/SERVICE.md`, `examples/`.
 
-## Dựng máy chủ trong 2 lệnh
+## Cho máy chủ nhận tệp: một lệnh `mysync invite create`
 
-Không cần viết `server.toml` bằng tay. Trên máy chủ:
+Máy chủ không có người ngồi trước màn hình? Một lệnh trên máy chủ:
 ```
-mysync quick-server --dir /srv/mysync --port 5656          # tạo khoá + server.toml an toàn (pairing tắt), in khoá công khai
-mysync peer add <khoá công khai của máy khách> --name van-phong --perm rw -c /srv/mysync.mysync/server.toml
+mysync invite create --dir /srv/nhan --rw --ttl 24h --address may-chu.example.com:5656
 ```
-Lệnh đầu in sẵn: khoá công khai của máy chủ, đoạn `client.toml` để dán sang máy khách, và đúng dòng `peer add` cần chạy.
-Trên máy khách: `mysync quick-client --server may-chu:5656 --server-key <khoá công khai máy chủ> --dir /duong/dan/can/dong/bo` — lệnh này in khoá công khai của máy khách và dòng `peer add` để chạy trên máy chủ.
-
-- Chạy lại bao nhiêu lần cũng được: không ghi đè khoá hay cấu hình đã có (cần `--force` mới ghi lại cấu hình; khoá bí mật không bao giờ bị thay), và báo rõ cái gì đã có sẵn.
-- Cấu hình và khoá nằm ở `<thư mục>.mysync` cạnh thư mục dùng chung (đổi bằng `--config-dir`), không nằm trong thư mục được chia sẻ.
-- `--service` cài và bật dịch vụ qua đúng đường cài dịch vụ hiện có (mọi kiểm tin cậy giữ nguyên); `--json` cho script. Trong giao diện đồ hoạ: menu Cài đặt, mục **Dựng máy chủ…**.
-- Chi tiết: `docs/SERVER-TO-SERVER.md` mục 2.0.
+Lệnh tự tạo khoá và cấu hình an toàn nếu chưa có (thêm `--service` để cài dịch vụ), rồi in **một mã `MSY2-…`** và hạn dùng. Đưa mã đó cho người ở máy gửi: họ dán vào bước 2 của MySync (bước "Một máy tính khác có cài MySync") là xong. Máy chủ **không bao giờ hỏi xác nhận** khi nhận mã.
+- `--ro` cho quyền chỉ xem; `--uses N` số lần dùng (mặc định 1); `--name nhãn`; `--json` cho script; `-c server.toml` nếu cấu hình ở chỗ khác.
+- `mysync invite list` xem các mã và các máy đã vào; `mysync invite revoke <id>` huỷ một mã.
+- Cổng phải mở và có địa chỉ tới được từ máy gửi (không có relay).
+- Chi tiết, mã thoát, vận hành: `docs/SERVER-TO-SERVER.md` mục 2.-1.
 
 ## Cài làm dịch vụ (từng bước)
 
